@@ -1,10 +1,7 @@
 """Wan2.2-I2V-A14B inference with TP4 on Neuron (s-lnc2-trn2: 4 NeuronCores).
 
 Uses torchrun --nproc_per_node=4 for tensor parallelism.
-Memory-efficient: loads one component at a time.
-  1. Load T5 → encode prompts → free T5
-  2. Load VAE → encode image → keep for decode
-  3. Load ONE DiT model at a time (low/high noise), swap via CPU offload
+All models loaded directly on Neuron — no CPU offloading.
 
 Architecture (Wan2.2-I2V-A14B):
   dim=5120, 40 heads, 40 layers, ffn_dim=13824
@@ -70,7 +67,7 @@ def main():
 
     if rank == 0:
         logger.info("=" * 70)
-        logger.info("  Wan2.2-I2V-A14B  SINGLE CHIP EXPLORATION")
+        logger.info("  Wan2.2-I2V-A14B  TP4 on Neuron")
         logger.info("=" * 70)
         logger.info(f"  Instance:        {INSTANCE_TYPE}")
         logger.info(f"  LNC config:      {LNC_CONFIG}")
@@ -91,9 +88,70 @@ def main():
 
     config = WAN_CONFIGS['i2v-A14B']
 
-    # ══════════════════════════════════════════════════════════════════════
-    # PHASE 1: T5 encode (load → encode → free)
-    # ══════════════════════════════════════════════════════════════════════
+    # ── Load T5 ──
+    if rank == T5_RANK:
+        logger.info(f"Loading T5 on rank {T5_RANK}...")
+        text_encoder = T5EncoderModel(
+            text_len=config.text_len,
+            dtype=config.t5_dtype,
+            device=torch.device('cpu'),
+            checkpoint_path=os.path.join(MODEL_PATH, config.t5_checkpoint),
+            tokenizer_path=os.path.join(MODEL_PATH, config.t5_tokenizer))
+        text_encoder.model = text_encoder.model.to(NEURON_DEVICE)
+        logger.info("T5 loaded on Neuron")
+    else:
+        text_encoder = None
+
+    # ── Load VAE ──
+    if rank == VAE_RANK:
+        logger.info("Loading VAE...")
+        vae = Wan2_1_VAE(
+            vae_pth=os.path.join(MODEL_PATH, config.vae_checkpoint),
+            device=torch.device('cpu'))
+        vae.model = vae.model.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
+        logger.info("VAE loaded on Neuron")
+    else:
+        vae = None
+
+    # ── Load both DiT models with TP sharding ──
+    init_tp_group(tp_degree=TP_DEGREE)
+    tp_rank = get_tp_rank()
+
+    if rank == 0:
+        logger.info(f"Loading low_noise_model...")
+    low_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.low_noise_checkpoint)
+    low_noise_model.eval().requires_grad_(False)
+    shard_model_tp(low_noise_model, tp_rank, TP_DEGREE)
+    low_noise_model = low_noise_model.to(torch.bfloat16).to(NEURON_DEVICE)
+
+    if rank == 0:
+        logger.info("Compiling low_noise_model...")
+    low_noise_model.patch_embedding = torch.compile(low_noise_model.patch_embedding, backend='neuron', dynamic=False)
+    low_noise_model.text_embedding = torch.compile(low_noise_model.text_embedding, backend='neuron', dynamic=False)
+    low_noise_model.head = torch.compile(low_noise_model.head, backend='neuron', dynamic=False)
+    for block in low_noise_model.blocks:
+        block.ffn = torch.compile(block.ffn, backend='neuron', dynamic=False)
+
+    if rank == 0:
+        logger.info(f"Loading high_noise_model...")
+    high_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.high_noise_checkpoint)
+    high_noise_model.eval().requires_grad_(False)
+    shard_model_tp(high_noise_model, tp_rank, TP_DEGREE)
+    high_noise_model = high_noise_model.to(torch.bfloat16).to(NEURON_DEVICE)
+
+    if rank == 0:
+        logger.info("Compiling high_noise_model...")
+    high_noise_model.patch_embedding = torch.compile(high_noise_model.patch_embedding, backend='neuron', dynamic=False)
+    high_noise_model.text_embedding = torch.compile(high_noise_model.text_embedding, backend='neuron', dynamic=False)
+    high_noise_model.head = torch.compile(high_noise_model.head, backend='neuron', dynamic=False)
+    for block in high_noise_model.blocks:
+        block.ffn = torch.compile(block.ffn, backend='neuron', dynamic=False)
+
+    dist.barrier()
+    if rank == 0:
+        logger.info("All models loaded!")
+
+    # ── Encode prompt ──
     prompt = (
         "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. "
         "The fluffy-furred feline gazes directly at the camera with a relaxed expression. "
@@ -106,24 +164,10 @@ def main():
     ctx_null_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
 
     if rank == T5_RANK:
-        logger.info("PHASE 1: Loading T5 for prompt encoding...")
-        text_encoder = T5EncoderModel(
-            text_len=config.text_len,
-            dtype=config.t5_dtype,
-            device=torch.device('cpu'),
-            checkpoint_path=os.path.join(MODEL_PATH, config.t5_checkpoint),
-            tokenizer_path=os.path.join(MODEL_PATH, config.t5_tokenizer))
-        text_encoder.model = text_encoder.model.to(NEURON_DEVICE)
-
         context = text_encoder([prompt], NEURON_DEVICE)
         context_null = text_encoder([n_prompt], NEURON_DEVICE)
         ctx_tensor[0, :context[0].shape[0]] = context[0].to(torch.bfloat16)
         ctx_null_tensor[0, :context_null[0].shape[0]] = context_null[0].to(torch.bfloat16)
-
-        # Free T5 immediately
-        del text_encoder, context, context_null
-        gc.collect()
-        logger.info("T5 encoded and freed")
 
     dist.broadcast(ctx_tensor, src=T5_RANK)
     dist.broadcast(ctx_null_tensor, src=T5_RANK)
@@ -131,9 +175,7 @@ def main():
     if rank == 0:
         logger.info("Prompt encoded and broadcast")
 
-    # ══════════════════════════════════════════════════════════════════════
-    # PHASE 2: VAE encode image (load → encode → keep for decode later)
-    # ══════════════════════════════════════════════════════════════════════
+    # ── Prepare image and latents ──
     import torchvision.transforms.functional as TF
 
     image_path = os.path.join(MODEL_PATH, "examples/i2v_input.JPG")
@@ -141,7 +183,7 @@ def main():
         image_path = os.path.join(MODEL_PATH, "examples/i2v_input.jpg")
     if not os.path.exists(image_path):
         if rank == 0:
-            logger.info("No example image found, generating random image")
+            logger.info("No example image found, using random image")
         img = Image.new("RGB", (1280, 720), (128, 128, 128))
     else:
         img = Image.open(image_path).convert("RGB")
@@ -166,7 +208,7 @@ def main():
     y1 = (img.height - oh) // 2
     img = img.crop((x1, y1, x1 + ow, y1 + oh))
 
-    img_tensor = TF.to_tensor(img).sub_(0.5).div_(0.5)  # [C, H, W]
+    img_tensor = TF.to_tensor(img).sub_(0.5).div_(0.5)
 
     F = frame_num
     T_latent = (F - 1) // vae_stride[0] + 1
@@ -176,29 +218,25 @@ def main():
     seed_g = torch.Generator(device=torch.device("cpu"))
     seed_g.manual_seed(seed)
 
-    z_dim = 16  # I2V-A14B uses Wan2.1 VAE (16 channels)
+    z_dim = 16
     noise = torch.randn(
         z_dim, T_latent, lat_h, lat_w,
         dtype=torch.float32, generator=seed_g, device=torch.device("cpu"))
 
-    # Build mask for I2V conditioning
+    # Build I2V mask
     msk = torch.ones(1, F, lat_h, lat_w)
     msk[:, 1:] = 0
     msk = torch.concat([
         torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
     ], dim=1)
     msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
-    msk = msk.transpose(1, 2)[0]  # [4, T_latent, lat_h, lat_w]
+    msk = msk.transpose(1, 2)[0]
 
+    # VAE encode image
     y_device = torch.zeros((z_dim + 4, T_latent, lat_h, lat_w), dtype=torch.bfloat16, device=NEURON_DEVICE)
 
     if rank == VAE_RANK:
-        logger.info("PHASE 2: Loading VAE for image encoding...")
-        vae = Wan2_1_VAE(
-            vae_pth=os.path.join(MODEL_PATH, config.vae_checkpoint),
-            device=torch.device('cpu'))
-        vae.model = vae.model.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
-
+        logger.info("Encoding image with VAE...")
         img_for_vae = torch.nn.functional.interpolate(
             img_tensor[None], size=(oh, ow), mode='bicubic').transpose(0, 1)
         img_seq = torch.cat([img_for_vae, torch.zeros(3, F - 1, oh, ow)], dim=1)
@@ -208,60 +246,15 @@ def main():
         y_device = torch.cat([msk_device, z_result], dim=0)
         logger.info(f"VAE encode done: y shape = {y_device.shape}")
 
-        # Keep VAE for decode — offload to CPU to free HBM for DiT
-        vae.model = vae.model.to('cpu')
-        logger.info("VAE offloaded to CPU (will reload for decode)")
-    else:
-        vae = None
-
     dist.broadcast(y_device, src=VAE_RANK)
 
     if rank == 0:
         logger.info("-" * 70)
-        logger.info("  INPUT SHAPES & MODEL CONFIG")
+        logger.info(f"  Image: {oh}x{ow}, Frames: {frame_num}, Seq len: {seq_len}")
+        logger.info(f"  Latent: [{z_dim}, {T_latent}, {lat_h}, {lat_w}]")
+        logger.info(f"  DiT: dim={config.dim}, heads={config.num_heads}, layers={config.num_layers}")
+        logger.info(f"  Heads/rank: {config.num_heads // TP_DEGREE}, Boundary: {config.boundary}")
         logger.info("-" * 70)
-        logger.info(f"  Image:           {oh}x{ow} (original {ih}x{iw})")
-        logger.info(f"  Frames:          {frame_num}")
-        logger.info(f"  VAE stride:      {vae_stride}")
-        logger.info(f"  Patch size:      {patch_size}")
-        logger.info(f"  Latent shape:    [{z_dim}, {T_latent}, {lat_h}, {lat_w}]")
-        logger.info(f"  y shape:         {list(y_device.shape)}")
-        logger.info(f"  Seq len (DiT):   {seq_len}")
-        logger.info(f"  DiT config:      dim={config.dim}, heads={config.num_heads}, layers={config.num_layers}, ffn_dim={config.ffn_dim}")
-        logger.info(f"  Heads/rank (TP): {config.num_heads // TP_DEGREE}")
-        logger.info(f"  Boundary:        {config.boundary}")
-        logger.info("-" * 70)
-
-    # ══════════════════════════════════════════════════════════════════════
-    # PHASE 3: DiT denoising with model offloading
-    # Strategy: load both models on CPU, move active one to device as needed
-    # ══════════════════════════════════════════════════════════════════════
-    init_tp_group(tp_degree=TP_DEGREE)
-    tp_rank = get_tp_rank()
-
-    if rank == 0:
-        logger.info("PHASE 3: Loading DiT models (CPU first, offload strategy)...")
-
-    # Load and shard both models — keep on CPU
-    if rank == 0:
-        logger.info(f"Loading low_noise_model from {MODEL_PATH}/{config.low_noise_checkpoint}...")
-    low_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.low_noise_checkpoint)
-    low_noise_model.eval().requires_grad_(False)
-    shard_model_tp(low_noise_model, tp_rank, TP_DEGREE)
-    low_noise_model = low_noise_model.to(torch.bfloat16)
-    # Keep on CPU for now
-
-    if rank == 0:
-        logger.info(f"Loading high_noise_model from {MODEL_PATH}/{config.high_noise_checkpoint}...")
-    high_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.high_noise_checkpoint)
-    high_noise_model.eval().requires_grad_(False)
-    shard_model_tp(high_noise_model, tp_rank, TP_DEGREE)
-    high_noise_model = high_noise_model.to(torch.bfloat16)
-    # Keep on CPU for now
-
-    dist.barrier()
-    if rank == 0:
-        logger.info("Both DiT models loaded and sharded (on CPU). Starting denoising...")
 
     noise = noise.to(torch.bfloat16).to(NEURON_DEVICE)
 
@@ -274,9 +267,6 @@ def main():
     latent_orig = noise.clone()
     run_results = []
     boundary = config.boundary * config.num_train_timesteps
-
-    # Track which model is currently on device
-    current_on_device = None  # 'low' or 'high'
 
     for run_idx in range(NUM_RUNS):
         run_label = f"Run {run_idx+1}/{NUM_RUNS}"
@@ -298,33 +288,12 @@ def main():
             latent_model_input = [latent]
             timestep = torch.tensor([t.item()], device=NEURON_DEVICE)
 
-            # Select model based on boundary
             if t.item() >= boundary:
-                needed = 'high'
+                model = high_noise_model
                 guide_scale = config.sample_guide_scale[1]
             else:
-                needed = 'low'
+                model = low_noise_model
                 guide_scale = config.sample_guide_scale[0]
-
-            # Swap models if needed
-            if current_on_device != needed:
-                if rank == 0:
-                    logger.info(f"  Step {step_idx}: swapping to {needed}_noise_model")
-                if current_on_device == 'low':
-                    low_noise_model = low_noise_model.to('cpu')
-                elif current_on_device == 'high':
-                    high_noise_model = high_noise_model.to('cpu')
-                gc.collect()
-
-                if needed == 'low':
-                    low_noise_model = low_noise_model.to(NEURON_DEVICE)
-                    model = low_noise_model
-                else:
-                    high_noise_model = high_noise_model.to(NEURON_DEVICE)
-                    model = high_noise_model
-                current_on_device = needed
-            else:
-                model = low_noise_model if needed == 'low' else high_noise_model
 
             noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0]
             noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0]
@@ -341,19 +310,10 @@ def main():
         if rank == 0:
             logger.info(f"{run_label} denoising: {denoise_time:.1f}s ({denoise_time/NUM_STEPS:.1f}s/step)")
 
-        # ── Free DiT from device for VAE decode ──
-        if current_on_device == 'low':
-            low_noise_model = low_noise_model.to('cpu')
-        elif current_on_device == 'high':
-            high_noise_model = high_noise_model.to('cpu')
-        current_on_device = None
-        gc.collect()
-
         # ── Decode with VAE ──
         vae_start = time.time()
         if rank == VAE_RANK:
-            logger.info(f"{run_label} VAE decode (reloading to device)...")
-            vae.model = vae.model.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
+            logger.info(f"{run_label} VAE decode...")
             x0 = [latent.to(torch.bfloat16)]
             videos = vae.decode(x0)
             video = videos[0]
@@ -362,12 +322,10 @@ def main():
             video_cpu = video.cpu().float()
             video_np = ((video_cpu.clamp(-1, 1) * 0.5 + 0.5) * 255).byte()
             if video_np.dim() == 4 and video_np.shape[0] == 3:
-                video_np = video_np.permute(1, 2, 3, 0)  # [F, H, W, C]
+                video_np = video_np.permute(1, 2, 3, 0)
             frames = [video_np[i].numpy() for i in range(video_np.shape[0])]
             imageio.mimwrite(output_path, frames, fps=16, codec='libx264')
             logger.info(f"Video saved to {output_path} ({len(frames)} frames)")
-            # Offload VAE back to CPU
-            vae.model = vae.model.to('cpu')
 
         dist.barrier()
         vae_time = time.time() - vae_start
@@ -382,31 +340,15 @@ def main():
                 'total': run_time,
             })
 
-    # ── Final benchmark summary ──
     if rank == 0 and run_results:
         logger.info("")
         logger.info("=" * 70)
         logger.info("  BENCHMARK SUMMARY")
         logger.info("=" * 70)
-        logger.info(f"  Instance:        {INSTANCE_TYPE}")
-        logger.info(f"  LNC config:      {LNC_CONFIG}")
-        logger.info(f"  NeuronDevices:   {NUM_NEURON_DEVICES}")
-        logger.info(f"  TP degree:       {TP_DEGREE} (single chip)")
-        logger.info(f"  NKI kernels:     {USE_NKI_KERNELS}")
-        logger.info(f"  Resolution:      {oh}x{ow}, {frame_num} frames")
-        logger.info(f"  Latent:          [{z_dim}, {T_latent}, {lat_h}, {lat_w}]")
-        logger.info(f"  Seq len:         {seq_len}")
-        logger.info(f"  Steps:           {NUM_STEPS}")
-        logger.info(f"  Boundary:        {config.boundary}")
-        logger.info("-" * 70)
-        logger.info(f"  {'Run':<6} {'Denoise':>10} {'s/step':>10} {'VAE dec':>10} {'Total':>10}")
-        logger.info("-" * 70)
+        logger.info(f"  TP={TP_DEGREE}, {config.num_heads//TP_DEGREE} heads/rank")
+        logger.info(f"  {oh}x{ow}, {frame_num} frames, {NUM_STEPS} steps")
         for r in run_results:
-            s_per_step = r['denoise'] / NUM_STEPS
-            logger.info(f"  {r['run']:<6} {r['denoise']:>9.1f}s {s_per_step:>9.1f}s {r['vae']:>9.1f}s {r['total']:>9.1f}s")
-        warm = run_results[-1]
-        logger.info("-" * 70)
-        logger.info(f"  Warm run:  denoise={warm['denoise']:.1f}s ({warm['denoise']/NUM_STEPS:.1f}s/step), vae={warm['vae']:.1f}s, total={warm['total']:.1f}s")
+            logger.info(f"  Run {r['run']}: denoise={r['denoise']:.1f}s ({r['denoise']/NUM_STEPS:.1f}s/step), vae={r['vae']:.1f}s, total={r['total']:.1f}s")
         logger.info("=" * 70)
 
     dist.destroy_process_group()
