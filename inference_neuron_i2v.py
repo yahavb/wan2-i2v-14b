@@ -130,6 +130,9 @@ def main():
             vae_pth=os.path.join(MODEL_PATH, config.vae_checkpoint),
             device=torch.device('cpu'))
         vae.model = vae.model.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
+        vae.mean = vae.mean.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
+        vae.std = vae.std.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
+        vae.scale = [vae.mean, 1.0 / vae.std]
         logger.info("VAE loaded on Neuron")
     else:
         vae = None
