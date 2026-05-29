@@ -14,8 +14,8 @@ spec:
       nodeSelector:
         node-type: trn2
       resourceClaims:
-        - name: s-lnc2-trn2
-          resourceClaimTemplateName: s-lnc2-trn2
+        - name: s-lnc1-trn2
+          resourceClaimTemplateName: s-lnc1-trn2
       containers:
         - name: inference
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -31,7 +31,7 @@ spec:
               bash setup.sh
           resources:
             claims:
-              - name: s-lnc2-trn2
+              - name: s-lnc1-trn2
             requests:
               cpu: 22
               memory: 220Gi
@@ -52,12 +52,10 @@ spec:
               value: "ERROR"
             - name: TORCH_NEURONX_LOG_LEVEL
               value: "ERROR"
-            - name: NEURON_LOGICAL_NC_CONFIG
-              value: "2"
             - name: NEURON_CC_FLAGS
               value: "--model-type=transformer"
             - name: TP_DEGREE
-              value: "4"
+              value: "8"
             - name: T5_RANK
               value: "0"
             - name: VAE_TP_DEGREE
@@ -73,7 +71,7 @@ spec:
             - name: INSTANCE_TYPE
               value: "trn2.48xlarge"
             - name: LNC_CONFIG
-              value: "LNC2"
+              value: "LNC1"
             - name: NUM_NEURON_DEVICES
               value: "1"
             - name: CUDA_VISIBLE_DEVICES

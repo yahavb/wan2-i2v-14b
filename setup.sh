@@ -43,7 +43,7 @@ export WAN_DIR="${SCRIPT_DIR}"
 export MODEL_PATH=/tmp/Wan2.2-I2V-A14B
 
 cd "${SCRIPT_DIR}"
-torchrun --nproc_per_node=${TP_DEGREE:-4} --master_port=29500 \
+torchrun --nproc_per_node=${TP_DEGREE:-8} --master_port=29500 \
   "${SCRIPT_DIR}/inference_neuron_i2v.py" 2>&1 || true
 
 # ─── Neuron Explorer analysis (only if profiling was enabled) ─
