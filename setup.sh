@@ -33,9 +33,12 @@ snapshot_download('Wan-AI/Wan2.2-I2V-A14B', local_dir='${MODEL_LOCAL}', local_di
   echo "Creating tar archive for S3 cache..."
   tar cf /tmp/Wan2.2-I2V-A14B.tar -C /tmp Wan2.2-I2V-A14B
   mkdir -p "$(dirname $MODEL_TAR)"
-  cp /tmp/Wan2.2-I2V-A14B.tar "$MODEL_TAR"
+  if cp /tmp/Wan2.2-I2V-A14B.tar "$MODEL_TAR" 2>/dev/null; then
+    echo "Cached tar to S3!"
+  else
+    echo "WARNING: S3 cache copy failed (file too large?) — continuing without cache"
+  fi
   rm -f /tmp/Wan2.2-I2V-A14B.tar
-  echo "Cached tar to S3!"
 fi
 echo "Model weights ready at $MODEL_LOCAL"
 
