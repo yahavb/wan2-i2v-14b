@@ -88,9 +88,20 @@ def main():
 
     config = WAN_CONFIGS['i2v-A14B']
 
-    # ── Load T5 ──
+    # ── Encode prompt with T5 (then free it — not needed during denoising) ──
+    prompt = (
+        "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. "
+        "The fluffy-furred feline gazes directly at the camera with a relaxed expression. "
+        "Blurred beach scenery forms the background featuring crystal-clear waters, "
+        "distant green hills, and a blue sky dotted with white clouds."
+    )
+    n_prompt = config.sample_neg_prompt
+
+    ctx_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
+    ctx_null_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
+
     if rank == T5_RANK:
-        logger.info(f"Loading T5 on rank {T5_RANK}...")
+        logger.info("Loading T5...")
         text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
@@ -98,9 +109,19 @@ def main():
             checkpoint_path=os.path.join(MODEL_PATH, config.t5_checkpoint),
             tokenizer_path=os.path.join(MODEL_PATH, config.t5_tokenizer))
         text_encoder.model = text_encoder.model.to(NEURON_DEVICE)
-        logger.info("T5 loaded on Neuron")
-    else:
-        text_encoder = None
+        context = text_encoder([prompt], NEURON_DEVICE)
+        context_null = text_encoder([n_prompt], NEURON_DEVICE)
+        ctx_tensor[0, :context[0].shape[0]] = context[0].to(torch.bfloat16)
+        ctx_null_tensor[0, :context_null[0].shape[0]] = context_null[0].to(torch.bfloat16)
+        del text_encoder, context, context_null
+        gc.collect()
+        logger.info("T5 encoded and freed")
+
+    dist.broadcast(ctx_tensor, src=T5_RANK)
+    dist.broadcast(ctx_null_tensor, src=T5_RANK)
+
+    if rank == 0:
+        logger.info("Prompt encoded and broadcast")
 
     # ── Load VAE ──
     if rank == VAE_RANK:
@@ -150,30 +171,6 @@ def main():
     dist.barrier()
     if rank == 0:
         logger.info("All models loaded!")
-
-    # ── Encode prompt ──
-    prompt = (
-        "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. "
-        "The fluffy-furred feline gazes directly at the camera with a relaxed expression. "
-        "Blurred beach scenery forms the background featuring crystal-clear waters, "
-        "distant green hills, and a blue sky dotted with white clouds."
-    )
-    n_prompt = config.sample_neg_prompt
-
-    ctx_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
-    ctx_null_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
-
-    if rank == T5_RANK:
-        context = text_encoder([prompt], NEURON_DEVICE)
-        context_null = text_encoder([n_prompt], NEURON_DEVICE)
-        ctx_tensor[0, :context[0].shape[0]] = context[0].to(torch.bfloat16)
-        ctx_null_tensor[0, :context_null[0].shape[0]] = context_null[0].to(torch.bfloat16)
-
-    dist.broadcast(ctx_tensor, src=T5_RANK)
-    dist.broadcast(ctx_null_tensor, src=T5_RANK)
-
-    if rank == 0:
-        logger.info("Prompt encoded and broadcast")
 
     # ── Prepare image and latents ──
     import torchvision.transforms.functional as TF
