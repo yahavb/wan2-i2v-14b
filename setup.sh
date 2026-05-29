@@ -14,31 +14,17 @@ uv pip install "setuptools<81"
 uv pip install git+https://github.com/pytorch/vision.git@v0.25.0 --no-deps --no-cache --no-build-isolation
 uv pip install imageio imageio-ffmpeg
 
-# ─── Model caching (S3-backed PVC tar pattern) ───────────────
-MODEL_TAR="/var/mdl/wan2_2_i2v/Wan2.2-I2V-A14B.tar"
+# ─── Download model directly (too large for tar/S3 cache) ────
 MODEL_LOCAL="/tmp/Wan2.2-I2V-A14B"
 
-if [[ -f "$MODEL_TAR" ]]; then
-  echo "Copying model tar from S3 cache..."
-  cp "$MODEL_TAR" /tmp/Wan2.2-I2V-A14B.tar
-  echo "Extracting..."
-  tar xf /tmp/Wan2.2-I2V-A14B.tar -C /tmp/
-  rm -f /tmp/Wan2.2-I2V-A14B.tar
+if [[ -d "$MODEL_LOCAL" && -f "$MODEL_LOCAL/Wan2.1_VAE.pth" ]]; then
+  echo "Model already present at $MODEL_LOCAL"
 else
   echo "Downloading model from HuggingFace..."
   python3 -c "
 from huggingface_hub import snapshot_download
 snapshot_download('Wan-AI/Wan2.2-I2V-A14B', local_dir='${MODEL_LOCAL}', local_dir_use_symlinks=False)
 "
-  echo "Creating tar archive for S3 cache..."
-  tar cf /tmp/Wan2.2-I2V-A14B.tar -C /tmp Wan2.2-I2V-A14B
-  mkdir -p "$(dirname $MODEL_TAR)"
-  if cp /tmp/Wan2.2-I2V-A14B.tar "$MODEL_TAR" 2>/dev/null; then
-    echo "Cached tar to S3!"
-  else
-    echo "WARNING: S3 cache copy failed (file too large?) — continuing without cache"
-  fi
-  rm -f /tmp/Wan2.2-I2V-A14B.tar
 fi
 echo "Model weights ready at $MODEL_LOCAL"
 
