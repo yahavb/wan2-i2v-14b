@@ -67,7 +67,7 @@ spec:
             - name: NUM_STEPS
               value: "10"
             - name: NUM_RUNS
-              value: "2"
+              value: "1"
             - name: FRAME_NUM
               value: "81"
             - name: INSTANCE_TYPE

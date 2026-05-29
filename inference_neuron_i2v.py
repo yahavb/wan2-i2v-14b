@@ -1,12 +1,14 @@
 """Wan2.2-I2V-A14B inference with TP2 on Neuron (single trn2 chip).
 
 Uses torchrun --nproc_per_node=2 for tensor parallelism.
-Both low_noise_model and high_noise_model are TP-sharded across 2 NeuronCores.
-T5 on rank 0, VAE on rank 0.
+Memory-efficient: loads one component at a time due to 24GB HBM constraint.
+  1. Load T5 → encode prompts → free T5
+  2. Load VAE → encode image → keep for decode
+  3. Load ONE DiT model at a time (low/high noise), swap via CPU offload
 
 Architecture (Wan2.2-I2V-A14B):
   dim=5120, 40 heads, 40 layers, ffn_dim=13824
-  TP=2: 20 heads/rank
+  TP=2: 20 heads/rank, ~7.26B params/rank (~14.5GB bf16)
   Dual model: low_noise_model (t < boundary), high_noise_model (t >= boundary)
   VAE stride: (4, 8, 8), in_dim=16
 """
@@ -89,70 +91,9 @@ def main():
 
     config = WAN_CONFIGS['i2v-A14B']
 
-    # ── Load T5 on T5_RANK ──
-    if rank == T5_RANK:
-        logger.info(f"Loading T5 on rank {T5_RANK}...")
-        text_encoder = T5EncoderModel(
-            text_len=config.text_len,
-            dtype=config.t5_dtype,
-            device=torch.device('cpu'),
-            checkpoint_path=os.path.join(MODEL_PATH, config.t5_checkpoint),
-            tokenizer_path=os.path.join(MODEL_PATH, config.t5_tokenizer))
-        text_encoder.model = text_encoder.model.to(NEURON_DEVICE)
-        logger.info(f"T5 loaded on Neuron (rank {T5_RANK})")
-    else:
-        text_encoder = None
-
-    # ── Load VAE on VAE_RANK ──
-    if rank == VAE_RANK:
-        logger.info(f"Loading VAE on rank {VAE_RANK}...")
-        vae = Wan2_1_VAE(
-            vae_pth=os.path.join(MODEL_PATH, config.vae_checkpoint),
-            device=torch.device('cpu'))
-        vae.model = vae.model.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
-        logger.info("VAE loaded on Neuron")
-    else:
-        vae = None
-
-    # ── Load DiT models (both low_noise and high_noise) with TP sharding ──
-    init_tp_group(tp_degree=TP_DEGREE)
-    tp_rank = get_tp_rank()
-
-    if rank == 0:
-        logger.info(f"Loading low_noise_model from {MODEL_PATH}/{config.low_noise_checkpoint}...")
-    low_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.low_noise_checkpoint)
-    low_noise_model.eval().requires_grad_(False)
-    shard_model_tp(low_noise_model, tp_rank, TP_DEGREE)
-    low_noise_model = low_noise_model.to(torch.bfloat16).to(NEURON_DEVICE)
-
-    if rank == 0:
-        logger.info("Compiling low_noise_model sub-modules...")
-    low_noise_model.patch_embedding = torch.compile(low_noise_model.patch_embedding, backend='neuron', dynamic=False)
-    low_noise_model.text_embedding = torch.compile(low_noise_model.text_embedding, backend='neuron', dynamic=False)
-    low_noise_model.head = torch.compile(low_noise_model.head, backend='neuron', dynamic=False)
-    for block in low_noise_model.blocks:
-        block.ffn = torch.compile(block.ffn, backend='neuron', dynamic=False)
-
-    if rank == 0:
-        logger.info(f"Loading high_noise_model from {MODEL_PATH}/{config.high_noise_checkpoint}...")
-    high_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.high_noise_checkpoint)
-    high_noise_model.eval().requires_grad_(False)
-    shard_model_tp(high_noise_model, tp_rank, TP_DEGREE)
-    high_noise_model = high_noise_model.to(torch.bfloat16).to(NEURON_DEVICE)
-
-    if rank == 0:
-        logger.info("Compiling high_noise_model sub-modules...")
-    high_noise_model.patch_embedding = torch.compile(high_noise_model.patch_embedding, backend='neuron', dynamic=False)
-    high_noise_model.text_embedding = torch.compile(high_noise_model.text_embedding, backend='neuron', dynamic=False)
-    high_noise_model.head = torch.compile(high_noise_model.head, backend='neuron', dynamic=False)
-    for block in high_noise_model.blocks:
-        block.ffn = torch.compile(block.ffn, backend='neuron', dynamic=False)
-
-    dist.barrier()
-    if rank == 0:
-        logger.info("All models loaded and compiled!")
-
-    # ── Encode prompt ──
+    # ══════════════════════════════════════════════════════════════════════
+    # PHASE 1: T5 encode (load → encode → free)
+    # ══════════════════════════════════════════════════════════════════════
     prompt = (
         "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. "
         "The fluffy-furred feline gazes directly at the camera with a relaxed expression. "
@@ -165,26 +106,34 @@ def main():
     ctx_null_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
 
     if rank == T5_RANK:
+        logger.info("PHASE 1: Loading T5 for prompt encoding...")
+        text_encoder = T5EncoderModel(
+            text_len=config.text_len,
+            dtype=config.t5_dtype,
+            device=torch.device('cpu'),
+            checkpoint_path=os.path.join(MODEL_PATH, config.t5_checkpoint),
+            tokenizer_path=os.path.join(MODEL_PATH, config.t5_tokenizer))
+        text_encoder.model = text_encoder.model.to(NEURON_DEVICE)
+
         context = text_encoder([prompt], NEURON_DEVICE)
         context_null = text_encoder([n_prompt], NEURON_DEVICE)
-        ctx_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
         ctx_tensor[0, :context[0].shape[0]] = context[0].to(torch.bfloat16)
-        ctx_null_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
         ctx_null_tensor[0, :context_null[0].shape[0]] = context_null[0].to(torch.bfloat16)
+
+        # Free T5 immediately
+        del text_encoder, context, context_null
+        gc.collect()
+        logger.info("T5 encoded and freed")
 
     dist.broadcast(ctx_tensor, src=T5_RANK)
     dist.broadcast(ctx_null_tensor, src=T5_RANK)
-    context = [ctx_tensor]
-    context_null = [ctx_null_tensor]
-
-    if rank == T5_RANK:
-        del text_encoder
-        gc.collect()
 
     if rank == 0:
-        logger.info("Prompt encoded and broadcast to all ranks")
+        logger.info("Prompt encoded and broadcast")
 
-    # ── Prepare image and latents ──
+    # ══════════════════════════════════════════════════════════════════════
+    # PHASE 2: VAE encode image (load → encode → keep for decode later)
+    # ══════════════════════════════════════════════════════════════════════
     import torchvision.transforms.functional as TF
 
     image_path = os.path.join(MODEL_PATH, "examples/i2v_input.JPG")
@@ -227,12 +176,12 @@ def main():
     seed_g = torch.Generator(device=torch.device("cpu"))
     seed_g.manual_seed(seed)
 
-    z_dim = 16  # I2V-A14B uses 16 channels (Wan2.1 VAE)
+    z_dim = 16  # I2V-A14B uses Wan2.1 VAE (16 channels)
     noise = torch.randn(
         z_dim, T_latent, lat_h, lat_w,
         dtype=torch.float32, generator=seed_g, device=torch.device("cpu"))
 
-    # Build mask for I2V conditioning (first frame = image, rest = noise)
+    # Build mask for I2V conditioning
     msk = torch.ones(1, F, lat_h, lat_w)
     msk[:, 1:] = 0
     msk = torch.concat([
@@ -241,23 +190,29 @@ def main():
     msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
     msk = msk.transpose(1, 2)[0]  # [4, T_latent, lat_h, lat_w]
 
-    # Encode image with VAE on rank 0
-    z_img_shape = (z_dim, T_latent, lat_h, lat_w)
     y_device = torch.zeros((z_dim + 4, T_latent, lat_h, lat_w), dtype=torch.bfloat16, device=NEURON_DEVICE)
 
     if rank == VAE_RANK:
-        logger.info("Encoding image with VAE...")
+        logger.info("PHASE 2: Loading VAE for image encoding...")
+        vae = Wan2_1_VAE(
+            vae_pth=os.path.join(MODEL_PATH, config.vae_checkpoint),
+            device=torch.device('cpu'))
+        vae.model = vae.model.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
+
         img_for_vae = torch.nn.functional.interpolate(
-            img_tensor[None], size=(oh, ow), mode='bicubic').transpose(0, 1)  # [C, 1, H, W]
-        img_seq = torch.cat([img_for_vae, torch.zeros(3, F - 1, oh, ow)], dim=1)  # [C, F, H, W]
-        img_neuron = img_seq.unsqueeze(0).to(device=NEURON_DEVICE, dtype=torch.bfloat16)
-        # VAE encode expects list of [C, F, H, W] tensors
+            img_tensor[None], size=(oh, ow), mode='bicubic').transpose(0, 1)
+        img_seq = torch.cat([img_for_vae, torch.zeros(3, F - 1, oh, ow)], dim=1)
         z = vae.encode([img_seq.to(device=NEURON_DEVICE, dtype=torch.bfloat16)])
-        z_result = z[0].to(torch.bfloat16)  # [z_dim, T_latent, lat_h, lat_w]
-        # y = concat(mask, z_encoded) for I2V conditioning
+        z_result = z[0].to(torch.bfloat16)
         msk_device = msk.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
-        y_device = torch.cat([msk_device, z_result], dim=0)  # [z_dim+4, T_latent, lat_h, lat_w]
+        y_device = torch.cat([msk_device, z_result], dim=0)
         logger.info(f"VAE encode done: y shape = {y_device.shape}")
+
+        # Keep VAE for decode — offload to CPU to free HBM for DiT
+        vae.model = vae.model.to('cpu')
+        logger.info("VAE offloaded to CPU (will reload for decode)")
+    else:
+        vae = None
 
     dist.broadcast(y_device, src=VAE_RANK)
 
@@ -277,19 +232,51 @@ def main():
         logger.info(f"  Boundary:        {config.boundary}")
         logger.info("-" * 70)
 
-    # Move noise to device
+    # ══════════════════════════════════════════════════════════════════════
+    # PHASE 3: DiT denoising with model offloading
+    # Strategy: load both models on CPU, move active one to device as needed
+    # ══════════════════════════════════════════════════════════════════════
+    init_tp_group(tp_degree=TP_DEGREE)
+    tp_rank = get_tp_rank()
+
+    if rank == 0:
+        logger.info("PHASE 3: Loading DiT models (CPU first, offload strategy)...")
+
+    # Load and shard both models — keep on CPU
+    if rank == 0:
+        logger.info(f"Loading low_noise_model from {MODEL_PATH}/{config.low_noise_checkpoint}...")
+    low_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.low_noise_checkpoint)
+    low_noise_model.eval().requires_grad_(False)
+    shard_model_tp(low_noise_model, tp_rank, TP_DEGREE)
+    low_noise_model = low_noise_model.to(torch.bfloat16)
+    # Keep on CPU for now
+
+    if rank == 0:
+        logger.info(f"Loading high_noise_model from {MODEL_PATH}/{config.high_noise_checkpoint}...")
+    high_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.high_noise_checkpoint)
+    high_noise_model.eval().requires_grad_(False)
+    shard_model_tp(high_noise_model, tp_rank, TP_DEGREE)
+    high_noise_model = high_noise_model.to(torch.bfloat16)
+    # Keep on CPU for now
+
+    dist.barrier()
+    if rank == 0:
+        logger.info("Both DiT models loaded and sharded (on CPU). Starting denoising...")
+
     noise = noise.to(torch.bfloat16).to(NEURON_DEVICE)
 
     NUM_STEPS = int(os.environ.get("NUM_STEPS", "10"))
-    NUM_RUNS = int(os.environ.get("NUM_RUNS", "2"))
+    NUM_RUNS = int(os.environ.get("NUM_RUNS", "1"))
 
-    # Model args: I2V passes y (mask + encoded image) alongside context
-    arg_c = {'context': [context[0][0]], 'seq_len': seq_len, 'y': [y_device]}
-    arg_null = {'context': [context_null[0][0]], 'seq_len': seq_len, 'y': [y_device]}
+    arg_c = {'context': [ctx_tensor[0]], 'seq_len': seq_len, 'y': [y_device]}
+    arg_null = {'context': [ctx_null_tensor[0]], 'seq_len': seq_len, 'y': [y_device]}
 
     latent_orig = noise.clone()
     run_results = []
     boundary = config.boundary * config.num_train_timesteps
+
+    # Track which model is currently on device
+    current_on_device = None  # 'low' or 'high'
 
     for run_idx in range(NUM_RUNS):
         run_label = f"Run {run_idx+1}/{NUM_RUNS}"
@@ -309,16 +296,35 @@ def main():
 
         for step_idx, t in enumerate(tqdm(timesteps, disable=(rank != 0), desc=run_label)):
             latent_model_input = [latent]
-            timestep = [t.to(NEURON_DEVICE)]
-            timestep = torch.stack(timestep).to(NEURON_DEVICE)
+            timestep = torch.tensor([t.item()], device=NEURON_DEVICE)
 
             # Select model based on boundary
             if t.item() >= boundary:
-                model = high_noise_model
+                needed = 'high'
                 guide_scale = config.sample_guide_scale[1]
             else:
-                model = low_noise_model
+                needed = 'low'
                 guide_scale = config.sample_guide_scale[0]
+
+            # Swap models if needed
+            if current_on_device != needed:
+                if rank == 0:
+                    logger.info(f"  Step {step_idx}: swapping to {needed}_noise_model")
+                if current_on_device == 'low':
+                    low_noise_model = low_noise_model.to('cpu')
+                elif current_on_device == 'high':
+                    high_noise_model = high_noise_model.to('cpu')
+                gc.collect()
+
+                if needed == 'low':
+                    low_noise_model = low_noise_model.to(NEURON_DEVICE)
+                    model = low_noise_model
+                else:
+                    high_noise_model = high_noise_model.to(NEURON_DEVICE)
+                    model = high_noise_model
+                current_on_device = needed
+            else:
+                model = low_noise_model if needed == 'low' else high_noise_model
 
             noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0]
             noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0]
@@ -335,10 +341,19 @@ def main():
         if rank == 0:
             logger.info(f"{run_label} denoising: {denoise_time:.1f}s ({denoise_time/NUM_STEPS:.1f}s/step)")
 
+        # ── Free DiT from device for VAE decode ──
+        if current_on_device == 'low':
+            low_noise_model = low_noise_model.to('cpu')
+        elif current_on_device == 'high':
+            high_noise_model = high_noise_model.to('cpu')
+        current_on_device = None
+        gc.collect()
+
         # ── Decode with VAE ──
         vae_start = time.time()
         if rank == VAE_RANK:
-            logger.info(f"{run_label} VAE decode...")
+            logger.info(f"{run_label} VAE decode (reloading to device)...")
+            vae.model = vae.model.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
             x0 = [latent.to(torch.bfloat16)]
             videos = vae.decode(x0)
             video = videos[0]
@@ -351,6 +366,8 @@ def main():
             frames = [video_np[i].numpy() for i in range(video_np.shape[0])]
             imageio.mimwrite(output_path, frames, fps=16, codec='libx264')
             logger.info(f"Video saved to {output_path} ({len(frames)} frames)")
+            # Offload VAE back to CPU
+            vae.model = vae.model.to('cpu')
 
         dist.barrier()
         vae_time = time.time() - vae_start
