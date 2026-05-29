@@ -648,14 +648,14 @@ class Wan2_1_VAE:
         """
         videos: A list of videos each with shape [C, T, H, W].
         """
-        with amp.autocast(dtype=self.dtype):
+        with torch.no_grad():
             return [
                 self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
                 for u in videos
             ]
 
     def decode(self, zs):
-        with amp.autocast(dtype=self.dtype):
+        with torch.no_grad():
             return [
                 self.model.decode(u.unsqueeze(0),
                                   self.scale).float().clamp_(-1, 1).squeeze(0)
