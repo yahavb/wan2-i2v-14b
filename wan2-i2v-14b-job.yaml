@@ -57,7 +57,7 @@ spec:
             - name: NEURON_CC_FLAGS
               value: "--model-type=transformer"
             - name: TP_DEGREE
-              value: "2"
+              value: "4"
             - name: T5_RANK
               value: "0"
             - name: VAE_TP_DEGREE

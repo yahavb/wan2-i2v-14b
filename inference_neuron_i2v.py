@@ -1,14 +1,14 @@
-"""Wan2.2-I2V-A14B inference with TP2 on Neuron (single trn2 chip).
+"""Wan2.2-I2V-A14B inference with TP4 on Neuron (s-lnc2-trn2: 4 NeuronCores).
 
-Uses torchrun --nproc_per_node=2 for tensor parallelism.
-Memory-efficient: loads one component at a time due to 24GB HBM constraint.
+Uses torchrun --nproc_per_node=4 for tensor parallelism.
+Memory-efficient: loads one component at a time.
   1. Load T5 → encode prompts → free T5
   2. Load VAE → encode image → keep for decode
   3. Load ONE DiT model at a time (low/high noise), swap via CPU offload
 
 Architecture (Wan2.2-I2V-A14B):
   dim=5120, 40 heads, 40 layers, ffn_dim=13824
-  TP=2: 20 heads/rank, ~7.26B params/rank (~14.5GB bf16)
+  TP=4: 10 heads/rank, ~3.63B params/rank (~7.3GB bf16)
   Dual model: low_noise_model (t < boundary), high_noise_model (t >= boundary)
   VAE stride: (4, 8, 8), in_dim=16
 """
@@ -43,7 +43,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "/tmp/Wan2.2-I2V-A14B")
-TP_DEGREE = int(os.environ.get("TP_DEGREE", "2"))
+TP_DEGREE = int(os.environ.get("TP_DEGREE", "4"))
 T5_RANK = int(os.environ.get("T5_RANK", "0"))
 VAE_RANK = 0
 
