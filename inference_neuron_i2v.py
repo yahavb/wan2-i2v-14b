@@ -123,59 +123,7 @@ def main():
     if rank == 0:
         logger.info("Prompt encoded and broadcast")
 
-    # ── Load VAE ──
-    if rank == VAE_RANK:
-        logger.info("Loading VAE...")
-        vae = Wan2_1_VAE(
-            vae_pth=os.path.join(MODEL_PATH, config.vae_checkpoint),
-            device=torch.device('cpu'))
-        vae.model = vae.model.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
-        vae.mean = vae.mean.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
-        vae.std = vae.std.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
-        vae.scale = [vae.mean, 1.0 / vae.std]
-        logger.info("VAE loaded on Neuron")
-    else:
-        vae = None
-
-    # ── Load both DiT models with TP sharding ──
-    init_tp_group(tp_degree=TP_DEGREE)
-    tp_rank = get_tp_rank()
-
-    if rank == 0:
-        logger.info(f"Loading low_noise_model...")
-    low_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.low_noise_checkpoint)
-    low_noise_model.eval().requires_grad_(False)
-    shard_model_tp(low_noise_model, tp_rank, TP_DEGREE)
-    low_noise_model = low_noise_model.to(torch.bfloat16).to(NEURON_DEVICE)
-
-    if rank == 0:
-        logger.info("Compiling low_noise_model...")
-    low_noise_model.patch_embedding = torch.compile(low_noise_model.patch_embedding, backend='neuron', dynamic=False)
-    low_noise_model.text_embedding = torch.compile(low_noise_model.text_embedding, backend='neuron', dynamic=False)
-    low_noise_model.head = torch.compile(low_noise_model.head, backend='neuron', dynamic=False)
-    for block in low_noise_model.blocks:
-        block.ffn = torch.compile(block.ffn, backend='neuron', dynamic=False)
-
-    if rank == 0:
-        logger.info(f"Loading high_noise_model...")
-    high_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.high_noise_checkpoint)
-    high_noise_model.eval().requires_grad_(False)
-    shard_model_tp(high_noise_model, tp_rank, TP_DEGREE)
-    high_noise_model = high_noise_model.to(torch.bfloat16).to(NEURON_DEVICE)
-
-    if rank == 0:
-        logger.info("Compiling high_noise_model...")
-    high_noise_model.patch_embedding = torch.compile(high_noise_model.patch_embedding, backend='neuron', dynamic=False)
-    high_noise_model.text_embedding = torch.compile(high_noise_model.text_embedding, backend='neuron', dynamic=False)
-    high_noise_model.head = torch.compile(high_noise_model.head, backend='neuron', dynamic=False)
-    for block in high_noise_model.blocks:
-        block.ffn = torch.compile(block.ffn, backend='neuron', dynamic=False)
-
-    dist.barrier()
-    if rank == 0:
-        logger.info("All models loaded!")
-
-    # ── Prepare image and latents ──
+    # ── VAE encode image (before DiT loading — needs scratch space for Conv3D) ──
     import torchvision.transforms.functional as TF
 
     image_path = os.path.join(MODEL_PATH, "examples/i2v_input.JPG")
@@ -232,11 +180,18 @@ def main():
     msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
     msk = msk.transpose(1, 2)[0]
 
-    # VAE encode image
     y_device = torch.zeros((z_dim + 4, T_latent, lat_h, lat_w), dtype=torch.bfloat16, device=NEURON_DEVICE)
 
     if rank == VAE_RANK:
-        logger.info("Encoding image with VAE...")
+        logger.info("Loading VAE and encoding image...")
+        vae = Wan2_1_VAE(
+            vae_pth=os.path.join(MODEL_PATH, config.vae_checkpoint),
+            device=torch.device('cpu'))
+        vae.model = vae.model.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
+        vae.mean = vae.mean.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
+        vae.std = vae.std.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
+        vae.scale = [vae.mean, 1.0 / vae.std]
+
         img_for_vae = torch.nn.functional.interpolate(
             img_tensor[None], size=(oh, ow), mode='bicubic').transpose(0, 1)
         img_seq = torch.cat([img_for_vae, torch.zeros(3, F - 1, oh, ow)], dim=1)
@@ -245,8 +200,51 @@ def main():
         msk_device = msk.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
         y_device = torch.cat([msk_device, z_result], dim=0)
         logger.info(f"VAE encode done: y shape = {y_device.shape}")
+        # Keep VAE for decode later but free encoder scratch
+        del z, z_result, img_seq, img_for_vae
+        gc.collect()
+    else:
+        vae = None
 
     dist.broadcast(y_device, src=VAE_RANK)
+
+    # ── Load both DiT models with TP sharding ──
+    init_tp_group(tp_degree=TP_DEGREE)
+    tp_rank = get_tp_rank()
+
+    if rank == 0:
+        logger.info(f"Loading low_noise_model...")
+    low_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.low_noise_checkpoint)
+    low_noise_model.eval().requires_grad_(False)
+    shard_model_tp(low_noise_model, tp_rank, TP_DEGREE)
+    low_noise_model = low_noise_model.to(torch.bfloat16).to(NEURON_DEVICE)
+
+    if rank == 0:
+        logger.info("Compiling low_noise_model...")
+    low_noise_model.patch_embedding = torch.compile(low_noise_model.patch_embedding, backend='neuron', dynamic=False)
+    low_noise_model.text_embedding = torch.compile(low_noise_model.text_embedding, backend='neuron', dynamic=False)
+    low_noise_model.head = torch.compile(low_noise_model.head, backend='neuron', dynamic=False)
+    for block in low_noise_model.blocks:
+        block.ffn = torch.compile(block.ffn, backend='neuron', dynamic=False)
+
+    if rank == 0:
+        logger.info(f"Loading high_noise_model...")
+    high_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.high_noise_checkpoint)
+    high_noise_model.eval().requires_grad_(False)
+    shard_model_tp(high_noise_model, tp_rank, TP_DEGREE)
+    high_noise_model = high_noise_model.to(torch.bfloat16).to(NEURON_DEVICE)
+
+    if rank == 0:
+        logger.info("Compiling high_noise_model...")
+    high_noise_model.patch_embedding = torch.compile(high_noise_model.patch_embedding, backend='neuron', dynamic=False)
+    high_noise_model.text_embedding = torch.compile(high_noise_model.text_embedding, backend='neuron', dynamic=False)
+    high_noise_model.head = torch.compile(high_noise_model.head, backend='neuron', dynamic=False)
+    for block in high_noise_model.blocks:
+        block.ffn = torch.compile(block.ffn, backend='neuron', dynamic=False)
+
+    dist.barrier()
+    if rank == 0:
+        logger.info("All models loaded!")
 
     if rank == 0:
         logger.info("-" * 70)
