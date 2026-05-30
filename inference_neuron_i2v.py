@@ -140,7 +140,7 @@ def main():
     vae_stride = config.vae_stride  # (4, 8, 8)
     patch_size = config.patch_size  # (1, 2, 2)
     frame_num = FRAME_NUM
-    max_area = 720 * 1280
+    max_area = 480 * 832
 
     ih, iw = img.height, img.width
     aspect_ratio = ih / iw
@@ -209,15 +209,12 @@ def main():
 
     dist.broadcast(y_device, src=VAE_RANK)
 
-    # ── Load DiT models with TP sharding (one on device at a time) ──
-    # Each DiT shard is ~4GB, activations need ~4.3GB — can't fit both + activations
-    # Strategy: load both, shard both, keep high_noise on device (runs first: t >= boundary=0.9)
-    # low_noise stays on CPU until needed
+    # ── Load both DiT models with TP sharding ──
     init_tp_group(tp_degree=TP_DEGREE)
     tp_rank = get_tp_rank()
 
     if rank == 0:
-        logger.info(f"Loading high_noise_model (on device)...")
+        logger.info(f"Loading high_noise_model...")
     high_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.high_noise_checkpoint)
     high_noise_model.eval().requires_grad_(False)
     shard_model_tp(high_noise_model, tp_rank, TP_DEGREE)
@@ -232,16 +229,23 @@ def main():
         block.ffn = torch.compile(block.ffn, backend='neuron', dynamic=False)
 
     if rank == 0:
-        logger.info(f"Loading low_noise_model (on CPU, will swap when needed)...")
+        logger.info(f"Loading low_noise_model...")
     low_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.low_noise_checkpoint)
     low_noise_model.eval().requires_grad_(False)
     shard_model_tp(low_noise_model, tp_rank, TP_DEGREE)
-    low_noise_model = low_noise_model.to(torch.bfloat16)
-    # Keep on CPU — will move to device when boundary crosses
+    low_noise_model = low_noise_model.to(torch.bfloat16).to(NEURON_DEVICE)
+
+    if rank == 0:
+        logger.info("Compiling low_noise_model...")
+    low_noise_model.patch_embedding = torch.compile(low_noise_model.patch_embedding, backend='neuron', dynamic=False)
+    low_noise_model.text_embedding = torch.compile(low_noise_model.text_embedding, backend='neuron', dynamic=False)
+    low_noise_model.head = torch.compile(low_noise_model.head, backend='neuron', dynamic=False)
+    for block in low_noise_model.blocks:
+        block.ffn = torch.compile(block.ffn, backend='neuron', dynamic=False)
 
     dist.barrier()
     if rank == 0:
-        logger.info("DiT models ready (high_noise on device, low_noise on CPU)")
+        logger.info("All models loaded!")
 
     if rank == 0:
         logger.info("-" * 70)
@@ -262,7 +266,6 @@ def main():
     latent_orig = noise.clone()
     run_results = []
     boundary = config.boundary * config.num_train_timesteps
-    current_on_device = 'high'  # high_noise_model starts on device
 
     for run_idx in range(NUM_RUNS):
         run_label = f"Run {run_idx+1}/{NUM_RUNS}"
@@ -285,25 +288,11 @@ def main():
             timestep = torch.tensor([t.item()], device=NEURON_DEVICE)
 
             if t.item() >= boundary:
-                needed = 'high'
+                model = high_noise_model
                 guide_scale = config.sample_guide_scale[1]
             else:
-                needed = 'low'
+                model = low_noise_model
                 guide_scale = config.sample_guide_scale[0]
-
-            if needed != current_on_device:
-                if rank == 0:
-                    logger.info(f"  Step {step_idx}: swapping to {needed}_noise_model")
-                if current_on_device == 'high':
-                    high_noise_model = high_noise_model.to('cpu')
-                    low_noise_model = low_noise_model.to(NEURON_DEVICE)
-                else:
-                    low_noise_model = low_noise_model.to('cpu')
-                    high_noise_model = high_noise_model.to(NEURON_DEVICE)
-                current_on_device = needed
-                gc.collect()
-
-            model = high_noise_model if current_on_device == 'high' else low_noise_model
 
             noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0]
             noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0]
@@ -319,13 +308,6 @@ def main():
         denoise_time = time.time() - denoise_start
         if rank == 0:
             logger.info(f"{run_label} denoising: {denoise_time:.1f}s ({denoise_time/NUM_STEPS:.1f}s/step)")
-
-        # ── Free DiT from device for VAE decode ──
-        if current_on_device == 'high':
-            high_noise_model = high_noise_model.to('cpu')
-        else:
-            low_noise_model = low_noise_model.to('cpu')
-        gc.collect()
 
         # ── Decode with VAE ──
         vae_start = time.time()
