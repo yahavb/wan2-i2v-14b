@@ -1,12 +1,12 @@
-"""Wan2.2-I2V-A14B inference with TP4 on Neuron (m-trn2: 2 NDs, LNC2, 4 NeuronCores).
+"""Wan2.2-I2V-A14B inference with TP8 on Neuron (m-trn2: 2 NDs, LNC2, 8 NeuronCores).
 
-Uses torchrun --nproc_per_node=4 for tensor parallelism.
+Uses torchrun --nproc_per_node=8 for tensor parallelism.
 All models loaded directly on Neuron — no CPU offloading.
-2 NDs × LNC2 = 4 logical NCs, each with ~12GB HBM.
+2 NDs × 4 NCs (LNC2) = 8 NeuronCores, each with ~6GB HBM.
 
 Architecture (Wan2.2-I2V-A14B):
   dim=5120, 40 heads, 40 layers, ffn_dim=13824
-  TP=4: 10 heads/rank, ~3.75B params/rank (~7.5GB bf16)
+  TP=8: 5 heads/rank, ~1.99B params/rank (~4GB bf16)
   Dual model: low_noise_model (t < boundary), high_noise_model (t >= boundary)
   VAE stride: (4, 8, 8), in_dim=16
 """
@@ -41,7 +41,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "/tmp/Wan2.2-I2V-A14B")
-TP_DEGREE = int(os.environ.get("TP_DEGREE", "4"))
+TP_DEGREE = int(os.environ.get("TP_DEGREE", "8"))
 T5_RANK = int(os.environ.get("T5_RANK", "0"))
 VAE_RANK = 0
 

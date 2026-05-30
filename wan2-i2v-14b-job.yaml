@@ -54,10 +54,8 @@ spec:
               value: "ERROR"
             - name: NEURON_CC_FLAGS
               value: "--model-type=transformer"
-            - name: NEURON_LOGICAL_NC_CONFIG
-              value: "2"
             - name: TP_DEGREE
-              value: "4"
+              value: "8"
             - name: T5_RANK
               value: "0"
             - name: VAE_TP_DEGREE
