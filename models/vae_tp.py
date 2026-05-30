@@ -281,7 +281,7 @@ def _shard_residual_block(block, tp_rank, tp_degree):
     #   residual[6] Conv(out→out) row-parallel: LOCAL input → all-reduce → FULL output
     #   Shortcut: FULL→FULL (keep replicated)
     #   x + h: FULL + FULL ✓
-    from wan.modules.vae2_2 import RMS_norm
+    from wan.modules.vae2_1 import RMS_norm
     for i, layer in enumerate(block.residual):
         if isinstance(layer, RMS_norm) and len(conv_indices) >= 2 and i > conv_indices[0]:
             # Only shard the norm AFTER the first (column-parallel) conv

@@ -86,6 +86,7 @@ def main():
     from wan.modules.vae2_1 import Wan2_1_VAE
     from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
     from models.tp_utils import init_tp_group, shard_model_tp, get_tp_rank
+    from models.vae_tp import create_vae_tp_group, shard_vae_model_tp
 
     config = WAN_CONFIGS['i2v-A14B']
 
@@ -181,10 +182,15 @@ def main():
     msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
     msk = msk.transpose(1, 2)[0]
 
+    VAE_TP_DEGREE = int(os.environ.get("VAE_TP_DEGREE", "8"))
+    VAE_TP_RANKS = list(range(VAE_TP_DEGREE))
+
     y_device = torch.zeros((z_dim + 4, T_latent, lat_h, lat_w), dtype=torch.bfloat16, device=NEURON_DEVICE)
 
-    if rank == VAE_RANK:
-        logger.info("Loading VAE and encoding image...")
+    # Load VAE on all VAE TP ranks, shard decoder
+    if rank in VAE_TP_RANKS:
+        if rank == 0:
+            logger.info(f"Loading VAE with TP={VAE_TP_DEGREE}...")
         vae = Wan2_1_VAE(
             vae_pth=os.path.join(MODEL_PATH, config.vae_checkpoint),
             device=torch.device('cpu'))
@@ -193,6 +199,14 @@ def main():
         vae.std = vae.std.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
         vae.scale = [vae.mean, 1.0 / vae.std]
 
+        # Create VAE TP group and shard decoder
+        create_vae_tp_group(VAE_TP_RANKS)
+        vae_tp_rank = VAE_TP_RANKS.index(rank)
+        shard_vae_model_tp(vae.model, vae_tp_rank, VAE_TP_DEGREE)
+        if rank == 0:
+            logger.info(f"VAE TP={VAE_TP_DEGREE} sharded on all ranks")
+
+        # Encode image (encoder is replicated, all ranks get same result)
         img_for_vae = torch.nn.functional.interpolate(
             img_tensor[None], size=(oh, ow), mode='bicubic').transpose(0, 1)
         img_seq = torch.cat([img_for_vae, torch.zeros(3, F - 1, oh, ow)], dim=1)
@@ -200,14 +214,16 @@ def main():
         z_result = z[0].to(torch.bfloat16)
         msk_device = msk.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
         y_device = torch.cat([msk_device, z_result], dim=0)
-        logger.info(f"VAE encode done: y shape = {y_device.shape}")
-        # Keep VAE for decode later but free encoder scratch
+        if rank == 0:
+            logger.info(f"VAE encode done: y shape = {y_device.shape}")
         del z, z_result, img_seq, img_for_vae
         gc.collect()
     else:
         vae = None
 
-    dist.broadcast(y_device, src=VAE_RANK)
+    # Broadcast y to any ranks not in VAE TP group (if VAE_TP_DEGREE < TP_DEGREE)
+    if VAE_TP_DEGREE < TP_DEGREE:
+        dist.broadcast(y_device, src=VAE_RANK)
 
     # ── Load DiT models with TP sharding (one on device at a time) ──
     init_tp_group(tp_degree=TP_DEGREE)
@@ -316,22 +332,31 @@ def main():
         if rank == 0:
             logger.info(f"{run_label} denoising: {denoise_time:.1f}s ({denoise_time/NUM_STEPS:.1f}s/step)")
 
-        # ── Decode with VAE ──
+        # ── Free DiT for VAE decode ──
+        if current_on_device == 'high':
+            high_noise_model = high_noise_model.to('cpu')
+        else:
+            low_noise_model = low_noise_model.to('cpu')
+        gc.collect()
+
+        # ── Decode with VAE (TP across all VAE ranks) ──
         vae_start = time.time()
-        if rank == VAE_RANK:
-            logger.info(f"{run_label} VAE decode...")
+        if rank in VAE_TP_RANKS:
+            if rank == 0:
+                logger.info(f"{run_label} VAE decode (TP={VAE_TP_DEGREE})...")
             x0 = [latent.to(torch.bfloat16)]
             videos = vae.decode(x0)
-            video = videos[0]
-            import imageio
-            output_path = "/tmp/wan2_i2v_output.mp4"
-            video_cpu = video.cpu().float()
-            video_np = ((video_cpu.clamp(-1, 1) * 0.5 + 0.5) * 255).byte()
-            if video_np.dim() == 4 and video_np.shape[0] == 3:
-                video_np = video_np.permute(1, 2, 3, 0)
-            frames = [video_np[i].numpy() for i in range(video_np.shape[0])]
-            imageio.mimwrite(output_path, frames, fps=16, codec='libx264')
-            logger.info(f"Video saved to {output_path} ({len(frames)} frames)")
+            if rank == 0:
+                video = videos[0]
+                import imageio
+                output_path = "/tmp/wan2_i2v_output.mp4"
+                video_cpu = video.cpu().float()
+                video_np = ((video_cpu.clamp(-1, 1) * 0.5 + 0.5) * 255).byte()
+                if video_np.dim() == 4 and video_np.shape[0] == 3:
+                    video_np = video_np.permute(1, 2, 3, 0)
+                frames = [video_np[i].numpy() for i in range(video_np.shape[0])]
+                imageio.mimwrite(output_path, frames, fps=16, codec='libx264')
+                logger.info(f"Video saved to {output_path} ({len(frames)} frames)")
 
         dist.barrier()
         vae_time = time.time() - vae_start
