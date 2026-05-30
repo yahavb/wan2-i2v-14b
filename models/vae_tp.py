@@ -400,14 +400,14 @@ def shard_vae_decoder_tp(decoder, tp_rank: int, tp_degree: int):
         elif type(layer).__name__ == 'AttentionBlock':
             decoder.middle[i] = _shard_attention_block(layer, tp_rank, tp_degree)
 
-    # Shard upsample blocks
-    for i, up_block in enumerate(decoder.upsamples):
-        # Up_ResidualBlock contains .upsamples (nn.Sequential of ResidualBlock + Resample)
-        for j, layer in enumerate(up_block.upsamples):
-            if type(layer).__name__ == 'ResidualBlock':
-                up_block.upsamples[j] = _shard_residual_block(layer, tp_rank, tp_degree)
-            elif type(layer).__name__ == 'Resample':
-                up_block.upsamples[j] = _shard_resample(layer, tp_rank, tp_degree)
+    # Shard upsample blocks (flat nn.Sequential in vae2_1)
+    for i, layer in enumerate(decoder.upsamples):
+        if type(layer).__name__ == 'ResidualBlock':
+            decoder.upsamples[i] = _shard_residual_block(layer, tp_rank, tp_degree)
+        elif type(layer).__name__ == 'AttentionBlock':
+            decoder.upsamples[i] = _shard_attention_block(layer, tp_rank, tp_degree)
+        elif type(layer).__name__ == 'Resample':
+            decoder.upsamples[i] = _shard_resample(layer, tp_rank, tp_degree)
 
     # Head: [RMS_norm(out_dim), SiLU, CausalConv3d(out_dim, 12, 3)]
     # After last ResidualBlock row-parallel all-reduce → FULL channels in.
