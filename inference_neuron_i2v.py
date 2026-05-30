@@ -209,12 +209,12 @@ def main():
 
     dist.broadcast(y_device, src=VAE_RANK)
 
-    # ── Load both DiT models with TP sharding ──
+    # ── Load DiT models with TP sharding (one on device at a time) ──
     init_tp_group(tp_degree=TP_DEGREE)
     tp_rank = get_tp_rank()
 
     if rank == 0:
-        logger.info(f"Loading high_noise_model...")
+        logger.info(f"Loading high_noise_model (on device first — runs for t >= boundary)...")
     high_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.high_noise_checkpoint)
     high_noise_model.eval().requires_grad_(False)
     shard_model_tp(high_noise_model, tp_rank, TP_DEGREE)
@@ -229,23 +229,15 @@ def main():
         block.ffn = torch.compile(block.ffn, backend='neuron', dynamic=False)
 
     if rank == 0:
-        logger.info(f"Loading low_noise_model...")
+        logger.info(f"Loading low_noise_model (stays on CPU until boundary)...")
     low_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.low_noise_checkpoint)
     low_noise_model.eval().requires_grad_(False)
     shard_model_tp(low_noise_model, tp_rank, TP_DEGREE)
-    low_noise_model = low_noise_model.to(torch.bfloat16).to(NEURON_DEVICE)
-
-    if rank == 0:
-        logger.info("Compiling low_noise_model...")
-    low_noise_model.patch_embedding = torch.compile(low_noise_model.patch_embedding, backend='neuron', dynamic=False)
-    low_noise_model.text_embedding = torch.compile(low_noise_model.text_embedding, backend='neuron', dynamic=False)
-    low_noise_model.head = torch.compile(low_noise_model.head, backend='neuron', dynamic=False)
-    for block in low_noise_model.blocks:
-        block.ffn = torch.compile(block.ffn, backend='neuron', dynamic=False)
+    low_noise_model = low_noise_model.to(torch.bfloat16)
 
     dist.barrier()
     if rank == 0:
-        logger.info("All models loaded!")
+        logger.info("DiT ready (high_noise on device, low_noise on CPU)")
 
     if rank == 0:
         logger.info("-" * 70)
@@ -266,6 +258,7 @@ def main():
     latent_orig = noise.clone()
     run_results = []
     boundary = config.boundary * config.num_train_timesteps
+    current_on_device = 'high'
 
     for run_idx in range(NUM_RUNS):
         run_label = f"Run {run_idx+1}/{NUM_RUNS}"
@@ -288,11 +281,25 @@ def main():
             timestep = torch.tensor([t.item()], device=NEURON_DEVICE)
 
             if t.item() >= boundary:
-                model = high_noise_model
+                needed = 'high'
                 guide_scale = config.sample_guide_scale[1]
             else:
-                model = low_noise_model
+                needed = 'low'
                 guide_scale = config.sample_guide_scale[0]
+
+            if needed != current_on_device:
+                if rank == 0:
+                    logger.info(f"  Step {step_idx}: swapping to {needed}_noise_model")
+                if current_on_device == 'high':
+                    high_noise_model = high_noise_model.to('cpu')
+                    low_noise_model = low_noise_model.to(NEURON_DEVICE)
+                else:
+                    low_noise_model = low_noise_model.to('cpu')
+                    high_noise_model = high_noise_model.to(NEURON_DEVICE)
+                current_on_device = needed
+                gc.collect()
+
+            model = high_noise_model if current_on_device == 'high' else low_noise_model
 
             noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0]
             noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0]
