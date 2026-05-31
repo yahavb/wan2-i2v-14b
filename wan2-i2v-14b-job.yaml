@@ -67,7 +67,7 @@ spec:
             - name: NUM_RUNS
               value: "1"
             - name: FRAME_NUM
-              value: "33"
+              value: "17"
             - name: INSTANCE_TYPE
               value: "trn2.48xlarge"
             - name: LNC_CONFIG
