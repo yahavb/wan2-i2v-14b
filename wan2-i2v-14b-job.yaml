@@ -59,7 +59,7 @@ spec:
             - name: T5_RANK
               value: "0"
             - name: VAE_TP_DEGREE
-              value: "8"
+              value: "2"
             - name: USE_NKI_KERNELS
               value: "1"
             - name: NUM_STEPS
