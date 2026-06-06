@@ -65,33 +65,34 @@ def _nki_cross_attention(q, k, v, dtype=torch.bfloat16):
     Input shapes: q [B, L1, n, d], k [B, L2, n, d], v [B, L2, n, d]
     Output shape: [B, L1, n, d]
 
-    Supports B > 1 by looping over the batch dimension (for CFG batching).
+    Folds batch into head dimension for a single kernel call (bs = B*n).
     """
     b, l1, n, d = q.shape
     l2 = k.shape[1]
 
     # Kernel expects: q(bs, d, seq_q), k(bs, d, seq_k), v(bs, seq_k, d)
-    # where bs = num_heads (we process one batch element at a time)
+    # Fold batch into heads: bs = B * n
     P = 128
     pad_q = (P - l1 % P) % P
     identity = _get_identity(q.device, dtype)
     softmax_scale = 1.0 / math.sqrt(d)
 
-    outputs = []
-    for i in range(b):
-        q_nki = q[i].permute(1, 2, 0).contiguous()  # [n, d, L1]
-        k_nki = k[i].permute(1, 2, 0).contiguous()  # [n, d, L2]
-        v_nki = v[i].permute(1, 0, 2).contiguous()  # [n, L2, d]
+    # Reshape: [B, L, n, d] -> [B*n, d, L] (fold B into head dim)
+    q_nki = q.permute(0, 2, 3, 1).reshape(b * n, d, l1).contiguous()  # [B*n, d, L1]
+    k_nki = k.permute(0, 2, 3, 1).reshape(b * n, d, l2).contiguous()  # [B*n, d, L2]
+    v_nki = v.permute(0, 2, 1, 3).reshape(b * n, l2, d).contiguous()  # [B*n, L2, d]
 
-        if pad_q > 0:
-            q_nki = F.pad(q_nki, (0, pad_q))
+    if pad_q > 0:
+        q_nki = F.pad(q_nki, (0, pad_q))
 
-        out_nki = _nki_cross_attn(
-            q_nki, k_nki, v_nki, identity, softmax_scale=softmax_scale
-        )
-        outputs.append(out_nki[:l1].unsqueeze(0))  # [1, L1, n, d]
+    out_nki = _nki_cross_attn(
+        q_nki, k_nki, v_nki, identity, softmax_scale=softmax_scale
+    )
 
-    return torch.cat(outputs, dim=0)  # [B, L1, n, d]
+    # Output: [L1_padded, B*n, d] -> [B, L1, n, d]
+    out = out_nki[:l1]  # [L1, B*n, d]
+    out = out.view(l1, b, n, d).permute(1, 0, 2, 3)  # [B, L1, n, d]
+    return out.contiguous()
 
 
 def _nki_self_attention(q, k, v, dtype=torch.bfloat16):
@@ -100,7 +101,7 @@ def _nki_self_attention(q, k, v, dtype=torch.bfloat16):
     Input shapes: q [B, L, n, d], k [B, L, n, d], v [B, L, n, d]
     Output shape: [B, L, n, d]
 
-    Supports B > 1 by looping over the batch dimension (for CFG batching).
+    Folds batch into head dimension for a single kernel call (bs = B*n).
     """
     b, l, n, d = q.shape
 
@@ -112,38 +113,38 @@ def _nki_self_attention(q, k, v, dtype=torch.bfloat16):
     identity = _get_identity(q.device, dtype)
     softmax_scale = 1.0 / math.sqrt(d)
 
-    # Build mask once (shared across batch elements)
+    # Build mask once (shared across all batch*head elements)
     seqlen_k_padded = l + pad_k
     num_sections = seqlen_k_padded // SELF_ATTN_SEQLEN_MULTIPLE
     mask = torch.zeros(P, seqlen_k_padded, dtype=dtype, device=q.device)
     if pad_k > 0:
         mask[:, l:] = float("-inf")
 
-    outputs = []
-    for i in range(b):
-        q_nki = q[i].permute(1, 2, 0).contiguous()  # [n, d, L]
-        k_nki = k[i].permute(1, 2, 0).contiguous()  # [n, d, L]
-        v_nki = v[i].permute(1, 0, 2).contiguous()  # [n, L, d]
+    # Reshape: [B, L, n, d] -> [B*n, d, L] (fold B into head dim)
+    q_nki = q.permute(0, 2, 3, 1).reshape(b * n, d, l).contiguous()  # [B*n, d, L]
+    k_nki = k.permute(0, 2, 3, 1).reshape(b * n, d, l).contiguous()  # [B*n, d, L]
+    v_nki = v.permute(0, 2, 1, 3).reshape(b * n, l, d).contiguous()  # [B*n, L, d]
 
-        if pad_q > 0:
-            q_nki = F.pad(q_nki, (0, pad_q))
-        if pad_k > 0:
-            k_nki = F.pad(k_nki, (0, pad_k))
-            v_nki = F.pad(v_nki, (0, 0, 0, pad_k))
+    if pad_q > 0:
+        q_nki = F.pad(q_nki, (0, pad_q))
+    if pad_k > 0:
+        k_nki = F.pad(k_nki, (0, pad_k))
+        v_nki = F.pad(v_nki, (0, 0, 0, pad_k))
 
-        out_nki = _nki_self_attn(
-            q_nki,
-            k_nki,
-            v_nki,
-            identity,
-            mask,
-            softmax_scale=softmax_scale,
-            num_sections=num_sections,
-        )
+    out_nki = _nki_self_attn(
+        q_nki,
+        k_nki,
+        v_nki,
+        identity,
+        mask,
+        softmax_scale=softmax_scale,
+        num_sections=num_sections,
+    )
 
-        outputs.append(out_nki[:l].unsqueeze(0))  # [1, L, n, d]
-
-    return torch.cat(outputs, dim=0)  # [B, L, n, d]
+    # Output: [L_padded, B*n, d] -> [B, L, n, d]
+    out = out_nki[:l]  # [L, B*n, d]
+    out = out.view(l, b, n, d).permute(1, 0, 2, 3)  # [B, L, n, d]
+    return out.contiguous()
 
 
 def attention(
