@@ -62,6 +62,7 @@ LNC_CONFIG = os.environ.get("LNC_CONFIG", "LNC2")
 NUM_NEURON_DEVICES = os.environ.get("NUM_NEURON_DEVICES", "1")
 USE_NKI_KERNELS = os.environ.get("USE_NKI_KERNELS", "1")
 CFG_BATCH = os.environ.get("CFG_BATCH", "1") == "1"
+DUAL_MODEL = os.environ.get("DUAL_MODEL", "1") == "1"
 
 
 def main():
@@ -79,6 +80,7 @@ def main():
         logger.info(f"  World size:      {world_size}")
         logger.info(f"  NKI kernels:     {USE_NKI_KERNELS}")
         logger.info(f"  CFG batch:       {CFG_BATCH}")
+        logger.info(f"  Dual model:      {DUAL_MODEL}")
         logger.info(f"  T5 rank:         {T5_RANK}")
         logger.info(f"  Frame count:     {FRAME_NUM}")
         logger.info("=" * 70)
@@ -281,17 +283,36 @@ def main():
         block.ffn = torch.compile(block.ffn, backend="neuron", dynamic=False)
 
     if rank == 0:
-        logger.info(f"Loading low_noise_model (stays on CPU until boundary)...")
+        logger.info(f"Loading low_noise_model...")
     low_noise_model = WanModel.from_pretrained(
         MODEL_PATH, subfolder=config.low_noise_checkpoint
     )
     low_noise_model.eval().requires_grad_(False)
     shard_model_tp(low_noise_model, tp_rank, TP_DEGREE)
-    low_noise_model = low_noise_model.to(torch.bfloat16)
+    if DUAL_MODEL:
+        low_noise_model = low_noise_model.to(torch.bfloat16).to(NEURON_DEVICE)
+        if rank == 0:
+            logger.info("Compiling low_noise_model...")
+        low_noise_model.patch_embedding = torch.compile(
+            low_noise_model.patch_embedding, backend="neuron", dynamic=False
+        )
+        low_noise_model.text_embedding = torch.compile(
+            low_noise_model.text_embedding, backend="neuron", dynamic=False
+        )
+        low_noise_model.head = torch.compile(
+            low_noise_model.head, backend="neuron", dynamic=False
+        )
+        for block in low_noise_model.blocks:
+            block.ffn = torch.compile(block.ffn, backend="neuron", dynamic=False)
+    else:
+        low_noise_model = low_noise_model.to(torch.bfloat16)
 
     dist.barrier()
     if rank == 0:
-        logger.info("DiT ready (high_noise on device, low_noise on CPU)")
+        if DUAL_MODEL:
+            logger.info("DiT ready (both models on device — no swap needed)")
+        else:
+            logger.info("DiT ready (high_noise on device, low_noise on CPU)")
 
     if rank == 0:
         logger.info("-" * 70)
@@ -357,7 +378,7 @@ def main():
                 needed = "low"
                 guide_scale = config.sample_guide_scale[0]
 
-            if needed != current_on_device:
+            if not DUAL_MODEL and needed != current_on_device:
                 if rank == 0:
                     logger.info(f"  Step {step_idx}: swapping to {needed}_noise_model")
                 if current_on_device == "high":
@@ -369,7 +390,7 @@ def main():
                 current_on_device = needed
                 gc.collect()
 
-            model = high_noise_model if current_on_device == "high" else low_noise_model
+            model = high_noise_model if needed == "high" else low_noise_model
 
             if CFG_BATCH:
                 # Single forward pass with batch_size=2: [uncond, cond]
@@ -405,12 +426,13 @@ def main():
                 f"{run_label} denoising: {denoise_time:.1f}s ({denoise_time / NUM_STEPS:.1f}s/step)"
             )
 
-        # ── Free DiT for VAE decode ──
-        if current_on_device == "high":
-            high_noise_model = high_noise_model.to("cpu")
-        else:
-            low_noise_model = low_noise_model.to("cpu")
-        gc.collect()
+        # ── Free DiT for VAE decode (only needed in swap mode) ──
+        if not DUAL_MODEL:
+            if current_on_device == "high":
+                high_noise_model = high_noise_model.to("cpu")
+            else:
+                low_noise_model = low_noise_model.to("cpu")
+            gc.collect()
 
         # ── Decode with VAE (TP across all VAE ranks) ──
         vae_start = time.time()
