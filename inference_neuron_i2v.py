@@ -1,14 +1,26 @@
-"""Wan2.2-I2V-A14B inference with TP8 on Neuron (m-trn2: 2 NDs, LNC2, 8 NeuronCores).
+"""Wan2.2-I2V-A14B inference with TP4 on Neuron (trn2.3xlarge, LNC2, 4 NeuronCores).
 
-Uses torchrun --nproc_per_node=8 for tensor parallelism.
+Uses torchrun --nproc_per_node=4 for tensor parallelism.
 All models loaded directly on Neuron — no CPU offloading.
-2 NDs × 4 NCs (LNC2) = 8 NeuronCores, each with ~6GB HBM.
+1 ND × 4 NCs (LNC2) = 4 NeuronCores, each with ~24GB HBM.
 
 Architecture (Wan2.2-I2V-A14B):
   dim=5120, 40 heads, 40 layers, ffn_dim=13824
-  TP=8: 5 heads/rank, ~1.99B params/rank (~4GB bf16)
+  TP=4: 10 heads/rank, ~3.75B params/rank (~7.5GB bf16)
   Dual model: low_noise_model (t < boundary), high_noise_model (t >= boundary)
   VAE stride: (4, 8, 8), in_dim=16
+
+Optimizations:
+  - CFG_BATCH=1: Batches uncond+cond in single forward pass (10.5% faster)
+  - DUAL_MODEL=1: Both noise models resident on device (0s swap vs 4s)
+  - Compiler flags: --model-type=transformer --distribution-strategy=llm-training
+
+Recommended run command:
+  NEURON_CC_FLAGS="--model-type=transformer --distribution-strategy=llm-training" \\
+  torchrun --nproc_per_node=4 --master_port=29500 inference_neuron_i2v.py
+
+Performance (480x368, 17 frames, 10 steps, warm):
+  - Step: 6.0s | Denoise: 59.9s | VAE: 4.1s | Total: 63.9s
 """
 
 import os
