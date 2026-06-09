@@ -28,14 +28,11 @@ snapshot_download('Wan-AI/Wan2.2-I2V-A14B', local_dir='${MODEL_LOCAL}', local_di
 fi
 echo "Model weights ready at $MODEL_LOCAL"
 
-# ─── Profiling DISABLED (saves ~5GB HBM on single chip) ──────
-# To re-enable: set NEURON_RT_INSPECT_ENABLE=1 in the job manifest
-# export NEURON_RT_INSPECT_ENABLE=1
-# export NEURON_RT_INSPECT_OUTPUT_DIR=/tmp/neuron_profile
-# export NEURON_RT_INSPECT_DEVICE_PROFILE=session
-# mkdir -p /tmp/neuron_profile
+# ─── Native PyTorch Neuron profiler (captures NEFF+NTFF pairs) ────
+export NEURON_PROFILE_ENABLE=1
+export NEURON_PROFILE_DIR=/tmp/neuron_profile
 echo "============================================"
-echo "  Profiling DISABLED (HBM conservation)"
+echo "  Native Neuron Profiler ENABLED"
 echo "============================================"
 
 # ─── Launch with torchrun (TP=2, single chip) ────────────────
@@ -43,30 +40,69 @@ export WAN_DIR="${SCRIPT_DIR}"
 export MODEL_PATH=/tmp/Wan2.2-I2V-A14B
 
 cd "${SCRIPT_DIR}"
-torchrun --nproc_per_node=${TP_DEGREE:-8} --master_port=29500 \
+WORLD_SIZE=$(( ${TP_DEGREE:-4} * ${SP_DEGREE:-2} ))
+torchrun --nproc_per_node=${WORLD_SIZE} --master_port=29500 \
   "${SCRIPT_DIR}/inference_neuron_i2v.py" 2>&1 || true
 
-# ─── Neuron Explorer analysis (only if profiling was enabled) ─
-PROFILE_DIR="/tmp/neuron_profile"
-if [[ -d "$PROFILE_DIR" && -n "$(ls -A $PROFILE_DIR 2>/dev/null)" ]]; then
-  NTFF_DIR=$(find "$PROFILE_DIR" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | head -1)
-  if [[ -n "$NTFF_DIR" ]]; then
-    echo ""
-    echo "============================================"
-    echo "  NEURON EXPLORER ANALYSIS"
-    echo "============================================"
+# ─── Neuron Explorer: analyze traces ───────────────────────
+PROFILE_DEST="/tmp/neuron_profile"
+if [[ -d "$PROFILE_DEST" && -n "$(ls -A $PROFILE_DEST 2>/dev/null)" ]]; then
+  echo ""
+  echo "============================================"
+  echo "  NEURON EXPLORER ANALYSIS"
+  echo "============================================"
 
-    neuron-explorer view -d "$NTFF_DIR" \
-      --output-format summary-text \
-      --ignore-dma-trace 2>&1 | tee /tmp/neuron_explorer_summary.txt || true
-
-    neuron-explorer view -d "$NTFF_DIR" \
-      --output-format json \
-      --output-file /tmp/neuron_explorer_profile.json \
-      --ignore-dma-trace 2>&1 | tee /tmp/neuron_explorer_view.log || true
+  # Copy NEFFs into session dirs so explorer can match NEFF+NTFF pairs
+  if [[ -d "$PROFILE_DEST/neffs" ]]; then
+    for session_dir in $(find "$PROFILE_DEST" -name "*.ntff" -printf '%h\n' 2>/dev/null | sort -u); do
+      cp "$PROFILE_DEST/neffs/"*.neff "$session_dir/" 2>/dev/null || true
+    done
+    echo "Copied NEFFs into session directories"
   fi
+
+  NTFF_DIR=$(find "$PROFILE_DEST" -name "*.ntff" -printf '%h\n' 2>/dev/null | head -1)
+
+  echo "=== neuron-explorer view (summary-text) ==="
+  neuron-explorer view -d "$NTFF_DIR" \
+    --output-format summary-text \
+    2>&1 | tee /tmp/neuron_explorer_summary.txt || true
+
+  echo ""
+  echo "=== neuron-explorer view (JSON) ==="
+  neuron-explorer view -d "$NTFF_DIR" \
+    --output-format json \
+    --output-file /tmp/neuron_explorer_profile.json \
+    2>&1 | tee /tmp/neuron_explorer_view.log || true
+
+  echo ""
+  echo "=== NEFF COUNT AND SIZE DISTRIBUTION ==="
+  NEFF_COUNT=$(find "$NTFF_DIR" -name '*.neff' | wc -l)
+  echo "Total NEFFs: $NEFF_COUNT"
+  find "$NTFF_DIR" -name '*.neff' -exec ls -l '{}' ';' | awk '{print $5}' | sort -n | awk '
+    BEGIN { count=0; sum=0 }
+    { sizes[count++]=$1; sum+=$1 }
+    END {
+      if (count == 0) { print "No NEFFs found"; exit }
+      printf "Total size: %.2f MB\n", sum/1024/1024
+      printf "Min: %d bytes\n", sizes[0]
+      printf "Max: %d bytes (%.2f MB)\n", sizes[count-1], sizes[count-1]/1024/1024
+      printf "Median: %d bytes\n", sizes[int(count/2)]
+      printf "Mean: %.0f bytes\n", sum/count
+      printf "\nSize buckets:\n"
+      small=0; med=0; large=0; xlarge=0
+      for(i=0;i<count;i++) {
+        if(sizes[i]<10000) small++
+        else if(sizes[i]<100000) med++
+        else if(sizes[i]<1000000) large++
+        else xlarge++
+      }
+      printf "  <10KB  (tiny):   %d\n", small
+      printf "  10-100KB (small): %d\n", med
+      printf "  100KB-1MB (med):  %d\n", large
+      printf "  >1MB  (large):    %d\n", xlarge
+    }'
 else
-  echo "Profiling was disabled — skipping neuron-explorer"
+  echo "WARNING: No profile directory found for neuron-explorer"
 fi
 
 # ─── Archive results to S3 ───────────────────────────────────
@@ -81,7 +117,7 @@ cp /tmp/wan2_i2v_output.mp4 "$ARCHIVE_DIR/" 2>/dev/null || true
 cp /tmp/neuron_explorer_summary.txt "$ARCHIVE_DIR/" 2>/dev/null || true
 cp /tmp/neuron_explorer_profile.json "$ARCHIVE_DIR/" 2>/dev/null || true
 cp /tmp/neuron_explorer_view.log "$ARCHIVE_DIR/" 2>/dev/null || true
-cp -r /tmp/neuron_profile "$ARCHIVE_DIR/profiles" 2>/dev/null || true
+cp -r "$PROFILE_DEST" "$ARCHIVE_DIR/profiles" 2>/dev/null || true
 echo "Archive complete!"
 ls -la "$ARCHIVE_DIR/" 2>/dev/null || true
 

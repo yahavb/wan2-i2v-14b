@@ -26,7 +26,7 @@ spec:
             - |
               set -euxo pipefail
               cd /tmp
-              git clone https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-i2v-14b.git
+              git clone -b tp4-sp2 https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-i2v-14b.git
               cd wan2-i2v-14b
               bash setup.sh
           resources:
@@ -55,7 +55,9 @@ spec:
             - name: NEURON_CC_FLAGS
               value: "--model-type=transformer"
             - name: TP_DEGREE
-              value: "8"
+              value: "4"
+            - name: SP_DEGREE
+              value: "2"
             - name: T5_RANK
               value: "0"
             - name: VAE_TP_DEGREE

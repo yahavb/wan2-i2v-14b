@@ -41,7 +41,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "/tmp/Wan2.2-I2V-A14B")
-TP_DEGREE = int(os.environ.get("TP_DEGREE", "8"))
+TP_DEGREE = int(os.environ.get("TP_DEGREE", "4"))
+SP_DEGREE = int(os.environ.get("SP_DEGREE", "2"))
 T5_RANK = int(os.environ.get("T5_RANK", "0"))
 VAE_RANK = 0
 
@@ -74,6 +75,7 @@ def main():
         logger.info(f"  LNC config:      {LNC_CONFIG}")
         logger.info(f"  NeuronDevices:   {NUM_NEURON_DEVICES}")
         logger.info(f"  TP degree:       {TP_DEGREE}")
+        logger.info(f"  SP degree:       {SP_DEGREE}")
         logger.info(f"  World size:      {world_size}")
         logger.info(f"  NKI kernels:     {USE_NKI_KERNELS}")
         logger.info(f"  T5 rank:         {T5_RANK}")
@@ -87,6 +89,9 @@ def main():
     from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
     from models.tp_utils import init_tp_group, shard_model_tp, get_tp_rank
     from models.vae_tp import create_vae_tp_group, shard_vae_model_tp
+    from models.parallel_state import init_sp_group
+    from models.sp_attention import patch_model_for_sp
+    from models.sp_model import make_sp_forward
 
     config = WAN_CONFIGS['i2v-A14B']
 
@@ -225,8 +230,9 @@ def main():
     if VAE_TP_DEGREE < TP_DEGREE:
         dist.broadcast(y_device, src=VAE_RANK)
 
-    # ── Load DiT models with TP sharding (one on device at a time) ──
+    # ── Load DiT models with TP + SP sharding ──
     init_tp_group(tp_degree=TP_DEGREE)
+    init_sp_group(tp_degree=TP_DEGREE)
     tp_rank = get_tp_rank()
 
     if rank == 0:
@@ -234,6 +240,8 @@ def main():
     high_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.high_noise_checkpoint)
     high_noise_model.eval().requires_grad_(False)
     shard_model_tp(high_noise_model, tp_rank, TP_DEGREE)
+    patch_model_for_sp(high_noise_model)
+    make_sp_forward(high_noise_model)
     high_noise_model = high_noise_model.to(torch.bfloat16).to(NEURON_DEVICE)
 
     if rank == 0:
@@ -249,6 +257,8 @@ def main():
     low_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.low_noise_checkpoint)
     low_noise_model.eval().requires_grad_(False)
     shard_model_tp(low_noise_model, tp_rank, TP_DEGREE)
+    patch_model_for_sp(low_noise_model)
+    make_sp_forward(low_noise_model)
     low_noise_model = low_noise_model.to(torch.bfloat16)
 
     dist.barrier()
