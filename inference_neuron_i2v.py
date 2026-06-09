@@ -1,15 +1,28 @@
-"""Wan2.2-I2V-A14B inference with TP8 on Neuron (m-trn2: 2 NDs, LNC2, 8 NeuronCores).
+"""Wan2.2-I2V-A14B inference with TP4 on Neuron (trn2.3xlarge, LNC2, 4 NeuronCores).
 
-Uses torchrun --nproc_per_node=8 for tensor parallelism.
+Uses torchrun --nproc_per_node=4 for tensor parallelism.
 All models loaded directly on Neuron — no CPU offloading.
-2 NDs × 4 NCs (LNC2) = 8 NeuronCores, each with ~6GB HBM.
+1 ND × 4 NCs (LNC2) = 4 NeuronCores, each with ~24GB HBM.
 
 Architecture (Wan2.2-I2V-A14B):
   dim=5120, 40 heads, 40 layers, ffn_dim=13824
-  TP=8: 5 heads/rank, ~1.99B params/rank (~4GB bf16)
+  TP=4: 10 heads/rank, ~3.75B params/rank (~7.5GB bf16)
   Dual model: low_noise_model (t < boundary), high_noise_model (t >= boundary)
   VAE stride: (4, 8, 8), in_dim=16
+
+Optimizations:
+  - CFG_BATCH=1: Batches uncond+cond in single forward pass (10.5% faster)
+  - DUAL_MODEL=1: Both noise models resident on device (0s swap vs 4s)
+  - Compiler flags: --model-type=transformer --distribution-strategy=llm-training
+
+Recommended run command:
+  NEURON_CC_FLAGS="--model-type=transformer --distribution-strategy=llm-training" \\
+  torchrun --nproc_per_node=4 --master_port=29500 inference_neuron_i2v.py
+
+Performance (480x368, 17 frames, 10 steps, warm):
+  - Step: 6.0s | Denoise: 59.9s | VAE: 4.1s | Total: 63.9s
 """
+
 import os
 import sys
 import time
@@ -26,11 +39,11 @@ from tqdm import tqdm
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s %(levelname)s [rank %(process)d]: %(message)s',
+    format="%(asctime)s %(levelname)s [rank %(process)d]: %(message)s",
     stream=sys.stdout,
     force=True,
 )
-for name in ['torch', 'transformers', 'torch_neuronx', 'torch_mlir']:
+for name in ["torch", "transformers", "torch_neuronx", "torch_mlir"]:
     logging.getLogger(name).setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 
@@ -60,6 +73,8 @@ INSTANCE_TYPE = os.environ.get("INSTANCE_TYPE", "trn2.48xlarge")
 LNC_CONFIG = os.environ.get("LNC_CONFIG", "LNC2")
 NUM_NEURON_DEVICES = os.environ.get("NUM_NEURON_DEVICES", "1")
 USE_NKI_KERNELS = os.environ.get("USE_NKI_KERNELS", "1")
+CFG_BATCH = os.environ.get("CFG_BATCH", "1") == "1"
+DUAL_MODEL = os.environ.get("DUAL_MODEL", "1") == "1"
 
 
 def main():
@@ -76,6 +91,8 @@ def main():
         logger.info(f"  TP degree:       {TP_DEGREE}")
         logger.info(f"  World size:      {world_size}")
         logger.info(f"  NKI kernels:     {USE_NKI_KERNELS}")
+        logger.info(f"  CFG batch:       {CFG_BATCH}")
+        logger.info(f"  Dual model:      {DUAL_MODEL}")
         logger.info(f"  T5 rank:         {T5_RANK}")
         logger.info(f"  Frame count:     {FRAME_NUM}")
         logger.info("=" * 70)
@@ -88,7 +105,7 @@ def main():
     from models.tp_utils import init_tp_group, shard_model_tp, get_tp_rank
     from models.vae_tp import create_vae_tp_group, shard_vae_model_tp
 
-    config = WAN_CONFIGS['i2v-A14B']
+    config = WAN_CONFIGS["i2v-A14B"]
 
     # ── Encode prompt with T5 (then free it — not needed during denoising) ──
     prompt = (
@@ -100,21 +117,26 @@ def main():
     n_prompt = config.sample_neg_prompt
 
     ctx_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
-    ctx_null_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
+    ctx_null_tensor = torch.zeros(
+        1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE
+    )
 
     if rank == T5_RANK:
         logger.info("Loading T5...")
         text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
-            device=torch.device('cpu'),
+            device=torch.device("cpu"),
             checkpoint_path=os.path.join(MODEL_PATH, config.t5_checkpoint),
-            tokenizer_path=os.path.join(MODEL_PATH, config.t5_tokenizer))
+            tokenizer_path=os.path.join(MODEL_PATH, config.t5_tokenizer),
+        )
         text_encoder.model = text_encoder.model.to(NEURON_DEVICE)
         context = text_encoder([prompt], NEURON_DEVICE)
         context_null = text_encoder([n_prompt], NEURON_DEVICE)
-        ctx_tensor[0, :context[0].shape[0]] = context[0].to(torch.bfloat16)
-        ctx_null_tensor[0, :context_null[0].shape[0]] = context_null[0].to(torch.bfloat16)
+        ctx_tensor[0, : context[0].shape[0]] = context[0].to(torch.bfloat16)
+        ctx_null_tensor[0, : context_null[0].shape[0]] = context_null[0].to(
+            torch.bfloat16
+        )
         del text_encoder, context, context_null
         gc.collect()
         logger.info("T5 encoded and freed")
@@ -146,9 +168,17 @@ def main():
     ih, iw = img.height, img.width
     aspect_ratio = ih / iw
     lat_h = round(
-        np.sqrt(max_area * aspect_ratio) // vae_stride[1] // patch_size[1] * patch_size[1])
+        np.sqrt(max_area * aspect_ratio)
+        // vae_stride[1]
+        // patch_size[1]
+        * patch_size[1]
+    )
     lat_w = round(
-        np.sqrt(max_area / aspect_ratio) // vae_stride[2] // patch_size[2] * patch_size[2])
+        np.sqrt(max_area / aspect_ratio)
+        // vae_stride[2]
+        // patch_size[2]
+        * patch_size[2]
+    )
     oh = lat_h * vae_stride[1]
     ow = lat_w * vae_stride[2]
 
@@ -170,22 +200,30 @@ def main():
 
     z_dim = 16
     noise = torch.randn(
-        z_dim, T_latent, lat_h, lat_w,
-        dtype=torch.float32, generator=seed_g, device=torch.device("cpu"))
+        z_dim,
+        T_latent,
+        lat_h,
+        lat_w,
+        dtype=torch.float32,
+        generator=seed_g,
+        device=torch.device("cpu"),
+    )
 
     # Build I2V mask
     msk = torch.ones(1, F, lat_h, lat_w)
     msk[:, 1:] = 0
-    msk = torch.concat([
-        torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
-    ], dim=1)
+    msk = torch.concat(
+        [torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1
+    )
     msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
     msk = msk.transpose(1, 2)[0]
 
     VAE_TP_DEGREE = int(os.environ.get("VAE_TP_DEGREE", "8"))
     VAE_TP_RANKS = list(range(VAE_TP_DEGREE))
 
-    y_device = torch.zeros((z_dim + 4, T_latent, lat_h, lat_w), dtype=torch.bfloat16, device=NEURON_DEVICE)
+    y_device = torch.zeros(
+        (z_dim + 4, T_latent, lat_h, lat_w), dtype=torch.bfloat16, device=NEURON_DEVICE
+    )
 
     # Load VAE on all VAE TP ranks, shard decoder
     if rank in VAE_TP_RANKS:
@@ -193,7 +231,8 @@ def main():
             logger.info(f"Loading VAE with TP={VAE_TP_DEGREE}...")
         vae = Wan2_1_VAE(
             vae_pth=os.path.join(MODEL_PATH, config.vae_checkpoint),
-            device=torch.device('cpu'))
+            device=torch.device("cpu"),
+        )
         vae.model = vae.model.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
         vae.mean = vae.mean.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
         vae.std = vae.std.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
@@ -208,7 +247,8 @@ def main():
 
         # Encode image (encoder is replicated, all ranks get same result)
         img_for_vae = torch.nn.functional.interpolate(
-            img_tensor[None], size=(oh, ow), mode='bicubic').transpose(0, 1)
+            img_tensor[None], size=(oh, ow), mode="bicubic"
+        ).transpose(0, 1)
         img_seq = torch.cat([img_for_vae, torch.zeros(3, F - 1, oh, ow)], dim=1)
         z = vae.encode([img_seq.to(device=NEURON_DEVICE, dtype=torch.bfloat16)])
         z_result = z[0].to(torch.bfloat16)
@@ -230,37 +270,72 @@ def main():
     tp_rank = get_tp_rank()
 
     if rank == 0:
-        logger.info(f"Loading high_noise_model (on device first — runs for t >= boundary)...")
-    high_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.high_noise_checkpoint)
+        logger.info(
+            f"Loading high_noise_model (on device first — runs for t >= boundary)..."
+        )
+    high_noise_model = WanModel.from_pretrained(
+        MODEL_PATH, subfolder=config.high_noise_checkpoint
+    )
     high_noise_model.eval().requires_grad_(False)
     shard_model_tp(high_noise_model, tp_rank, TP_DEGREE)
     high_noise_model = high_noise_model.to(torch.bfloat16).to(NEURON_DEVICE)
 
     if rank == 0:
         logger.info("Compiling high_noise_model...")
-    high_noise_model.patch_embedding = torch.compile(high_noise_model.patch_embedding, backend='neuron', dynamic=False)
-    high_noise_model.text_embedding = torch.compile(high_noise_model.text_embedding, backend='neuron', dynamic=False)
-    high_noise_model.head = torch.compile(high_noise_model.head, backend='neuron', dynamic=False)
+    high_noise_model.patch_embedding = torch.compile(
+        high_noise_model.patch_embedding, backend="neuron", dynamic=False
+    )
+    high_noise_model.text_embedding = torch.compile(
+        high_noise_model.text_embedding, backend="neuron", dynamic=False
+    )
+    high_noise_model.head = torch.compile(
+        high_noise_model.head, backend="neuron", dynamic=False
+    )
     for block in high_noise_model.blocks:
-        block.ffn = torch.compile(block.ffn, backend='neuron', dynamic=False)
+        block.ffn = torch.compile(block.ffn, backend="neuron", dynamic=False)
 
     if rank == 0:
-        logger.info(f"Loading low_noise_model (stays on CPU until boundary)...")
-    low_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.low_noise_checkpoint)
+        logger.info(f"Loading low_noise_model...")
+    low_noise_model = WanModel.from_pretrained(
+        MODEL_PATH, subfolder=config.low_noise_checkpoint
+    )
     low_noise_model.eval().requires_grad_(False)
     shard_model_tp(low_noise_model, tp_rank, TP_DEGREE)
-    low_noise_model = low_noise_model.to(torch.bfloat16)
+    if DUAL_MODEL:
+        low_noise_model = low_noise_model.to(torch.bfloat16).to(NEURON_DEVICE)
+        if rank == 0:
+            logger.info("Compiling low_noise_model...")
+        low_noise_model.patch_embedding = torch.compile(
+            low_noise_model.patch_embedding, backend="neuron", dynamic=False
+        )
+        low_noise_model.text_embedding = torch.compile(
+            low_noise_model.text_embedding, backend="neuron", dynamic=False
+        )
+        low_noise_model.head = torch.compile(
+            low_noise_model.head, backend="neuron", dynamic=False
+        )
+        for block in low_noise_model.blocks:
+            block.ffn = torch.compile(block.ffn, backend="neuron", dynamic=False)
+    else:
+        low_noise_model = low_noise_model.to(torch.bfloat16)
 
     dist.barrier()
     if rank == 0:
-        logger.info("DiT ready (high_noise on device, low_noise on CPU)")
+        if DUAL_MODEL:
+            logger.info("DiT ready (both models on device — no swap needed)")
+        else:
+            logger.info("DiT ready (high_noise on device, low_noise on CPU)")
 
     if rank == 0:
         logger.info("-" * 70)
         logger.info(f"  Image: {oh}x{ow}, Frames: {frame_num}, Seq len: {seq_len}")
         logger.info(f"  Latent: [{z_dim}, {T_latent}, {lat_h}, {lat_w}]")
-        logger.info(f"  DiT: dim={config.dim}, heads={config.num_heads}, layers={config.num_layers}")
-        logger.info(f"  Heads/rank: {config.num_heads // TP_DEGREE}, Boundary: {config.boundary}")
+        logger.info(
+            f"  DiT: dim={config.dim}, heads={config.num_heads}, layers={config.num_layers}"
+        )
+        logger.info(
+            f"  Heads/rank: {config.num_heads // TP_DEGREE}, Boundary: {config.boundary}"
+        )
         logger.info("-" * 70)
 
     noise = noise.to(torch.bfloat16).to(NEURON_DEVICE)
@@ -268,16 +343,23 @@ def main():
     NUM_STEPS = int(os.environ.get("NUM_STEPS", "10"))
     NUM_RUNS = int(os.environ.get("NUM_RUNS", "1"))
 
-    arg_c = {'context': [ctx_tensor[0]], 'seq_len': seq_len, 'y': [y_device]}
-    arg_null = {'context': [ctx_null_tensor[0]], 'seq_len': seq_len, 'y': [y_device]}
+    arg_c = {"context": [ctx_tensor[0]], "seq_len": seq_len, "y": [y_device]}
+    arg_null = {"context": [ctx_null_tensor[0]], "seq_len": seq_len, "y": [y_device]}
+
+    # CFG batched args: pass both uncond and cond in a single forward pass (batch_size=2)
+    arg_cfg_batch = {
+        "context": [ctx_null_tensor[0], ctx_tensor[0]],
+        "seq_len": seq_len,
+        "y": [y_device, y_device],
+    }
 
     latent_orig = noise.clone()
     run_results = []
     boundary = config.boundary * config.num_train_timesteps
-    current_on_device = 'high'
+    current_on_device = "high"
 
     for run_idx in range(NUM_RUNS):
-        run_label = f"Run {run_idx+1}/{NUM_RUNS}"
+        run_label = f"Run {run_idx + 1}/{NUM_RUNS}"
         if rank == 0:
             logger.info(f"═══ {run_label} ({NUM_STEPS} steps) ═══")
 
@@ -285,59 +367,84 @@ def main():
 
         sample_scheduler = FlowUniPCMultistepScheduler(
             num_train_timesteps=config.num_train_timesteps,
-            shift=1, use_dynamic_shifting=False)
-        sample_scheduler.set_timesteps(NUM_STEPS, device=torch.device("cpu"), shift=config.sample_shift)
+            shift=1,
+            use_dynamic_shifting=False,
+        )
+        sample_scheduler.set_timesteps(
+            NUM_STEPS, device=torch.device("cpu"), shift=config.sample_shift
+        )
         timesteps = sample_scheduler.timesteps
 
         run_start = time.time()
         denoise_start = time.time()
 
-        for step_idx, t in enumerate(tqdm(timesteps, disable=(rank != 0), desc=run_label)):
-            latent_model_input = [latent]
+        for step_idx, t in enumerate(
+            tqdm(timesteps, disable=(rank != 0), desc=run_label)
+        ):
             timestep = torch.tensor([t.item()], device=NEURON_DEVICE)
 
             if t.item() >= boundary:
-                needed = 'high'
+                needed = "high"
                 guide_scale = config.sample_guide_scale[1]
             else:
-                needed = 'low'
+                needed = "low"
                 guide_scale = config.sample_guide_scale[0]
 
-            if needed != current_on_device:
+            if not DUAL_MODEL and needed != current_on_device:
                 if rank == 0:
                     logger.info(f"  Step {step_idx}: swapping to {needed}_noise_model")
-                if current_on_device == 'high':
-                    high_noise_model = high_noise_model.to('cpu')
+                if current_on_device == "high":
+                    high_noise_model = high_noise_model.to("cpu")
                     low_noise_model = low_noise_model.to(NEURON_DEVICE)
                 else:
-                    low_noise_model = low_noise_model.to('cpu')
+                    low_noise_model = low_noise_model.to("cpu")
                     high_noise_model = high_noise_model.to(NEURON_DEVICE)
                 current_on_device = needed
                 gc.collect()
 
-            model = high_noise_model if current_on_device == 'high' else low_noise_model
+            model = high_noise_model if needed == "high" else low_noise_model
 
-            noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0]
-            noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0]
+            if CFG_BATCH:
+                # Single forward pass with batch_size=2: [uncond, cond]
+                latent_model_input = [latent, latent]
+                timestep_batch = timestep.expand(2)  # [t_val, t_val] for B=2
+                noise_pred_batch = model(
+                    latent_model_input, t=timestep_batch, **arg_cfg_batch
+                )
+                noise_pred_uncond = noise_pred_batch[0]
+                noise_pred_cond = noise_pred_batch[1]
+            else:
+                # Original: two separate forward passes
+                latent_model_input = [latent]
+                noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0]
+                noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0]
 
-            noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
+            noise_pred = noise_pred_uncond + guide_scale * (
+                noise_pred_cond - noise_pred_uncond
+            )
 
             temp_x0 = sample_scheduler.step(
-                noise_pred.cpu().unsqueeze(0), t,
+                noise_pred.cpu().unsqueeze(0),
+                t,
                 latent.cpu().unsqueeze(0),
-                return_dict=False, generator=seed_g)[0]
+                return_dict=False,
+                generator=seed_g,
+            )[0]
             latent = temp_x0.squeeze(0).to(NEURON_DEVICE)
 
         denoise_time = time.time() - denoise_start
         if rank == 0:
-            logger.info(f"{run_label} denoising: {denoise_time:.1f}s ({denoise_time/NUM_STEPS:.1f}s/step)")
+            logger.info(
+                f"{run_label} denoising: {denoise_time:.1f}s ({denoise_time / NUM_STEPS:.1f}s/step)"
+            )
 
-        # ── Free DiT for VAE decode ──
-        if current_on_device == 'high':
-            high_noise_model = high_noise_model.to('cpu')
-        else:
-            low_noise_model = low_noise_model.to('cpu')
-        gc.collect()
+        # ── Free DiT for VAE decode (only needed in swap mode) ──
+        if not DUAL_MODEL:
+            if current_on_device == "high":
+                high_noise_model = high_noise_model.to("cpu")
+            else:
+                low_noise_model = low_noise_model.to("cpu")
+            gc.collect()
 
         # ── Decode with VAE (TP across all VAE ranks) ──
         vae_start = time.time()
@@ -349,13 +456,14 @@ def main():
             if rank == 0:
                 video = videos[0]
                 import imageio
+
                 output_path = "/tmp/wan2_i2v_output.mp4"
                 video_cpu = video.cpu().float()
                 video_np = ((video_cpu.clamp(-1, 1) * 0.5 + 0.5) * 255).byte()
                 if video_np.dim() == 4 and video_np.shape[0] == 3:
                     video_np = video_np.permute(1, 2, 3, 0)
                 frames = [video_np[i].numpy() for i in range(video_np.shape[0])]
-                imageio.mimwrite(output_path, frames, fps=16, codec='libx264')
+                imageio.mimwrite(output_path, frames, fps=16, codec="libx264")
                 logger.info(f"Video saved to {output_path} ({len(frames)} frames)")
 
         dist.barrier()
@@ -363,23 +471,29 @@ def main():
         run_time = time.time() - run_start
 
         if rank == 0:
-            logger.info(f"═══ {run_label} DONE: denoise={denoise_time:.1f}s, vae={vae_time:.1f}s, total={run_time:.1f}s ═══")
-            run_results.append({
-                'run': run_idx + 1,
-                'denoise': denoise_time,
-                'vae': vae_time,
-                'total': run_time,
-            })
+            logger.info(
+                f"═══ {run_label} DONE: denoise={denoise_time:.1f}s, vae={vae_time:.1f}s, total={run_time:.1f}s ═══"
+            )
+            run_results.append(
+                {
+                    "run": run_idx + 1,
+                    "denoise": denoise_time,
+                    "vae": vae_time,
+                    "total": run_time,
+                }
+            )
 
     if rank == 0 and run_results:
         logger.info("")
         logger.info("=" * 70)
         logger.info("  BENCHMARK SUMMARY")
         logger.info("=" * 70)
-        logger.info(f"  TP={TP_DEGREE}, {config.num_heads//TP_DEGREE} heads/rank")
+        logger.info(f"  TP={TP_DEGREE}, {config.num_heads // TP_DEGREE} heads/rank")
         logger.info(f"  {oh}x{ow}, {frame_num} frames, {NUM_STEPS} steps")
         for r in run_results:
-            logger.info(f"  Run {r['run']}: denoise={r['denoise']:.1f}s ({r['denoise']/NUM_STEPS:.1f}s/step), vae={r['vae']:.1f}s, total={r['total']:.1f}s")
+            logger.info(
+                f"  Run {r['run']}: denoise={r['denoise']:.1f}s ({r['denoise'] / NUM_STEPS:.1f}s/step), vae={r['vae']:.1f}s, total={r['total']:.1f}s"
+            )
         logger.info("=" * 70)
 
     dist.destroy_process_group()
