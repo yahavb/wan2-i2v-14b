@@ -37,7 +37,7 @@ spec:
               export NEURON_COMPILE_CACHE_URL=/var/tmp/neuron-compile-cache
               mkdir -p /var/tmp/neuron-compile-cache /tmp/neff_cache
 
-              REFERENCE_LINE="g6e/L40S i2v-A14B @320x576,21f — fill in target"
+              REFERENCE_LINE="(none — clean median is the baseline)"
 
               # ─── deps + model download (no run) ───
               bash scripts/prepare.sh 2>&1 | tee "$LOCAL_RESULTS/prepare.txt" | tail -5 || { echo "PREPARE FAILED"; exit 1; }
