@@ -25,6 +25,21 @@ from models.tp_utils import get_tp_rank, get_tp_world_size
 
 SELF_ATTN_SEQLEN_MULTIPLE = 8192
 
+# Cached attention mask. Shape/contents are identical across every self-attn
+# call (l_q, l_k constant), so build once instead of ~800x per generation.
+_mask_cache = {}
+
+
+def _get_sp_mask(P, seqlen_k_padded, l_k, pad_k, dtype, device):
+    key = (P, seqlen_k_padded, l_k, dtype, device)
+    m = _mask_cache.get(key)
+    if m is None:
+        m = torch.zeros(P, seqlen_k_padded, dtype=dtype, device=device)
+        if pad_k > 0:
+            m[:, l_k:] = float('-inf')
+        _mask_cache[key] = m
+    return m
+
 
 def _sp_nki_self_attention(q_local, k_full, v_full, dtype=torch.bfloat16):
     """NKI self-attention with Q shorter than K (for SP).
@@ -60,10 +75,8 @@ def _sp_nki_self_attention(q_local, k_full, v_full, dtype=torch.bfloat16):
     seqlen_k_padded = k_nki.shape[2]
     num_sections = seqlen_k_padded // SELF_ATTN_SEQLEN_MULTIPLE
 
-    # Mask: 0 for valid, -inf for padded K positions
-    mask = torch.zeros(P, seqlen_k_padded, dtype=dtype, device=q_local.device)
-    if pad_k > 0:
-        mask[:, l_k:] = float('-inf')
+    # Mask: 0 for valid, -inf for padded K positions (cached across calls)
+    mask = _get_sp_mask(P, seqlen_k_padded, l_k, pad_k, dtype, q_local.device)
 
     identity = _get_identity(q_local.device, dtype)
     softmax_scale = 1.0 / math.sqrt(d)
