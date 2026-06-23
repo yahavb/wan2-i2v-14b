@@ -73,6 +73,7 @@ for neff in "${NEFFS[@]}"; do
   if [ ! -f "$ntff" ]; then echo "  no NTFF, skip"; continue; fi
   if ingest "$neff" "$ntff" "$out"; then
     python3 "$HERE/pq_dma_report.py" "$out" "$h"
+    python3 "$HERE/pq_pad_shapes.py" "$out" "$h"   # tensor geometry -> identify which source op
   else
     echo "  ingest produced no parquet (timeout/too big) — skip"
   fi
