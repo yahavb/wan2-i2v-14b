@@ -19,8 +19,8 @@ print("\n" + "=" * 76)
 print("NEFF:", label)
 print("=" * 76)
 
-if not os.path.exists(S):
-    print("  Summary.parquet MISSING — ingest incomplete, skipping")
+if not os.path.exists(S) or os.path.getsize(S) < 1000:
+    print("  Summary.parquet missing/incomplete — ingest didn't finish, skipping")
     sys.exit(0)
 
 # ── engine / DMA shares (Summary) ──
