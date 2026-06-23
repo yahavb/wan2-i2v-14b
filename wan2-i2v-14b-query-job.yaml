@@ -35,7 +35,7 @@ spec:
             - |
               set -uo pipefail
               cd /tmp
-              git clone -b main https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-i2v-14b.git wan2-i2v-14b
+              git clone -b exp/b-pad https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-i2v-14b.git wan2-i2v-14b
               cd wan2-i2v-14b
               echo "════════ AUTOMATIC DMA ANALYSIS (all preserved heavy NEFFs) ════════"
               # Runs end-to-end and prints the full per-NEFF DMA picture to stdout
