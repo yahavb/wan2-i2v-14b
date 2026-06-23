@@ -35,7 +35,16 @@ def make_sp_forward(model):
             model.freqs = model.freqs.to(device)
 
         if y is not None:
-            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+            # exp/c-concat: preallocate the [u;y] tensor and copy into it instead
+            # of torch.cat, which compiled to a standalone software-DGE gather NEFF
+            # (d1f195fa: 41.9ms, sw_dyn DMA 98%, 0 matmul). Same bytes/order/result.
+            new_x = []
+            for u, v in zip(x, y):
+                out = u.new_empty((u.shape[0] + v.shape[0],) + tuple(u.shape[1:]))
+                out[:u.shape[0]] = u
+                out[u.shape[0]:] = v
+                new_x.append(out)
+            x = new_x
 
         # Patch embedding (replicated — all ranks see same input)
         x = [model.patch_embedding(u.unsqueeze(0)) for u in x]
