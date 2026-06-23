@@ -2,12 +2,16 @@
 # run_dma_analysis.sh — fully automatic instruction-level DMA analysis of ALL
 # preserved heavy NEFF+NTFF pairs. No exec, no interaction. Prints to stdout.
 #
-# Storage rule: /var/mdl is the S3 PVC — ONLY copy the tar.gz off it. Everything
-# else (untar, parquet ingest, queries) is LOCAL on /tmp.
+# Two modes:
+#   (a) embedded in a benchmark run — pass the local pairs dir:
+#         run_dma_analysis.sh /tmp/results/ntff_pairs
+#   (b) standalone — no arg: copy the results tar.gz off the S3 PVC to /tmp,
+#       untar, and analyze. Storage rule: /var/mdl is the S3 PVC — ONLY copy the
+#       tar.gz off it; all ingest/parquet/queries are LOCAL on /tmp.
 #
 # neuron-explorer view --output-format parquet WRITES the parquet then idles on
-# a UI server (no exit). So we run it backgrounded, poll for the parquet files,
-# then kill it — that is the "completion" signal, not process exit.
+# a UI server (no exit). So we run it backgrounded, wait for the parquet dir size
+# to STABILIZE (writing finished), then kill it — that is the completion signal.
 set -uo pipefail
 
 WORK=/tmp/ntff_query
@@ -18,11 +22,19 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "=== deps: duckdb (local query engine) ==="
 python3 -c "import duckdb" 2>/dev/null || pip install duckdb >/dev/null 2>&1 || { echo "duckdb install FAILED"; exit 1; }
 
-echo "=== copy results tar.gz off the S3 PVC to local /tmp ==="
-rm -rf "$WORK"; mkdir -p "$WORK"
-cp "$TGZ" "$WORK/results.tar.gz" || { echo "MISSING $TGZ"; exit 1; }
-tar -xzf "$WORK/results.tar.gz" -C "$WORK"
-PAIRS="$WORK/results/ntff_pairs"
+PAIRS="${1:-}"
+if [ -n "$PAIRS" ]; then
+  echo "=== using provided pairs dir (embedded mode): $PAIRS ==="
+  PQROOT="$PAIRS/../dma_pq"
+else
+  echo "=== standalone: copy results tar.gz off the S3 PVC to local /tmp ==="
+  rm -rf "$WORK"; mkdir -p "$WORK"
+  cp "$TGZ" "$WORK/results.tar.gz" || { echo "MISSING $TGZ"; exit 1; }
+  tar -xzf "$WORK/results.tar.gz" -C "$WORK"
+  PAIRS="$WORK/results/ntff_pairs"
+  PQROOT="$WORK"
+fi
+mkdir -p "$PQROOT"
 mapfile -t NEFFS < <(ls -S "$PAIRS"/*.neff 2>/dev/null)
 echo "found ${#NEFFS[@]} NEFF+NTFF pairs"
 
@@ -55,7 +67,7 @@ ingest() {  # $1=neff $2=ntff $3=outdir — write parquet, then kill the idle se
 for neff in "${NEFFS[@]}"; do
   h=$(basename "$neff" .neff)
   ntff="$PAIRS/$h.ntff"
-  out="$WORK/pq_$h"
+  out="$PQROOT/pq_$h"
   echo ""
   echo "########## ingesting $h ($(du -h "$neff" | cut -f1)) ##########"
   if [ ! -f "$ntff" ]; then echo "  no NTFF, skip"; continue; fi
