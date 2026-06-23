@@ -29,6 +29,29 @@ import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
+# ── exp/b-pad DEBUG: log each distinct conv pad geometry ONCE, to split the
+# heavy pad NEFF cost into temporal (causal-cache, fixable via the reference NKI
+# kernel) vs spatial H/W (foldable into F.conv3d padding=). _padding layout is
+# (W, W, H, H, 2T, 0) from CausalConv3d. Remove once the fix lands.
+_dbg_seen = set()
+
+
+def _dbg_pad(tag, orig_padding, eff_padding, xshape, cache_x):
+    import os
+    if os.environ.get("VAE_PAD_DEBUG", "1") != "1":
+        return
+    key = (tag, tuple(orig_padding), tuple(eff_padding), tuple(xshape))
+    if key in _dbg_seen:
+        return
+    _dbg_seen.add(key)
+    w0, w1, h0, h1, t0, t1 = orig_padding
+    ew = eff_padding
+    cshape = tuple(cache_x.shape) if cache_x is not None else None
+    print(f"[VAE_PAD] {tag} in={tuple(xshape)} cache={cshape} "
+          f"orig(W={w0},{w1} H={h0},{h1} T={t0},{t1}) eff_T={ew[4]} "
+          f"spatial={'YES' if (w0 or h0) else 'no'} temporal={'YES' if ew[4] else 'no'}",
+          flush=True)
+
 # ---------------------------------------------------------------------------
 # VAE TP process group
 # ---------------------------------------------------------------------------
@@ -128,6 +151,7 @@ class ColumnParallelCausalConv3d(nn.Module):
             cache_x = cache_x.to(x.device)
             x = torch.cat([cache_x, x], dim=2)
             padding[4] -= cache_x.shape[2]
+        _dbg_pad("ColParallel", self._padding, padding, x.shape, cache_x)
         x = F.pad(x, padding)
         return F.conv3d(x, self.weight, self.bias,
                         stride=self.stride, dilation=self.dilation,
@@ -172,6 +196,7 @@ class RowParallelCausalConv3d(nn.Module):
             cache_x = cache_x.to(x.device)
             x = torch.cat([cache_x, x], dim=2)
             padding[4] -= cache_x.shape[2]
+        _dbg_pad("RowParallel", self._padding, padding, x.shape, cache_x)
         x = F.pad(x, padding)
         out = F.conv3d(x, self.weight, None,  # no bias yet
                        stride=self.stride, dilation=self.dilation,
