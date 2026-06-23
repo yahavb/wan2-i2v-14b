@@ -33,13 +33,17 @@ spec:
             - /bin/bash
             - "-ec"
             - |
-              set -euo pipefail
+              set -uo pipefail
               cd /tmp
               git clone -b main https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-i2v-14b.git wan2-i2v-14b
-              echo "Query pod ready. Exec in and run:"
-              echo "  cd /tmp/wan2-i2v-14b && bash scripts/neuron/query_ntff.sh"
-              echo "Sleeping 6h so you can exec in (kubectl delete job to end)."
-              sleep 21600
+              cd wan2-i2v-14b
+              echo "════════ AUTOMATIC DMA ANALYSIS (all preserved heavy NEFFs) ════════"
+              # Runs end-to-end and prints the full per-NEFF DMA picture to stdout
+              # (read it with: kubectl logs job/wan2-i2v-14b-query). No exec needed.
+              bash scripts/neuron/run_dma_analysis.sh || echo "ANALYSIS FAILED (see above)"
+              echo "════════ DONE — pod stays alive 2h for any manual follow-up ════════"
+              echo "  (re-run: cd /tmp/wan2-i2v-14b && bash scripts/neuron/run_dma_analysis.sh)"
+              sleep 7200
           resources:
             claims:
               - name: s-lnc1-trn2
