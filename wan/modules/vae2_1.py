@@ -13,6 +13,28 @@ __all__ = [
 
 CACHE_T = 2
 
+# ── exp/b-pad DEBUG: log each distinct CausalConv3d pad geometry ONCE. This is
+# the BASE class every VAE conv (sharded or replicated) subclasses, so it catches
+# all of them. _padding layout = (W,W,H,H,2T,0). Splits the heavy pad NEFF cost
+# into temporal (causal-cache) vs spatial (H/W). Remove once the fix lands.
+_dbg_cc_seen = set()
+
+
+def _dbg_causalconv_pad(orig_padding, eff_padding, xshape, cache_x):
+    import os
+    if os.environ.get("VAE_PAD_DEBUG", "1") != "1":
+        return
+    key = (tuple(orig_padding), tuple(eff_padding), tuple(xshape))
+    if key in _dbg_cc_seen:
+        return
+    _dbg_cc_seen.add(key)
+    w0, w1, h0, h1, t0, t1 = orig_padding
+    cshape = tuple(cache_x.shape) if cache_x is not None else None
+    print(f"[VAE_PAD] CausalConv3d in={tuple(xshape)} cache={cshape} "
+          f"orig(W={w0},{w1} H={h0},{h1} T={t0},{t1}) eff_T={eff_padding[4]} "
+          f"spatial={'YES' if (w0 or h0) else 'no'} "
+          f"temporal={'YES' if eff_padding[4] else 'no'}", flush=True)
+
 
 class CausalConv3d(nn.Conv3d):
     """
@@ -31,6 +53,7 @@ class CausalConv3d(nn.Conv3d):
             cache_x = cache_x.to(x.device)
             x = torch.cat([cache_x, x], dim=2)
             padding[4] -= cache_x.shape[2]
+        _dbg_causalconv_pad(self._padding, padding, x.shape, cache_x)
         x = F.pad(x, padding)
 
         return super().forward(x)
