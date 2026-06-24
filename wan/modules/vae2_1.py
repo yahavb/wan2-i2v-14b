@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import logging
+import sys
 
 import torch
 # import torch.cuda.amp as amp (patched)
@@ -30,10 +31,14 @@ def _dbg_causalconv_pad(orig_padding, eff_padding, xshape, cache_x):
     _dbg_cc_seen.add(key)
     w0, w1, h0, h1, t0, t1 = orig_padding
     cshape = tuple(cache_x.shape) if cache_x is not None else None
-    print(f"[VAE_PAD] CausalConv3d in={tuple(xshape)} cache={cshape} "
-          f"orig(W={w0},{w1} H={h0},{h1} T={t0},{t1}) eff_T={eff_padding[4]} "
-          f"spatial={'YES' if (w0 or h0) else 'no'} "
-          f"temporal={'YES' if eff_padding[4] else 'no'}", flush=True)
+    msg = (f"[VAE_PAD] CausalConv3d in={tuple(xshape)} cache={cshape} "
+           f"orig(W={w0},{w1} H={h0},{h1} T={t0},{t1}) eff_T={eff_padding[4]} "
+           f"spatial={'YES' if (w0 or h0) else 'no'} "
+           f"temporal={'YES' if eff_padding[4] else 'no'}")
+    # use logging (proven to surface in kubectl logs) AND print, on every rank
+    logging.getLogger().warning(msg)
+    print(msg, flush=True)
+    sys.stdout.flush()
 
 
 class CausalConv3d(nn.Conv3d):
