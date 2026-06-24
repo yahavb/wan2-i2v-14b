@@ -1,6 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import logging
-import sys
 
 import torch
 # import torch.cuda.amp as amp (patched)
@@ -13,32 +12,6 @@ __all__ = [
 ]
 
 CACHE_T = 2
-
-# ── exp/b-pad DEBUG: log each distinct CausalConv3d pad geometry ONCE. This is
-# the BASE class every VAE conv (sharded or replicated) subclasses, so it catches
-# all of them. _padding layout = (W,W,H,H,2T,0). Splits the heavy pad NEFF cost
-# into temporal (causal-cache) vs spatial (H/W). Remove once the fix lands.
-_dbg_cc_seen = set()
-
-
-def _dbg_causalconv_pad(orig_padding, eff_padding, xshape, cache_x):
-    import os
-    if os.environ.get("VAE_PAD_DEBUG", "1") != "1":
-        return
-    key = (tuple(orig_padding), tuple(eff_padding), tuple(xshape))
-    if key in _dbg_cc_seen:
-        return
-    _dbg_cc_seen.add(key)
-    w0, w1, h0, h1, t0, t1 = orig_padding
-    cshape = tuple(cache_x.shape) if cache_x is not None else None
-    msg = (f"[VAE_PAD] CausalConv3d in={tuple(xshape)} cache={cshape} "
-           f"orig(W={w0},{w1} H={h0},{h1} T={t0},{t1}) eff_T={eff_padding[4]} "
-           f"spatial={'YES' if (w0 or h0) else 'no'} "
-           f"temporal={'YES' if eff_padding[4] else 'no'}")
-    # use logging (proven to surface in kubectl logs) AND print, on every rank
-    logging.getLogger().warning(msg)
-    print(msg, flush=True)
-    sys.stdout.flush()
 
 
 class CausalConv3d(nn.Conv3d):
@@ -53,15 +26,22 @@ class CausalConv3d(nn.Conv3d):
         self.padding = (0, 0, 0)
 
     def forward(self, x, cache_x=None):
-        padding = list(self._padding)
+        padding = list(self._padding)  # (W,W, H,H, 2T,0)
         if cache_x is not None and self._padding[4] > 0:
             cache_x = cache_x.to(x.device)
             x = torch.cat([cache_x, x], dim=2)
             padding[4] -= cache_x.shape[2]
-        _dbg_causalconv_pad(self._padding, padding, x.shape, cache_x)
-        x = F.pad(x, padding)
-
-        return super().forward(x)
+        # exp/b-pad: the symmetric spatial H/W pad was materialized as a separate
+        # software-DGE copy NEFF (profiled: pad NEFFs, matmul=0, 56-79% stalled).
+        # Fold the symmetric spatial pad INTO the conv (no copy); F.pad only the
+        # asymmetric causal TEMPORAL axis. Numerically identical (W,W & H,H were
+        # already symmetric). self.padding is (0,0,0) from __init__.
+        pad_w, pad_h, pad_t, pad_t_back = padding[0], padding[2], padding[4], padding[5]
+        if pad_t or pad_t_back:
+            x = F.pad(x, (0, 0, 0, 0, pad_t, pad_t_back))
+        return F.conv3d(x, self.weight, self.bias, stride=self.stride,
+                        padding=(0, pad_h, pad_w), dilation=self.dilation,
+                        groups=self.groups)
 
 
 class RMS_norm(nn.Module):
