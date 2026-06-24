@@ -163,6 +163,9 @@ spec:
                 2>&1 | tee "$LOCAL_RESULTS/dma_analysis.txt" || echo "DMA analysis skipped"
 
               # ─── persist results (single tar.gz to the PVC) ───
+              # Include the output video for CORRECTNESS verification (a conv/pad
+              # change can produce right timings with corrupted frames — must eyeball).
+              cp /tmp/wan2_i2v_output.mp4 "$LOCAL_RESULTS/" 2>/dev/null && echo "video archived" || echo "no video to archive"
               ARCHIVE=/tmp/wan2-i2v-14b_results.tar.gz
               tar -czf "$ARCHIVE" -C /tmp results 2>/dev/null || true
               cp "$ARCHIVE" /var/mdl/ 2>/dev/null && echo "Saved: /var/mdl/$(basename "$ARCHIVE")" || echo "persist skipped"
