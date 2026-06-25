@@ -8,7 +8,7 @@ modulations are sharded to match. The head gathers back to full.
 import math
 import torch
 import torch.distributed as dist
-from models.parallel_state import get_sp_rank, get_sp_degree
+from models.parallel_state import get_sp_rank, get_sp_degree, get_sp_group
 from models.tp_utils import get_tp_rank, get_tp_world_size
 
 
@@ -65,9 +65,13 @@ def make_sp_forward(model):
             .unflatten(0, (bt, L)).to(torch.bfloat16))
         e0 = model.time_projection(e).unflatten(2, (6, model.dim))
 
-        # Shard x and e0 to this rank's portion
-        L_local = L // world_size
-        local_start = world_rank * L_local
+        # Shard x and e0 by SP ONLY (not world). TP must REPLICATE the sequence
+        # (it shards heads), so every rank in a TP group holds the SAME L/sp tokens
+        # — this is what makes the cross-attn/FFN RowParallel all_reduces (over the
+        # TP group) valid. Sharding by world_rank gave TP-group ranks DIFFERENT
+        # tokens, so those all_reduces summed unrelated tokens -> noise.
+        L_local = L // sp_degree
+        local_start = sp_rank * L_local
         x = x[:, local_start:local_start + L_local].contiguous()
         e0_local = e0[:, local_start:local_start + L_local].contiguous()
 
@@ -92,12 +96,14 @@ def make_sp_forward(model):
         for block in model.blocks:
             x = block(x, **kwargs)
 
-        # Gather x back to full for head
+        # Gather x back to full for head — over the SP GROUP (sp_degree shards of
+        # L/sp each -> full L), NOT the world group. TP ranks hold identical data
+        # so they gather the same result.
         B = x.shape[0]
         x_full = torch.empty(B, L, model.dim, dtype=x.dtype, device=x.device)
         x_flat = x.reshape(B * L_local, model.dim).contiguous()
         x_full_flat = x_full.reshape(B * L, model.dim)
-        dist.all_gather_into_tensor(x_full_flat, x_flat)
+        dist.all_gather_into_tensor(x_full_flat, x_flat, group=get_sp_group())
         x = x_full_flat.reshape(B, L, model.dim)
 
         # Head (on full sequence)
