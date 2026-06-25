@@ -27,7 +27,7 @@ spec:
               set -euo pipefail
 
               cd /tmp
-              BRANCH=main
+              BRANCH=exp/no-sp
               git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-i2v-14b.git wan2-i2v-14b
               cd wan2-i2v-14b
 
@@ -162,10 +162,12 @@ spec:
               bash scripts/neuron/run_dma_analysis.sh "$LOCAL_RESULTS/ntff_pairs" \
                 2>&1 | tee "$LOCAL_RESULTS/dma_analysis.txt" || echo "DMA analysis skipped"
 
-              # ─── persist results (single tar.gz to the PVC) ───
+              # ─── persist results + VIDEO for correctness validation ───
+              cp /tmp/wan2_i2v_output.mp4 "$LOCAL_RESULTS/" 2>/dev/null && echo "video archived" || echo "NO VIDEO PRODUCED"
               ARCHIVE=/tmp/wan2-i2v-14b_results.tar.gz
               tar -czf "$ARCHIVE" -C /tmp results 2>/dev/null || true
               cp "$ARCHIVE" /var/mdl/ 2>/dev/null && echo "Saved: /var/mdl/$(basename "$ARCHIVE")" || echo "persist skipped"
+              echo "╔══ VALIDATION: watch video. $GIT_BRANCH @ ${GIT_SHA:0:12} SP=${SP_DEGREE} steps=${NUM_STEPS} ══╗"
           resources:
             claims:
               - name: s-lnc1-trn2
@@ -194,7 +196,7 @@ spec:
             - name: TP_DEGREE
               value: "4"
             - name: SP_DEGREE
-              value: "2"
+              value: "1"
             - name: T5_RANK
               value: "0"
             - name: VAE_TP_DEGREE
@@ -202,7 +204,7 @@ spec:
             - name: USE_NKI_KERNELS
               value: "1"
             - name: NUM_STEPS
-              value: "10"
+              value: "40"
             - name: NUM_RUNS
               value: "1"
             - name: FRAME_NUM
