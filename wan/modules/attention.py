@@ -16,11 +16,16 @@ FLASH_ATTN_2_AVAILABLE = False
 
 # ─── NKI Kernel Loading ─────────────────────────────────────────────────────
 USE_NKI_KERNELS = os.environ.get("USE_NKI_KERNELS", "1") == "1"
+# NST self-attention kernel (Neuron Science Team): no mask/identity, handles
+# actual_seqlen_k natively. Preferred over the deprecated mask-based kernel.
+USE_NST_SELF_ATTN = os.environ.get("USE_NST_SELF_ATTN", "0") == "1"
 
 _nki_cross_attn = None
 _nki_self_attn = None
+_nki_self_attn_nst = None
 _NKI_CROSS_AVAILABLE = False
 _NKI_SELF_AVAILABLE = False
+_NKI_SELF_NST_AVAILABLE = False
 
 if USE_NKI_KERNELS:
     try:
@@ -32,14 +37,26 @@ if USE_NKI_KERNELS:
     except Exception as e:
         print(f"[attention.py] NKI cross_attention kernel: FAILED ({e})")
 
-    try:
-        from torch_neuronx.nki_hop import wrap_nki as _wrap_nki_self
-        from kernels.self_attention import wan_flash_self_attn as _raw_self_attn
-        _nki_self_attn = _wrap_nki_self(_raw_self_attn)
-        _NKI_SELF_AVAILABLE = True
-        print("[attention.py] NKI self_attention kernel: LOADED")
-    except Exception as e:
-        print(f"[attention.py] NKI self_attention kernel: FAILED ({e})")
+    # NST self-attention (preferred — no mask/identity needed, handles actual_seqlen_k)
+    if USE_NST_SELF_ATTN:
+        try:
+            from kernels.self_attention_nst import wan_flash_self_attn as _nst_self_attn
+            _nki_self_attn_nst = _nst_self_attn  # already @wrap_nki decorated
+            _NKI_SELF_NST_AVAILABLE = True
+            print("[attention.py] NKI self_attention NST kernel: LOADED")
+        except Exception as e:
+            print(f"[attention.py] NKI self_attention NST kernel: FAILED ({e})")
+
+    # Fallback: original mask-based self-attention
+    if not _NKI_SELF_NST_AVAILABLE:
+        try:
+            from torch_neuronx.nki_hop import wrap_nki as _wrap_nki_self
+            from kernels.self_attention import wan_flash_self_attn as _raw_self_attn
+            _nki_self_attn = _wrap_nki_self(_raw_self_attn)
+            _NKI_SELF_AVAILABLE = True
+            print("[attention.py] NKI self_attention kernel: LOADED")
+        except Exception as e:
+            print(f"[attention.py] NKI self_attention kernel: FAILED ({e})")
 
 # Self-attention kernel requires seqlen_k to be multiple of 8192
 SELF_ATTN_SEQLEN_MULTIPLE = 8192
@@ -90,9 +107,38 @@ def _nki_cross_attention(q, k, v, dtype=torch.bfloat16):
     return out
 
 
+def _nki_self_attention_nst(q, k, v, dtype=torch.bfloat16):
+    """Run self-attention using the NST kernel (no mask/identity needed).
+
+    Input shapes: q [B, L, n, d], k [B, L, n, d], v [B, L, n, d]
+    Output shape: [B, L, n, d]. Mirrors wan2-ti2v-5b.
+    """
+    b, l, n, d = q.shape
+    assert b == 1, "NKI kernels only support batch_size=1"
+    q_nki = q[0].permute(1, 2, 0).contiguous()   # [n, d, L]
+    k_nki = k[0].permute(1, 2, 0).contiguous()   # [n, d, L]
+    v_nki = v[0].permute(1, 0, 2).contiguous()   # [n, L, d]
+    P = 128
+    SEQLEN_MULT = 512
+    pad_q = (P - l % P) % P
+    pad_k = (SEQLEN_MULT - l % SEQLEN_MULT) % SEQLEN_MULT
+    if pad_q > 0:
+        q_nki = F.pad(q_nki, (0, pad_q))
+    if pad_k > 0:
+        k_nki = F.pad(k_nki, (0, pad_k))
+        v_nki = F.pad(v_nki, (0, 0, 0, pad_k))
+    softmax_scale = 1.0 / math.sqrt(d)
+    out_nki = _nki_self_attn_nst(
+        q_nki, k_nki, v_nki,
+        softmax_scale=softmax_scale,
+        actual_seqlen_k=l,
+        use_dynamic_loop=True)
+    return out_nki[:l].unsqueeze(0)
+
+
 def _nki_self_attention(q, k, v, dtype=torch.bfloat16):
     """Run self-attention using NKI kernel.
-    
+
     Input shapes: q [B, L, n, d], k [B, L, n, d], v [B, L, n, d]
     Output shape: [B, L, n, d]
     """
@@ -165,6 +211,8 @@ def attention(
     if q.device.type == "neuron":
         if is_cross_attn and _NKI_CROSS_AVAILABLE:
             return _nki_cross_attention(q, k, v, dtype=dtype)
+        elif not is_cross_attn and _NKI_SELF_NST_AVAILABLE:
+            return _nki_self_attention_nst(q, k, v, dtype=dtype)
         elif not is_cross_attn and _NKI_SELF_AVAILABLE:
             return _nki_self_attention(q, k, v, dtype=dtype)
     

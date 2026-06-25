@@ -27,7 +27,7 @@ spec:
               set -euo pipefail
 
               cd /tmp
-              BRANCH=main
+              BRANCH=exp/nst-attention
               git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-i2v-14b.git wan2-i2v-14b
               cd wan2-i2v-14b
 
@@ -54,7 +54,7 @@ spec:
               bash scripts/prepare.sh 2>&1 | tee "$LOCAL_RESULTS/prepare.txt" | tail -5 || { echo "PREPARE FAILED"; exit 1; }
 
               # ─── PROVENANCE part 2: confirm NKI kernel loads on THIS code (needs deps) ───
-              NKI_STATUS=$(python3 -c 'import wan.modules.attention as a; print("self="+str(a._NKI_SELF_AVAILABLE), "cross="+str(a._NKI_CROSS_AVAILABLE), "SEQLEN_MULT="+str(a.SELF_ATTN_SEQLEN_MULTIPLE))' 2>&1 | tr '\n' ' ')
+              NKI_STATUS=$(python3 -c 'import wan.modules.attention as a; print("NST="+str(a._NKI_SELF_NST_AVAILABLE), "self="+str(a._NKI_SELF_AVAILABLE), "cross="+str(a._NKI_CROSS_AVAILABLE))' 2>&1 | tr '\n' ' ')
               echo "PROVENANCE NKI: $NKI_STATUS"
               echo "nki=$NKI_STATUS" >> "$LOCAL_RESULTS/provenance.txt"
 
@@ -162,10 +162,18 @@ spec:
               bash scripts/neuron/run_dma_analysis.sh "$LOCAL_RESULTS/ntff_pairs" \
                 2>&1 | tee "$LOCAL_RESULTS/dma_analysis.txt" || echo "DMA analysis skipped"
 
-              # ─── persist results (single tar.gz to the PVC) ───
+              # ─── persist results + VIDEO for correctness validation ───
+              cp /tmp/wan2_i2v_output.mp4 "$LOCAL_RESULTS/" 2>/dev/null && echo "video archived" || echo "NO VIDEO PRODUCED (decode failed?)"
               ARCHIVE=/tmp/wan2-i2v-14b_results.tar.gz
               tar -czf "$ARCHIVE" -C /tmp results 2>/dev/null || true
               cp "$ARCHIVE" /var/mdl/ 2>/dev/null && echo "Saved: /var/mdl/$(basename "$ARCHIVE")" || echo "persist skipped"
+
+              echo ""
+              echo "╔══════════════════════════════════════════════════════════════╗"
+              echo "║  VALIDATION REQUIRED — watch the video, confirm NOT noise     ║"
+              echo "║  provenance : $GIT_BRANCH @ ${GIT_SHA:0:12}  (NST: $NKI_STATUS)"
+              echo "║  tar -xzf /var/mdl/wan2-i2v-14b_results.tar.gz results/wan2_i2v_output.mp4"
+              echo "╚══════════════════════════════════════════════════════════════╝"
           resources:
             claims:
               - name: s-lnc1-trn2
@@ -200,6 +208,8 @@ spec:
             - name: VAE_TP_DEGREE
               value: "2"
             - name: USE_NKI_KERNELS
+              value: "1"
+            - name: USE_NST_SELF_ATTN
               value: "1"
             - name: NUM_STEPS
               value: "10"

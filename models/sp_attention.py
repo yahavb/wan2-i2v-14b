@@ -50,7 +50,7 @@ def _sp_nki_self_attention(q_local, k_full, v_full, dtype=torch.bfloat16):
 
     Uses the self-attention kernel which supports seq_q != seq_k.
     """
-    from wan.modules.attention import _nki_self_attn, _get_identity
+    from wan.modules import attention as _attn
 
     b, l_q, n, d = q_local.shape
     l_k = k_full.shape[1]
@@ -63,32 +63,45 @@ def _sp_nki_self_attention(q_local, k_full, v_full, dtype=torch.bfloat16):
     v_nki = v_full[0].permute(1, 0, 2).contiguous()   # [n, L_k, d]
 
     P = 128
+    softmax_scale = 1.0 / math.sqrt(d)
+
+    # ─── PREFERRED: NST kernel — no mask/identity, masks via actual_seqlen_k ───
+    # Mirrors the working wan2-ti2v-5b dit_attention_sp.py call path. Pads K to a
+    # 512 multiple (NST alignment) and tells the kernel the TRUE length (l_k) so
+    # the padding is correctly ignored — no separate -inf mask tensor to get wrong.
+    if _attn._NKI_SELF_NST_AVAILABLE:
+        NST_MULT = 512
+        pad_q = (P - l_q % P) % P
+        pad_k = (NST_MULT - l_k % NST_MULT) % NST_MULT
+        if pad_q > 0:
+            q_nki = F.pad(q_nki, (0, pad_q))
+        if pad_k > 0:
+            k_nki = F.pad(k_nki, (0, pad_k))
+            v_nki = F.pad(v_nki, (0, 0, 0, pad_k))
+        out_nki = _attn._nki_self_attn_nst(
+            q_nki, k_nki, v_nki,
+            softmax_scale=softmax_scale,
+            actual_seqlen_k=l_k,
+            use_dynamic_loop=True)
+        return out_nki[:l_q].unsqueeze(0)
+
+    # ─── FALLBACK: deprecated mask-based kernel ───
     pad_q = (P - l_q % P) % P
     if pad_q > 0:
         q_nki = F.pad(q_nki, (0, pad_q))
-
     pad_k = (SELF_ATTN_SEQLEN_MULTIPLE - l_k % SELF_ATTN_SEQLEN_MULTIPLE) % SELF_ATTN_SEQLEN_MULTIPLE
     if pad_k > 0:
         k_nki = F.pad(k_nki, (0, pad_k))
         v_nki = F.pad(v_nki, (0, 0, 0, pad_k))
-
     seqlen_k_padded = k_nki.shape[2]
     num_sections = seqlen_k_padded // SELF_ATTN_SEQLEN_MULTIPLE
-
-    # Mask: 0 for valid, -inf for padded K positions (cached across calls)
     mask = _get_sp_mask(P, seqlen_k_padded, l_k, pad_k, dtype, q_local.device)
-
-    identity = _get_identity(q_local.device, dtype)
-    softmax_scale = 1.0 / math.sqrt(d)
-
-    out_nki = _nki_self_attn(
+    identity = _attn._get_identity(q_local.device, dtype)
+    out_nki = _attn._nki_self_attn(
         q_nki, k_nki, v_nki, identity, mask,
         softmax_scale=softmax_scale,
         num_sections=num_sections)
-
-    # Output: [seqlen_q_padded, n, d] → slice → [1, L_q, n, d]
-    out = out_nki[:l_q].unsqueeze(0)
-    return out
+    return out_nki[:l_q].unsqueeze(0)
 
 
 def make_sp_self_attn_forward(self_attn):
