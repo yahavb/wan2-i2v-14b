@@ -27,7 +27,7 @@ spec:
               set -euo pipefail
 
               cd /tmp
-              BRANCH=main
+              BRANCH=exp/steps40
               git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-i2v-14b.git wan2-i2v-14b
               cd wan2-i2v-14b
 
@@ -162,10 +162,18 @@ spec:
               bash scripts/neuron/run_dma_analysis.sh "$LOCAL_RESULTS/ntff_pairs" \
                 2>&1 | tee "$LOCAL_RESULTS/dma_analysis.txt" || echo "DMA analysis skipped"
 
-              # ─── persist results (single tar.gz to the PVC) ───
+              # ─── persist results + VIDEO for correctness validation ───
+              cp /tmp/wan2_i2v_output.mp4 "$LOCAL_RESULTS/" 2>/dev/null && echo "video archived" || echo "NO VIDEO PRODUCED (decode failed?)"
               ARCHIVE=/tmp/wan2-i2v-14b_results.tar.gz
               tar -czf "$ARCHIVE" -C /tmp results 2>/dev/null || true
               cp "$ARCHIVE" /var/mdl/ 2>/dev/null && echo "Saved: /var/mdl/$(basename "$ARCHIVE")" || echo "persist skipped"
+
+              echo ""
+              echo "╔══════════════════════════════════════════════════════════════╗"
+              echo "║  VALIDATION REQUIRED — watch the video, confirm NOT noise     ║"
+              echo "║  $GIT_BRANCH @ ${GIT_SHA:0:12}  NUM_STEPS=${NUM_STEPS}"
+              echo "║  tar -xzf /var/mdl/wan2-i2v-14b_results.tar.gz results/wan2_i2v_output.mp4"
+              echo "╚══════════════════════════════════════════════════════════════╝"
           resources:
             claims:
               - name: s-lnc1-trn2
@@ -202,7 +210,7 @@ spec:
             - name: USE_NKI_KERNELS
               value: "1"
             - name: NUM_STEPS
-              value: "10"
+              value: "40"
             - name: NUM_RUNS
               value: "1"
             - name: FRAME_NUM
