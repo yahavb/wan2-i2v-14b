@@ -110,28 +110,28 @@ def make_sp_self_attn_forward(self_attn):
         n = self_attn.num_heads  # local heads after TP sharding
         d = self_attn.head_dim
 
-        L_full = L_local * world_size
+        # x is the SP shard (L/sp), REPLICATED across the TP group. Gather K/V over
+        # the SP GROUP (sp_degree shards -> full L). NOT the world group.
+        L_full = L_local * sp_degree
 
-        # All-gather x across world → full sequence on every rank
         x_full_flat = torch.empty(
             b * L_full, dim, dtype=x.dtype, device=x.device)
         x_flat = x.reshape(b * L_local, dim).contiguous()
-        dist.all_gather_into_tensor(x_full_flat, x_flat)
+        dist.all_gather_into_tensor(x_full_flat, x_flat, group=get_sp_group())
         x_full = x_full_flat.reshape(b, L_full, dim)
 
-        # QKV (projections already TP-sharded)
+        # QKV (projections already TP-sharded over heads)
         q = self_attn.norm_q(self_attn.q(x_full)).view(b, L_full, n, d)
         k = self_attn.norm_k(self_attn.k(x_full)).view(b, L_full, n, d)
         v = self_attn.v(x_full).view(b, L_full, n, d)
 
-        # RoPE on full sequence
+        # RoPE on full sequence (position-indexed, head-broadcast)
         q = rope_apply_neuron(q, grid_sizes, freqs)
         k = rope_apply_neuron(k, grid_sizes, freqs)
 
-        # SP: slice Q to this SP rank's shard
-        L_sp = L_full // sp_degree
-        sp_start = sp_rank * L_sp
-        q_local = q[:, sp_start:sp_start + L_sp]
+        # SP: this rank computes attention for ITS L/sp query tokens vs full K/V.
+        sp_start = sp_rank * L_local
+        q_local = q[:, sp_start:sp_start + L_local]
 
         # Attention: Q shard against full K, V
         if use_nki and q_local.device.type == "neuron":
@@ -144,17 +144,14 @@ def make_sp_self_attn_forward(self_attn):
             out = F.scaled_dot_product_attention(q_t, k_t, v_t)
             out = out.transpose(1, 2).contiguous()
 
-        # O projection (RowParallel: matmul + all-reduce across TP=4)
-        out = out.flatten(2)  # [B, L_sp, n*d]
-        out = self_attn.o(out)  # [B, L_sp, dim]
+        # O projection (RowParallel: matmul + all-reduce across TP group). Valid
+        # because all TP-group ranks hold the SAME L/sp tokens here.
+        out = out.flatten(2)            # [B, L_local, n*d]
+        out = self_attn.o(out)          # [B, L_local, dim]
 
-        # Each rank in same SP partition now has same [B, L_sp, dim].
-        # Pick this rank's world-shard.
-        L_per_rank = L_sp // tp_degree
-        local_start = tp_rank * L_per_rank
-        out_local = out[:, local_start:local_start + L_per_rank].contiguous()
-
-        return out_local
+        # Return this rank's L/sp shard unchanged — TP ranks share it, SP ranks
+        # hold complementary halves (gathered back in sp_model head step).
+        return out
 
     return forward
 
