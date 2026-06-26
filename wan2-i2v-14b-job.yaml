@@ -13,6 +13,7 @@ spec:
       restartPolicy: Never
       nodeSelector:
         node-type: trn2
+        kubernetes.io/hostname: ip-192-168-119-96.ap-southeast-4.compute.internal
       resourceClaims:
         - name: s-lnc1-trn2
           resourceClaimTemplateName: s-lnc1-trn2
