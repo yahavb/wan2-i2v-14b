@@ -336,6 +336,19 @@ def main():
             noise_pred_cond = out[0]
             noise_pred_uncond = out[1]
 
+            # DEBUG (CFG_DEBUG=1): on step 0 only, compare B=2 outputs vs the
+            # proven B=1 sequential calls on the SAME input. Logs where B=2 diverges.
+            if os.environ.get("CFG_DEBUG", "0") == "1" and step_idx == 0 and rank == 0:
+                ref_cond = model([latent], t=timestep, seq_len=seq_len,
+                                 context=[ctx_tensor[0]], y=[y_device])[0]
+                ref_unc = model([latent], t=timestep, seq_len=seq_len,
+                                context=[ctx_null_tensor[0]], y=[y_device])[0]
+                dc = (noise_pred_cond.float() - ref_cond.float()).abs().max().item()
+                du = (noise_pred_uncond.float() - ref_unc.float()).abs().max().item()
+                logger.info(f"[CFG_DEBUG] B2-vs-B1 max|diff| cond={dc:.4f} uncond={du:.4f} "
+                            f"(cond_norm={ref_cond.float().abs().max().item():.3f}) "
+                            f"-> {'MATCH' if max(dc,du)<0.05 else 'DIVERGES'}")
+
             noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
 
             temp_x0 = sample_scheduler.step(
