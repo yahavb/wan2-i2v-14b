@@ -28,7 +28,7 @@ spec:
               set -euo pipefail
 
               cd /tmp
-              BRANCH=exp/tp8-cfg
+              BRANCH=main
               git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-i2v-14b.git wan2-i2v-14b
               cd wan2-i2v-14b
 
