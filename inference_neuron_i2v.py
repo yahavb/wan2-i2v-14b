@@ -327,8 +327,28 @@ def main():
 
             model = high_noise_model if current_on_device == 'high' else low_noise_model
 
-            noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0]
-            noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0]
+            # Batched CFG: cond+uncond in ONE B=2 forward (shared latent/t/y,
+            # differ only in context). ~halves denoise vs two sequential forwards.
+            out = model(
+                [latent, latent], t=timestep, seq_len=seq_len,
+                context=[ctx_tensor[0], ctx_null_tensor[0]],
+                y=[y_device, y_device])
+            noise_pred_cond = out[0]
+            noise_pred_uncond = out[1]
+
+            # DEBUG (CFG_DEBUG=1): on step 0, compare B=2 outputs vs the proven B=1
+            # sequential calls on the SAME input. The forwards do COLLECTIVES, so
+            # ALL ranks must run them in lockstep — only rank 0 logs the diff.
+            if os.environ.get("CFG_DEBUG", "0") == "1" and step_idx == 0:
+                ref_cond = model([latent], t=timestep, seq_len=seq_len,
+                                 context=[ctx_tensor[0]], y=[y_device])[0]
+                ref_unc = model([latent], t=timestep, seq_len=seq_len,
+                                context=[ctx_null_tensor[0]], y=[y_device])[0]
+                if rank == 0:
+                    dc = (noise_pred_cond.float() - ref_cond.float()).abs().max().item()
+                    du = (noise_pred_uncond.float() - ref_unc.float()).abs().max().item()
+                    logger.info(f"[CFG_DEBUG] B2-vs-B1 max|diff| cond={dc:.4f} uncond={du:.4f} "
+                                f"-> {'MATCH' if max(dc,du)<0.05 else 'DIVERGES'}")
 
             noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
 
