@@ -13,6 +13,7 @@ spec:
       restartPolicy: Never
       nodeSelector:
         node-type: trn2
+        kubernetes.io/hostname: ip-192-168-119-96.ap-southeast-4.compute.internal
       resourceClaims:
         - name: s-lnc1-trn2
           resourceClaimTemplateName: s-lnc1-trn2
@@ -27,7 +28,7 @@ spec:
               set -euo pipefail
 
               cd /tmp
-              BRANCH=main
+              BRANCH=exp/tp8-cfg
               git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-i2v-14b.git wan2-i2v-14b
               cd wan2-i2v-14b
 
@@ -197,9 +198,9 @@ spec:
             - name: NEURON_CC_FLAGS
               value: "--model-type=transformer"
             - name: TP_DEGREE
-              value: "4"
+              value: "8"
             - name: SP_DEGREE
-              value: "2"
+              value: "1"
             - name: T5_RANK
               value: "0"
             - name: VAE_TP_DEGREE

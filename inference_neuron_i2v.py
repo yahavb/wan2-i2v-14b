@@ -327,8 +327,15 @@ def main():
 
             model = high_noise_model if current_on_device == 'high' else low_noise_model
 
-            noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0]
-            noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0]
+            # Batched CFG: cond+uncond in ONE B=2 forward (shared latent/t/y,
+            # differ only in context). ~halves denoise vs two sequential forwards.
+            out = model(
+                [latent, latent], t=timestep, seq_len=seq_len,
+                context=[ctx_tensor[0], ctx_null_tensor[0]],
+                y=[y_device, y_device])
+            noise_pred_cond = out[0]
+            noise_pred_uncond = out[1]
+
 
             noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
 
