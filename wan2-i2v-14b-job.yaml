@@ -27,7 +27,7 @@ spec:
               set -euo pipefail
 
               cd /tmp
-              BRANCH=exp/tp8
+              BRANCH=exp/batched-cfg
               git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-i2v-14b.git wan2-i2v-14b
               cd wan2-i2v-14b
 
@@ -197,9 +197,9 @@ spec:
             - name: NEURON_CC_FLAGS
               value: "--model-type=transformer"
             - name: TP_DEGREE
-              value: "8"
+              value: "4"
             - name: SP_DEGREE
-              value: "1"
+              value: "2"
             - name: T5_RANK
               value: "0"
             - name: VAE_TP_DEGREE

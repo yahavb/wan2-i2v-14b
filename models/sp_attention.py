@@ -55,40 +55,37 @@ def _sp_nki_self_attention(q_local, k_full, v_full, dtype=torch.bfloat16):
     b, l_q, n, d = q_local.shape
     l_k = k_full.shape[1]
 
-    assert b == 1
-
-    # Reshape for kernel: [n, d, L]
-    q_nki = q_local[0].permute(1, 2, 0).contiguous()  # [n, d, L_q]
-    k_nki = k_full[0].permute(1, 2, 0).contiguous()   # [n, d, L_k]
-    v_nki = v_full[0].permute(1, 0, 2).contiguous()   # [n, L_k, d]
-
+    # Batched CFG: the kernel processes [n,d,L] (no sample-batch dim — heads ARE
+    # its batch), so loop it over the B sample-batch items (e.g. cond+uncond) and
+    # stack. Everything ELSE in the forward (QKV/O proj, FFN, cross-attn, norms,
+    # activations) runs as native B in one pass — only this kernel call repeats.
     P = 128
     pad_q = (P - l_q % P) % P
-    if pad_q > 0:
-        q_nki = F.pad(q_nki, (0, pad_q))
-
     pad_k = (SELF_ATTN_SEQLEN_MULTIPLE - l_k % SELF_ATTN_SEQLEN_MULTIPLE) % SELF_ATTN_SEQLEN_MULTIPLE
-    if pad_k > 0:
-        k_nki = F.pad(k_nki, (0, pad_k))
-        v_nki = F.pad(v_nki, (0, 0, 0, pad_k))
-
-    seqlen_k_padded = k_nki.shape[2]
+    seqlen_k_padded = l_k + pad_k
     num_sections = seqlen_k_padded // SELF_ATTN_SEQLEN_MULTIPLE
-
-    # Mask: 0 for valid, -inf for padded K positions (cached across calls)
     mask = _get_sp_mask(P, seqlen_k_padded, l_k, pad_k, dtype, q_local.device)
-
     identity = _get_identity(q_local.device, dtype)
     softmax_scale = 1.0 / math.sqrt(d)
 
-    out_nki = _nki_self_attn(
-        q_nki, k_nki, v_nki, identity, mask,
-        softmax_scale=softmax_scale,
-        num_sections=num_sections)
+    outs = []
+    for bi in range(b):
+        q_nki = q_local[bi].permute(1, 2, 0).contiguous()  # [n, d, L_q]
+        k_nki = k_full[bi].permute(1, 2, 0).contiguous()   # [n, d, L_k]
+        v_nki = v_full[bi].permute(1, 0, 2).contiguous()   # [n, L_k, d]
+        if pad_q > 0:
+            q_nki = F.pad(q_nki, (0, pad_q))
+        if pad_k > 0:
+            k_nki = F.pad(k_nki, (0, pad_k))
+            v_nki = F.pad(v_nki, (0, 0, 0, pad_k))
+        out_nki = _nki_self_attn(
+            q_nki, k_nki, v_nki, identity, mask,
+            softmax_scale=softmax_scale,
+            num_sections=num_sections)
+        outs.append(out_nki[:l_q].unsqueeze(0))  # [1, L_q, n, d]
 
-    # Output: [seqlen_q_padded, n, d] → slice → [1, L_q, n, d]
-    out = out_nki[:l_q].unsqueeze(0)
-    return out
+    # [B, L_q, n, d]
+    return torch.cat(outs, dim=0)
 
 
 def make_sp_self_attn_forward(self_attn):
