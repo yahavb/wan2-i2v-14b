@@ -42,11 +42,15 @@ def _vae_w_halo(x, radius):
     grp = get_vae_w_group()
     left_edge = x[..., :radius].contiguous()      # my left cols -> left neighbor's right halo
     right_edge = x[..., -radius:].contiguous()     # my right cols -> right neighbor's left halo
-    # all-gather both edges from every rank
-    le = torch.empty((world,) + left_edge.shape, dtype=x.dtype, device=x.device)
-    re = torch.empty((world,) + right_edge.shape, dtype=x.dtype, device=x.device)
+    # all-gather both edges (Neuron: output dim0 = world*input dim0, flat -> reshape)
+    le = torch.empty((world * left_edge.shape[0],) + tuple(left_edge.shape[1:]),
+                     dtype=x.dtype, device=x.device)
+    re = torch.empty((world * right_edge.shape[0],) + tuple(right_edge.shape[1:]),
+                     dtype=x.dtype, device=x.device)
     dist.all_gather_into_tensor(le, left_edge, group=grp)
     dist.all_gather_into_tensor(re, right_edge, group=grp)
+    le = le.reshape((world,) + tuple(left_edge.shape))
+    re = re.reshape((world,) + tuple(right_edge.shape))
     halo_left = re[rank - 1] if rank > 0 else None      # my left halo = left neighbor's RIGHT edge
     halo_right = le[rank + 1] if rank < world - 1 else None
     return halo_left, halo_right
@@ -60,12 +64,14 @@ def _vae_w_all_gather(x):
     world = get_vae_w_degree()
     if world <= 1:
         return x
-    g = torch.empty((world,) + tuple(x.shape), dtype=x.dtype, device=x.device)
+    # Neuron all_gather output = input with dim0*world (flat), then reshape.
+    g = torch.empty((world * x.shape[0],) + tuple(x.shape[1:]), dtype=x.dtype, device=x.device)
     dist.all_gather_into_tensor(g, x.contiguous(), group=get_vae_w_group())
-    # g[r] is rank r's shard; concatenate along W (last dim) in rank order
+    g = g.reshape((world,) + tuple(x.shape))          # [world, ...x.shape]
+    # concatenate each rank's shard along W (last dim) in rank order
     ndim = x.dim()
-    perm = tuple(range(1, ndim + 1)) + (0,)          # move world dim next to W
-    g = g.permute(*perm).contiguous()                 # [..., w_local, world]
+    perm = tuple(range(1, ndim + 1)) + (0,)           # [..., w_local, world]
+    g = g.permute(*perm).contiguous()
     return g.reshape(tuple(x.shape[:-1]) + (x.shape[-1] * world,))
 
 
