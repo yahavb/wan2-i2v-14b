@@ -171,6 +171,9 @@ spec:
               tar -czf "$ARCHIVE" -C /tmp results 2>/dev/null || true
               cp "$ARCHIVE" /var/mdl/ 2>/dev/null && echo "Saved: /var/mdl/$(basename "$ARCHIVE")" || echo "persist skipped"
               echo "╔══ VALIDATE video. $GIT_BRANCH @ ${GIT_SHA:0:12} SP=${SP_DEGREE} steps=${NUM_STEPS} ══╗"
+              echo "POD STAYS ALIVE 2h — pull results with:"
+              echo "  kubectl cp <pod>:$ARCHIVE ./wan_results.tar.gz"
+              sleep 7200
           resources:
             claims:
               - name: m-trn2
