@@ -61,3 +61,33 @@ def get_sp_rank():
 
 def get_sp_degree():
     return _SP_DEGREE
+
+
+# ── VAE width-parallel group (ported from rolling_forcing vae-sp) ──
+# The VAE decoder is sharded along the spatial WIDTH dim across ALL ranks
+# (group = WORLD), with halo exchange of kernel-radius edge columns. This
+# parallelizes the heavy conv FLOPs + replaces full pad-copy with thin halos.
+_VAEW_GROUP = None
+_VAEW_RANK = 0
+_VAEW_DEGREE = 1
+
+
+def init_vae_w_group():
+    """All ranks form one width-shard group for VAE decode."""
+    global _VAEW_GROUP, _VAEW_RANK, _VAEW_DEGREE
+    _VAEW_GROUP = dist.group.WORLD
+    _VAEW_RANK = dist.get_rank()
+    _VAEW_DEGREE = dist.get_world_size()
+    print(f"[VAE-W] Initialized: rank={_VAEW_RANK}/{_VAEW_DEGREE}")
+
+
+def get_vae_w_group():
+    return _VAEW_GROUP
+
+
+def get_vae_w_rank():
+    return _VAEW_RANK
+
+
+def get_vae_w_degree():
+    return _VAEW_DEGREE

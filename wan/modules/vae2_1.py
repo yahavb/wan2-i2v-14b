@@ -14,9 +14,34 @@ __all__ = [
 CACHE_T = 2
 
 
+def _vae_w_halo(x, radius):
+    """Exchange `radius` edge columns (dim=-1, W) with W-shard neighbors.
+    Returns (halo_left, halo_right); None at the true outer boundary.
+    Ported from rolling_forcing _halo_exchange_w (torch-native edge slice)."""
+    from models.parallel_state import get_vae_w_group, get_vae_w_rank, get_vae_w_degree
+    import torch.distributed as dist
+    world = get_vae_w_degree()
+    if world <= 1:
+        return None, None
+    rank = get_vae_w_rank()
+    grp = get_vae_w_group()
+    left_edge = x[..., :radius].contiguous()      # my left cols -> left neighbor's right halo
+    right_edge = x[..., -radius:].contiguous()     # my right cols -> right neighbor's left halo
+    # all-gather both edges from every rank
+    le = torch.empty((world,) + left_edge.shape, dtype=x.dtype, device=x.device)
+    re = torch.empty((world,) + right_edge.shape, dtype=x.dtype, device=x.device)
+    dist.all_gather_into_tensor(le, left_edge, group=grp)
+    dist.all_gather_into_tensor(re, right_edge, group=grp)
+    halo_left = re[rank - 1] if rank > 0 else None      # my left halo = left neighbor's RIGHT edge
+    halo_right = le[rank + 1] if rank < world - 1 else None
+    return halo_left, halo_right
+
+
 class CausalConv3d(nn.Conv3d):
     """
-    Causal 3d convolusion.
+    Causal 3d convolution. Supports VAE width-sharding: when the VAE-W group
+    has world>1, each rank holds W/world columns and exchanges kernel-radius
+    halos with neighbors instead of materializing the full spatial pad.
     """
 
     def __init__(self, *args, **kwargs):
@@ -26,13 +51,26 @@ class CausalConv3d(nn.Conv3d):
         self.padding = (0, 0, 0)
 
     def forward(self, x, cache_x=None):
-        padding = list(self._padding)
+        from models.parallel_state import get_vae_w_degree, get_vae_w_rank
+        padding = list(self._padding)  # (W,W, H,H, 2T,0)
         if cache_x is not None and self._padding[4] > 0:
             cache_x = cache_x.to(x.device)
             x = torch.cat([cache_x, x], dim=2)
             padding[4] -= cache_x.shape[2]
-        x = F.pad(x, padding)
 
+        world = get_vae_w_degree()
+        radius = self._padding[0]  # W pad = kernel_w // 2
+        if world > 1 and radius > 0:
+            rank = get_vae_w_rank()
+            hl, hr = _vae_w_halo(x, radius)
+            parts = ([hl] if hl is not None else []) + [x] + ([hr] if hr is not None else [])
+            x = torch.cat(parts, dim=-1) if len(parts) > 1 else x
+            # only pad the W edges that are true outer boundaries (no neighbor)
+            pad_w_l = padding[0] if hl is None else 0
+            pad_w_r = padding[1] if hr is None else 0
+            padding[0], padding[1] = pad_w_l, pad_w_r
+
+        x = F.pad(x, padding)
         return super().forward(x)
 
 
