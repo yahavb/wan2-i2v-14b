@@ -28,7 +28,7 @@ spec:
               set -euo pipefail
 
               cd /tmp
-              BRANCH=main
+              BRANCH=exp/vae-wshard
               git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-i2v-14b.git wan2-i2v-14b
               cd wan2-i2v-14b
 
@@ -204,7 +204,7 @@ spec:
             - name: T5_RANK
               value: "0"
             - name: VAE_TP_DEGREE
-              value: "2"
+              value: "8"
             - name: USE_NKI_KERNELS
               value: "1"
             - name: NUM_STEPS

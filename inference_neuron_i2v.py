@@ -204,12 +204,13 @@ def main():
         vae.std = vae.std.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
         vae.scale = [vae.mean, 1.0 / vae.std]
 
-        # Create VAE TP group and shard decoder
-        create_vae_tp_group(VAE_TP_RANKS)
-        vae_tp_rank = VAE_TP_RANKS.index(rank)
-        shard_vae_model_tp(vae.model, vae_tp_rank, VAE_TP_DEGREE)
+        # VAE WIDTH-SHARD (ported from rolling_forcing): full conv weights on
+        # every rank, sharded along spatial WIDTH with halo exchange. No channel
+        # TP. init the W-group so CausalConv3d/AttentionBlock shard internally.
+        from models.parallel_state import init_vae_w_group
+        init_vae_w_group()
         if rank == 0:
-            logger.info(f"VAE TP={VAE_TP_DEGREE} sharded on all ranks")
+            logger.info(f"VAE WIDTH-SHARD across {VAE_TP_DEGREE} ranks (halo exchange)")
 
         # Encode image (encoder is replicated, all ranks get same result)
         img_for_vae = torch.nn.functional.interpolate(
@@ -356,13 +357,26 @@ def main():
             low_noise_model = low_noise_model.to('cpu')
         gc.collect()
 
-        # ── Decode with VAE (TP across all VAE ranks) ──
+        # ── Decode with VAE (WIDTH-sharded across all ranks + halo exchange) ──
         vae_start = time.time()
         if rank in VAE_TP_RANKS:
             if rank == 0:
-                logger.info(f"{run_label} VAE decode (TP={VAE_TP_DEGREE})...")
-            x0 = [latent.to(torch.bfloat16)]
-            videos = vae.decode(x0)
+                logger.info(f"{run_label} VAE decode (W-shard x{VAE_TP_DEGREE})...")
+            from wan.modules.vae2_1 import set_vae_w_active
+            from models.parallel_state import get_vae_w_degree, get_vae_w_rank
+            lat = latent.to(torch.bfloat16)
+            wsh = get_vae_w_degree()
+            # Only width-shard if W divides evenly across ranks; else full decode.
+            do_wshard = wsh > 1 and (lat.shape[-1] % wsh == 0)
+            if wsh > 1 and not do_wshard and rank == 0:
+                logger.info(f"VAE W-shard SKIPPED: lat_w={lat.shape[-1]} not divisible by {wsh}; full decode")
+            if do_wshard:
+                Wl = lat.shape[-1] // wsh
+                r = get_vae_w_rank()
+                lat = lat[..., r * Wl:(r + 1) * Wl].contiguous()
+                set_vae_w_active(True)        # enable halo/gather inside the decoder
+            videos = vae.decode([lat])
+            set_vae_w_active(False)
             if rank == 0:
                 video = videos[0]
                 import imageio

@@ -13,6 +13,21 @@ __all__ = [
 
 CACHE_T = 2
 
+# VAE width-shard is active ONLY during decode (encode runs full-width, and its
+# output y feeds the DiT at full res). Gate the halo/gather on this flag so the
+# same CausalConv3d/AttentionBlock code is correct in both phases.
+_VAE_W_ACTIVE = False
+
+
+def set_vae_w_active(flag):
+    global _VAE_W_ACTIVE
+    _VAE_W_ACTIVE = flag
+
+
+def _vae_w_on():
+    from models.parallel_state import get_vae_w_degree
+    return _VAE_W_ACTIVE and get_vae_w_degree() > 1
+
 
 def _vae_w_halo(x, radius):
     """Exchange `radius` edge columns (dim=-1, W) with W-shard neighbors.
@@ -37,6 +52,23 @@ def _vae_w_halo(x, radius):
     return halo_left, halo_right
 
 
+def _vae_w_all_gather(x):
+    """Gather a W-sharded tensor [..., w_local] -> [..., w_local*world] in rank
+    order along the width dim. Mirrors rolling_forcing _all_gather_w."""
+    from models.parallel_state import get_vae_w_group, get_vae_w_degree
+    import torch.distributed as dist
+    world = get_vae_w_degree()
+    if world <= 1:
+        return x
+    g = torch.empty((world,) + tuple(x.shape), dtype=x.dtype, device=x.device)
+    dist.all_gather_into_tensor(g, x.contiguous(), group=get_vae_w_group())
+    # g[r] is rank r's shard; concatenate along W (last dim) in rank order
+    ndim = x.dim()
+    perm = tuple(range(1, ndim + 1)) + (0,)          # move world dim next to W
+    g = g.permute(*perm).contiguous()                 # [..., w_local, world]
+    return g.reshape(tuple(x.shape[:-1]) + (x.shape[-1] * world,))
+
+
 class CausalConv3d(nn.Conv3d):
     """
     Causal 3d convolution. Supports VAE width-sharding: when the VAE-W group
@@ -58,9 +90,8 @@ class CausalConv3d(nn.Conv3d):
             x = torch.cat([cache_x, x], dim=2)
             padding[4] -= cache_x.shape[2]
 
-        world = get_vae_w_degree()
         radius = self._padding[0]  # W pad = kernel_w // 2
-        if world > 1 and radius > 0:
+        if _vae_w_on() and radius > 0:
             rank = get_vae_w_rank()
             hl, hr = _vae_w_halo(x, radius)
             parts = ([hl] if hl is not None else []) + [x] + ([hr] if hr is not None else [])
@@ -276,6 +307,15 @@ class AttentionBlock(nn.Module):
         nn.init.zeros_(self.proj.weight)
 
     def forward(self, x):
+        # VAE W-shard: attention spans the FULL width, so gather to full W,
+        # compute, then re-slice back to this rank's shard. Convs stay sharded;
+        # only attention needs global width (mirrors rolling_forcing AttentionBlock).
+        from models.parallel_state import get_vae_w_rank
+        active = _vae_w_on()
+        w_local = x.shape[-1]
+        if active:
+            x = _vae_w_all_gather(x)            # [b,c,t,h, w_local*world]
+
         identity = x
         b, c, t, h, w = x.size()
         x = rearrange(x, 'b c t h w -> (b t) c h w')
@@ -297,7 +337,11 @@ class AttentionBlock(nn.Module):
         # output
         x = self.proj(x)
         x = rearrange(x, '(b t) c h w-> b c t h w', t=t)
-        return x + identity
+        x = x + identity
+        if active:
+            rank = get_vae_w_rank()
+            x = x[..., rank * w_local:(rank + 1) * w_local].contiguous()
+        return x
 
 
 class Encoder3d(nn.Module):
@@ -507,6 +551,9 @@ class Decoder3d(nn.Module):
                 feat_idx[0] += 1
             else:
                 x = layer(x)
+        # W-shard: gather per-rank width slices into the full-width video
+        if _vae_w_on():
+            x = _vae_w_all_gather(x)
         return x
 
 
