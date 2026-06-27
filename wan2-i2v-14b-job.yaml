@@ -211,6 +211,8 @@ spec:
               value: "1"
             - name: NUM_STEPS
               value: "10"
+            - name: WSHARD_DEBUG
+              value: "1"
             - name: NUM_RUNS
               value: "1"
             - name: FRAME_NUM

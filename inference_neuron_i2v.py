@@ -382,6 +382,21 @@ def main():
                 set_vae_w_active(True)        # enable halo/gather inside the decoder
             videos = vae.decode([lat])
             set_vae_w_active(False)
+
+            # DEBUG: compare W-shard output vs a full (non-sharded) decode on the
+            # SAME latent. All ranks run the full decode (no collectives in it when
+            # inactive) so it's safe; only rank 0 compares. Finds if halo math is wrong.
+            if os.environ.get("WSHARD_DEBUG", "0") == "1" and do_wshard and run_idx == 0:
+                full = vae.decode([latent.to(torch.bfloat16)])   # W-shard inactive -> full decode
+                if rank == 0:
+                    a = videos[0].float(); bvid = full[0].float()
+                    if a.shape == bvid.shape:
+                        d = (a - bvid).abs().max().item()
+                        logger.info(f"[WSHARD_DEBUG] W-shard vs full max|diff|={d:.4f} "
+                                    f"-> {'MATCH' if d < 0.05 else 'DIVERGES'}")
+                    else:
+                        logger.info(f"[WSHARD_DEBUG] SHAPE MISMATCH wshard={tuple(a.shape)} full={tuple(bvid.shape)}")
+
             if rank == 0:
                 video = videos[0]
                 import imageio
