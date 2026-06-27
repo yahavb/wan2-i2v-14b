@@ -108,9 +108,12 @@ def make_sp_self_attn_forward(self_attn):
         # dim so BATCH and sequence-shard don't interleave at B>1 (the same bug
         # fixed in sp_model.py): [sp, b, L_local, dim] -> permute -> [b, L_full, dim].
         L_full = L_local * sp_degree
-        gathered = torch.empty(sp_degree, b, L_local, dim, dtype=x.dtype, device=x.device)
+        # all_gather output must be input with dim0 * sp_degree: [sp*b, L_local, dim].
+        gathered = torch.empty(sp_degree * b, L_local, dim, dtype=x.dtype, device=x.device)
         dist.all_gather_into_tensor(gathered, x.contiguous(), group=get_sp_group())
-        x_full = gathered.permute(1, 0, 2, 3).reshape(b, L_full, dim)
+        # gathered = [sp0_b0, sp0_b1, sp1_b0, sp1_b1] -> [sp, b, L_local, dim]
+        # -> [b, sp, L_local, dim] -> [b, L_full, dim] (each item's shards concatenated)
+        x_full = gathered.reshape(sp_degree, b, L_local, dim).permute(1, 0, 2, 3).reshape(b, L_full, dim)
 
         # QKV (projections already TP-sharded over heads)
         q = self_attn.norm_q(self_attn.q(x_full)).view(b, L_full, n, d)
