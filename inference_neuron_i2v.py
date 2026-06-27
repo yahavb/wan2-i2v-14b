@@ -146,7 +146,7 @@ def main():
     vae_stride = config.vae_stride  # (4, 8, 8)
     patch_size = config.patch_size  # (1, 2, 2)
     frame_num = FRAME_NUM
-    max_area = 320 * 576
+    max_area = 832 * 480  # 480p output (was 320*576). Bigger image; enables VAE W-shard.
 
     ih, iw = img.height, img.width
     aspect_ratio = ih / iw
@@ -154,6 +154,11 @@ def main():
         np.sqrt(max_area * aspect_ratio) // vae_stride[1] // patch_size[1] * patch_size[1])
     lat_w = round(
         np.sqrt(max_area / aspect_ratio) // vae_stride[2] // patch_size[2] * patch_size[2])
+    # round lat_w UP to a multiple of world_size so VAE W-shard engages for any
+    # input aspect ratio (the model pads seq_len anyway). world = TP*SP = all ranks.
+    _wsh = world_size
+    if lat_w % _wsh != 0:
+        lat_w += _wsh - (lat_w % _wsh)
     oh = lat_h * vae_stride[1]
     ow = lat_w * vae_stride[2]
 
