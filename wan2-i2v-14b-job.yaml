@@ -198,6 +198,11 @@ spec:
               find "$RUN_DIR" -maxdepth 2 -type f 2>/dev/null | sed 's/^/    /' | head -40
               echo "╚════════════════════════════════════════════════════════════╝"
               echo "╔══ VALIDATE video. $GIT_BRANCH @ ${GIT_SHA:0:12} SP=${SP_DEGREE} steps=${NUM_STEPS} ══╗"
+
+              # ─── keep-alive: hold the pod open so results can be kubectl cp'd ───
+              # (Data already persisted to $RUN_DIR on the PVC; this is for convenience.)
+              echo "Done. Pod stays alive 2h for kubectl cp. RUN_DIR=$RUN_DIR"
+              sleep 7200
           resources:
             claims:
               - name: m-trn2
