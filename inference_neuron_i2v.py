@@ -146,7 +146,7 @@ def main():
     vae_stride = config.vae_stride  # (4, 8, 8)
     patch_size = config.patch_size  # (1, 2, 2)
     frame_num = FRAME_NUM
-    max_area = 320 * 576
+    max_area = 832 * 480  # 480p output
 
     ih, iw = img.height, img.width
     aspect_ratio = ih / iw
