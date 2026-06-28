@@ -33,6 +33,14 @@ spec:
 
               LOCAL_RESULTS=/tmp/results; mkdir -p "$LOCAL_RESULTS"
 
+              # ─── PERSISTENT RUN DIR (the uploadable layout the user expects) ───
+              # /var/mdl/wan2_2_i2v/runs/<TS>/ will hold, for THIS execution:
+              #   trace_info.pb (required) + *.pb + .ntff + .neff  (Neuron Profiler 2.0 upload)
+              #   + explorer/breakdown txts + the output .mp4 for validation.
+              RUN_TS=$(date +%Y%m%d_%H%M%S)
+              RUN_DIR=/var/mdl/wan2_2_i2v/runs/$RUN_TS
+              mkdir -p "$RUN_DIR" && echo "RUN_DIR=$RUN_DIR" || echo "WARN: cannot create $RUN_DIR (PVC?)"
+
               # ─── PROVENANCE part 1: which code (no deps needed) ───
               GIT_SHA=$(git rev-parse HEAD)
               GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
@@ -151,17 +159,15 @@ spec:
 
               echo "=== [3b] SYSTEM-TRACE BUNDLE (Neuron Profiler 2.0 -> trace_info.pb, uploadable) ==="
               # The profiled run above set INSPECT_ENABLE but NOT OUTPUT_DIR, so its
-              # trace_info.pb went to ./output and was lost. Here we set the dir +
-              # DEVICE_PROFILE (also emit .ntff/.neff) and tar the per-rank bundle.
-              SYSTRACE=/tmp/systrace; rm -rf "$SYSTRACE"; mkdir -p "$SYSTRACE"
+              # trace_info.pb went to ./output and was lost. Here we point OUTPUT_DIR
+              # straight at the persistent RUN_DIR and turn on DEVICE_PROFILE so the
+              # runtime writes trace_info.pb + per-rank .ntff/.neff into the upload dir.
               NEURON_RT_INSPECT_ENABLE=1 NEURON_RT_INSPECT_SYSTEM_PROFILE=1 \
-              NEURON_RT_INSPECT_DEVICE_PROFILE=1 NEURON_RT_INSPECT_OUTPUT_DIR="$SYSTRACE" \
+              NEURON_RT_INSPECT_DEVICE_PROFILE=1 NEURON_RT_INSPECT_OUTPUT_DIR="$RUN_DIR" \
                 run_wan "$LOCAL_RESULTS/systrace_run.txt" 1 | grep -iE "total=|FAILED" || echo "(systrace run captured)"
-              echo "  trace_info.pb count: $(find "$SYSTRACE" -name 'trace_info.pb' 2>/dev/null | wc -l)"
-              echo "  rank subdirs       : $(find "$SYSTRACE" -maxdepth 1 -type d -name 'i-*' 2>/dev/null | wc -l)"
-              STBUNDLE=/tmp/wan2-i2v-14b_systrace.tar.gz
-              tar -czf "$STBUNDLE" -C "$(dirname "$SYSTRACE")" "$(basename "$SYSTRACE")" 2>/dev/null || true
-              cp "$STBUNDLE" /var/mdl/ 2>/dev/null && echo "Saved systrace bundle: /var/mdl/$(basename "$STBUNDLE")" || echo "systrace persist skipped"
+              echo "  trace_info.pb count: $(find "$RUN_DIR" -name 'trace_info.pb' 2>/dev/null | wc -l)"
+              echo "  rank subdirs       : $(find "$RUN_DIR" -maxdepth 1 -type d -name 'i-*' 2>/dev/null | wc -l)"
+              echo "  .ntff / .neff      : $(find "$RUN_DIR" -name '*.ntff' 2>/dev/null | wc -l) / $(find "$RUN_DIR" -name '*.neff' 2>/dev/null | wc -l)"
 
               echo "=== [4] per-NEFF engine breakdown + dominant-NEFF metrics (neuron-profile CLI) ==="
               run_explorer
@@ -179,11 +185,18 @@ spec:
               bash scripts/neuron/run_dma_analysis.sh "$LOCAL_RESULTS/ntff_pairs" \
                 2>&1 | tee "$LOCAL_RESULTS/dma_analysis.txt" || echo "DMA analysis skipped"
 
-              # ─── persist results + VIDEO for correctness validation ───
+              # ─── persist results + VIDEO into the SAME run dir as trace_info.pb ───
               cp /tmp/wan2_i2v_output.mp4 "$LOCAL_RESULTS/" 2>/dev/null && echo "video archived" || echo "NO VIDEO PRODUCED"
+              # Explorer/breakdown txts, heavy NEFF+NTFF pairs, video, provenance.
+              cp -r "$LOCAL_RESULTS"/. "$RUN_DIR"/ 2>/dev/null || echo "WARN: results copy to RUN_DIR failed"
+              # Keep the flat tarball too (back-compat with prior runs).
               ARCHIVE=/tmp/wan2-i2v-14b_results.tar.gz
               tar -czf "$ARCHIVE" -C /tmp results 2>/dev/null || true
               cp "$ARCHIVE" /var/mdl/ 2>/dev/null && echo "Saved: /var/mdl/$(basename "$ARCHIVE")" || echo "persist skipped"
+              echo "╔══════════════════ RUN DIR (upload this) ══════════════════╗"
+              echo "  $RUN_DIR"
+              find "$RUN_DIR" -maxdepth 2 -type f 2>/dev/null | sed 's/^/    /' | head -40
+              echo "╚════════════════════════════════════════════════════════════╝"
               echo "╔══ VALIDATE video. $GIT_BRANCH @ ${GIT_SHA:0:12} SP=${SP_DEGREE} steps=${NUM_STEPS} ══╗"
           resources:
             claims:
