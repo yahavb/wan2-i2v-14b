@@ -104,9 +104,12 @@ spec:
                 local POUT=/tmp/perneff_prof; rm -rf "$POUT"; mkdir -p "$POUT"
                 # auto-detect NEFFs from torch.compile cache AND /tmp/neff_cache
                 mapfile -t NEFFS < <(find /var/tmp/neuron-compile-cache /tmp/neff_cache -name "*.neff" 2>/dev/null | sort -u)
-                echo "NEFFs found: ${#NEFFS[@]}"
-                local OK=0
+                local TOTAL=${#NEFFS[@]}
+                echo "NEFFs found: $TOTAL"
+                echo "(step [4] captures+views each NEFF — this is the SLOW part, ~minutes; progress every 25)"
+                local OK=0 i=0
                 for neff in "${NEFFS[@]}"; do
+                  i=$((i+1))
                   local hash; hash=$(basename "$neff" .neff)
                   local ntff="$POUT/${hash}.ntff" json="$POUT/${hash}.json"
                   NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 180 \
@@ -114,8 +117,9 @@ spec:
                   [ -f "$ntff" ] || continue
                   timeout 120 neuron-profile view -n "$neff" -s "$ntff" --output-format summary-json > "$json" 2>/dev/null || true
                   [ -s "$json" ] && OK=$((OK+1))
+                  if [ $((i % 25)) -eq 0 ]; then echo "  [4] progress: $i/$TOTAL NEFFs (OK=$OK)"; fi
                 done
-                echo "captured+viewed OK: $OK / ${#NEFFS[@]}"
+                echo "captured+viewed OK: $OK / $TOTAL"
                 python3 scripts/neuron/profile_all_neffs.py "$POUT" 2>&1 | tee "$LOCAL_RESULTS/perneff_breakdown.txt" || echo "aggregation failed"
                 local BIGHASH BIGNEFF
                 BIGHASH=$(python3 scripts/neuron/pick_neffs.py "$POUT" /var/tmp/neuron-compile-cache | head -1)
@@ -199,9 +203,19 @@ spec:
               echo "╚════════════════════════════════════════════════════════════╝"
               echo "╔══ VALIDATE video. $GIT_BRANCH @ ${GIT_SHA:0:12} SP=${SP_DEGREE} steps=${NUM_STEPS} ══╗"
 
+              # ─── EXPLICIT COMPLETION MARKER — grep for this to know the run is DONE ───
+              # (everything above this line ran; if you don't see it, the run is still
+              #  in flight — step [4]'s per-NEFF loop is the slow silent part.)
+              echo ""
+              echo "████████████████████████████████████████████████████████████████"
+              echo "███ BENCHMARK COMPLETE — clean=${T_CLEAN:-N/A}s profiled=${T_PROF:-N/A}s ($GIT_BRANCH @ ${GIT_SHA:0:12})"
+              echo "███ run dir: $RUN_DIR"
+              echo "███ grep 'BENCHMARK COMPLETE' to confirm; pod now idles for kubectl cp"
+              echo "████████████████████████████████████████████████████████████████"
+
               # ─── keep-alive: hold the pod open so results can be kubectl cp'd ───
               # (Data already persisted to $RUN_DIR on the PVC; this is for convenience.)
-              echo "Done. Pod stays alive 2h for kubectl cp. RUN_DIR=$RUN_DIR"
+              echo "Pod stays alive 2h for kubectl cp. RUN_DIR=$RUN_DIR"
               sleep 7200
           resources:
             claims:
