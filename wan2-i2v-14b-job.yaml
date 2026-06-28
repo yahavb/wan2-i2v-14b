@@ -149,6 +149,20 @@ spec:
               NEURON_RT_INSPECT_ENABLE=1 run_wan "$LOCAL_RESULTS/profiled.txt" 3 | grep -iE "denoise=|vae=|total=|FAILED" || echo "PROFILED RUN FAILED"
               T_PROF=$(median_total_s "$LOCAL_RESULTS/profiled.txt")
 
+              echo "=== [3b] SYSTEM-TRACE BUNDLE (Neuron Profiler 2.0 -> trace_info.pb, uploadable) ==="
+              # The profiled run above set INSPECT_ENABLE but NOT OUTPUT_DIR, so its
+              # trace_info.pb went to ./output and was lost. Here we set the dir +
+              # DEVICE_PROFILE (also emit .ntff/.neff) and tar the per-rank bundle.
+              SYSTRACE=/tmp/systrace; rm -rf "$SYSTRACE"; mkdir -p "$SYSTRACE"
+              NEURON_RT_INSPECT_ENABLE=1 NEURON_RT_INSPECT_SYSTEM_PROFILE=1 \
+              NEURON_RT_INSPECT_DEVICE_PROFILE=1 NEURON_RT_INSPECT_OUTPUT_DIR="$SYSTRACE" \
+                run_wan "$LOCAL_RESULTS/systrace_run.txt" 1 | grep -iE "total=|FAILED" || echo "(systrace run captured)"
+              echo "  trace_info.pb count: $(find "$SYSTRACE" -name 'trace_info.pb' 2>/dev/null | wc -l)"
+              echo "  rank subdirs       : $(find "$SYSTRACE" -maxdepth 1 -type d -name 'i-*' 2>/dev/null | wc -l)"
+              STBUNDLE=/tmp/wan2-i2v-14b_systrace.tar.gz
+              tar -czf "$STBUNDLE" -C "$(dirname "$SYSTRACE")" "$(basename "$SYSTRACE")" 2>/dev/null || true
+              cp "$STBUNDLE" /var/mdl/ 2>/dev/null && echo "Saved systrace bundle: /var/mdl/$(basename "$STBUNDLE")" || echo "systrace persist skipped"
+
               echo "=== [4] per-NEFF engine breakdown + dominant-NEFF metrics (neuron-profile CLI) ==="
               run_explorer
 
