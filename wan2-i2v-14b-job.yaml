@@ -27,7 +27,7 @@ spec:
               set -euo pipefail
 
               cd /tmp
-              BRANCH=exp/480p-channelvae
+              BRANCH=exp/pad-section-2048
               git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-i2v-14b.git wan2-i2v-14b
               cd wan2-i2v-14b
 
