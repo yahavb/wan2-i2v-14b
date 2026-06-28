@@ -24,7 +24,7 @@ spec:
               set -uo pipefail
 
               # ─── which run to analyze ───
-              RUN=20260628_063835
+              RUN=20260628_192246
               SRC=/var/mdl/wan2_2_i2v/runs/$RUN
               WORK=/tmp/analyze; rm -rf "$WORK"; mkdir -p "$WORK"
               echo "════════ ANALYZE NEURON TRACES — run $RUN ════════"
