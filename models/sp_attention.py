@@ -1,7 +1,7 @@
 """Sequence Parallel self-attention for WanModel.
 
 With TP=4 SP=2 (8 ranks total), the NKI self-attention kernel supports
-seq_q != seq_k natively (q padded to 128, k padded to 8192 multiples).
+seq_q != seq_k natively (q padded to 128, k padded to SECTION (2048) multiples).
 
 SP attention flow:
   1. All-gather x across ALL ranks (world) → full [B, seq_len, dim]
@@ -23,7 +23,9 @@ from models.parallel_state import get_sp_group, get_sp_rank, get_sp_degree
 from models.tp_utils import get_tp_rank, get_tp_world_size
 
 
-SELF_ATTN_SEQLEN_MULTIPLE = 8192
+# MUST equal SECTION in kernels/self_attention.py and SELF_ATTN_SEQLEN_MULTIPLE
+# in wan/modules/attention.py. 2048 cuts the SP K-pad waste (45%->12%).
+SELF_ATTN_SEQLEN_MULTIPLE = 2048
 
 # Cached attention mask. Shape/contents are identical across every self-attn
 # call (l_q, l_k constant), so build once instead of ~800x per generation.

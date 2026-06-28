@@ -41,8 +41,10 @@ if USE_NKI_KERNELS:
     except Exception as e:
         print(f"[attention.py] NKI self_attention kernel: FAILED ({e})")
 
-# Self-attention kernel requires seqlen_k to be multiple of 8192
-SELF_ATTN_SEQLEN_MULTIPLE = 8192
+# Self-attention kernel requires seqlen_k to be a multiple of its SECTION tiling
+# granularity. MUST equal SECTION in kernels/self_attention.py. Dropped 8192->2048
+# to cut zero-pad waste (seq_len~9048 pads to 10240 not 16384: 12% vs 45%).
+SELF_ATTN_SEQLEN_MULTIPLE = 2048
 
 # Identity matrix buffer (created once, reused)
 _identity_matrix = None
