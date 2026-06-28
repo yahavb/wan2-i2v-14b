@@ -1,0 +1,122 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wan2-i2v-14b-analyze
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: wan2-i2v-14b-analyze
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn2
+      containers:
+        - name: analyze
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-ec"
+            - |
+              set -uo pipefail
+
+              # ─── which run to analyze ───
+              RUN=20260628_063835
+              SRC=/var/mdl/wan2_2_i2v/runs/$RUN
+              WORK=/tmp/analyze; rm -rf "$WORK"; mkdir -p "$WORK"
+              echo "════════ ANALYZE NEURON TRACES — run $RUN ════════"
+              ls -la "$SRC" || { echo "MISSING $SRC"; sleep 600; exit 1; }
+
+              # ─── get the analysis scripts (repo) ───
+              cd /tmp
+              git clone -b exp/480p-channelvae https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-i2v-14b.git repo
+              SCRIPTS=/tmp/repo/scripts/neuron
+
+              # ─── deps: duckdb (parquet query engine). neuron-explorer is in the image ───
+              echo "=== deps ==="
+              python3 -c "import duckdb; print('duckdb', duckdb.__version__)" 2>/dev/null \
+                || pip install --quiet duckdb && python3 -c "import duckdb; print('duckdb', duckdb.__version__)"
+              EXPLORER=$(command -v neuron-explorer || echo /opt/aws/neuron/bin/neuron-explorer)
+              echo "explorer: $EXPLORER"; "$EXPLORER" --version 2>&1 | head -1 || true
+
+              # ─── copy the heavy NEFF+NTFF pairs OFF the PVC to LOCAL /tmp (storage rule) ───
+              PAIRS="$WORK/ntff_pairs"; mkdir -p "$PAIRS"
+              cp "$SRC"/ntff_pairs/*.neff "$SRC"/ntff_pairs/*.ntff "$PAIRS"/ 2>/dev/null
+              echo "pairs copied: $(ls "$PAIRS"/*.ntff 2>/dev/null | wc -l)"
+              PQROOT="$WORK/dma_pq"; mkdir -p "$PQROOT"
+
+              # ─── ingest each pair to parquet, LONG timeout, KEEP instruction hierarchy
+              #     (the prior run stripped it / timed out at 20min on 8-16MB ntffs) ───
+              ingest() {  # $1=neff $2=ntff $3=out
+                local neff="$1" ntff="$2" out="$3"
+                rm -rf "$out"; mkdir -p "$out"
+                timeout 3600 "$EXPLORER" view -n "$neff" -s "$ntff" \
+                  --output-format parquet --output-file "$out" >/dev/null 2>&1 &
+                local pid=$! prev=-1 cur stable=0
+                for _ in $(seq 1 720); do            # up to 60 min
+                  kill -0 "$pid" 2>/dev/null || break
+                  cur=$(du -sb "$out" 2>/dev/null | cut -f1)
+                  if [ -f "$out/Summary.parquet" ] && [ "$cur" = "$prev" ]; then
+                    stable=$((stable+1)); [ "$stable" -ge 4 ] && break
+                  else stable=0; fi
+                  prev="$cur"; sleep 5
+                done
+                kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+                [ -f "$out/Summary.parquet" ] && [ "$(stat -c%s "$out/Summary.parquet" 2>/dev/null || echo 0)" -gt 1000 ]
+              }
+
+              REPORT="$WORK/dma_analysis_full.txt"
+              : > "$REPORT"
+              for neff in $(ls -S "$PAIRS"/*.neff 2>/dev/null); do
+                h=$(basename "$neff" .neff)
+                ntff="$PAIRS/$h.ntff"
+                out="$PQROOT/pq_$h"
+                echo "" | tee -a "$REPORT"
+                echo "########## ingesting $h ($(du -h "$neff" | cut -f1) neff / $(du -h "$ntff" | cut -f1) ntff) ##########" | tee -a "$REPORT"
+                [ -f "$ntff" ] || { echo "  no NTFF, skip" | tee -a "$REPORT"; continue; }
+                if ingest "$neff" "$ntff" "$out"; then
+                  python3 "$SCRIPTS/pq_dma_report.py" "$out" "$h" 2>&1 | tee -a "$REPORT"
+                  # also surface pad/concat shapes if the helper exists
+                  [ -f "$SCRIPTS/pq_pad_shapes.py" ] && python3 "$SCRIPTS/pq_pad_shapes.py" "$out" 2>&1 | tee -a "$REPORT" || true
+                else
+                  echo "  ingest produced no parquet even at 60min — $(du -sh "$out" 2>/dev/null)" | tee -a "$REPORT"
+                fi
+              done
+
+              echo "" | tee -a "$REPORT"
+              echo "=== DMA ANALYSIS COMPLETE ===" | tee -a "$REPORT"
+              # persist the full report back to the run dir on the PVC
+              cp "$REPORT" "$SRC/dma_analysis_full.txt" 2>/dev/null && echo "saved -> $SRC/dma_analysis_full.txt"
+              echo "════════ DONE — pod stays alive 2h (kubectl logs / cp) ════════"
+              sleep 7200
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          resources:
+            requests:
+              cpu: 8
+              memory: 64Gi
+            limits:
+              cpu: 8
+              memory: 64Gi
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
