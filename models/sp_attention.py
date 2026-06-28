@@ -55,40 +55,33 @@ def _sp_nki_self_attention(q_local, k_full, v_full, dtype=torch.bfloat16):
     b, l_q, n, d = q_local.shape
     l_k = k_full.shape[1]
 
-    assert b == 1
-
-    # Reshape for kernel: [n, d, L]
-    q_nki = q_local[0].permute(1, 2, 0).contiguous()  # [n, d, L_q]
-    k_nki = k_full[0].permute(1, 2, 0).contiguous()   # [n, d, L_k]
-    v_nki = v_full[0].permute(1, 0, 2).contiguous()   # [n, L_k, d]
-
+    # Batched CFG: kernel takes [n,d,L] (no sample-batch). Loop over B (cond+uncond)
+    # and stack. (Was assert b==1; SP path now also hit at B=2 under batched CFG.)
     P = 128
     pad_q = (P - l_q % P) % P
-    if pad_q > 0:
-        q_nki = F.pad(q_nki, (0, pad_q))
-
     pad_k = (SELF_ATTN_SEQLEN_MULTIPLE - l_k % SELF_ATTN_SEQLEN_MULTIPLE) % SELF_ATTN_SEQLEN_MULTIPLE
-    if pad_k > 0:
-        k_nki = F.pad(k_nki, (0, pad_k))
-        v_nki = F.pad(v_nki, (0, 0, 0, pad_k))
-
-    seqlen_k_padded = k_nki.shape[2]
+    seqlen_k_padded = l_k + pad_k
     num_sections = seqlen_k_padded // SELF_ATTN_SEQLEN_MULTIPLE
-
-    # Mask: 0 for valid, -inf for padded K positions (cached across calls)
     mask = _get_sp_mask(P, seqlen_k_padded, l_k, pad_k, dtype, q_local.device)
-
     identity = _get_identity(q_local.device, dtype)
     softmax_scale = 1.0 / math.sqrt(d)
 
-    out_nki = _nki_self_attn(
-        q_nki, k_nki, v_nki, identity, mask,
-        softmax_scale=softmax_scale,
-        num_sections=num_sections)
+    outs = []
+    for bi in range(b):
+        q_nki = q_local[bi].permute(1, 2, 0).contiguous()  # [n, d, L_q]
+        k_nki = k_full[bi].permute(1, 2, 0).contiguous()   # [n, d, L_k]
+        v_nki = v_full[bi].permute(1, 0, 2).contiguous()   # [n, L_k, d]
+        if pad_q > 0:
+            q_nki = F.pad(q_nki, (0, pad_q))
+        if pad_k > 0:
+            k_nki = F.pad(k_nki, (0, pad_k))
+            v_nki = F.pad(v_nki, (0, 0, 0, pad_k))
+        out_nki = _nki_self_attn(
+            q_nki, k_nki, v_nki, identity, mask,
+            softmax_scale=softmax_scale, num_sections=num_sections)
+        outs.append(out_nki[:l_q].unsqueeze(0))  # [1, L_q, n, d]
 
-    # Output: [seqlen_q_padded, n, d] → slice → [1, L_q, n, d]
-    out = out_nki[:l_q].unsqueeze(0)
-    return out
+    return torch.cat(outs, dim=0)                 # [B, L_q, n, d]
 
 
 def make_sp_self_attn_forward(self_attn):
@@ -110,15 +103,17 @@ def make_sp_self_attn_forward(self_attn):
         n = self_attn.num_heads  # local heads after TP sharding
         d = self_attn.head_dim
 
-        # x is the SP shard (L/sp), REPLICATED across the TP group. Gather K/V over
-        # the SP GROUP (sp_degree shards -> full L). NOT the world group.
+        # x is the SP shard (L/sp), REPLICATED across the TP group. Gather over the
+        # SP GROUP (sp_degree shards -> full L). Gather with SP-shard as the OUTER
+        # dim so BATCH and sequence-shard don't interleave at B>1 (the same bug
+        # fixed in sp_model.py): [sp, b, L_local, dim] -> permute -> [b, L_full, dim].
         L_full = L_local * sp_degree
-
-        x_full_flat = torch.empty(
-            b * L_full, dim, dtype=x.dtype, device=x.device)
-        x_flat = x.reshape(b * L_local, dim).contiguous()
-        dist.all_gather_into_tensor(x_full_flat, x_flat, group=get_sp_group())
-        x_full = x_full_flat.reshape(b, L_full, dim)
+        # all_gather output must be input with dim0 * sp_degree: [sp*b, L_local, dim].
+        gathered = torch.empty(sp_degree * b, L_local, dim, dtype=x.dtype, device=x.device)
+        dist.all_gather_into_tensor(gathered, x.contiguous(), group=get_sp_group())
+        # gathered = [sp0_b0, sp0_b1, sp1_b0, sp1_b1] -> [sp, b, L_local, dim]
+        # -> [b, sp, L_local, dim] -> [b, L_full, dim] (each item's shards concatenated)
+        x_full = gathered.reshape(sp_degree, b, L_local, dim).permute(1, 0, 2, 3).reshape(b, L_full, dim)
 
         # QKV (projections already TP-sharded over heads)
         q = self_attn.norm_q(self_attn.q(x_full)).view(b, L_full, n, d)

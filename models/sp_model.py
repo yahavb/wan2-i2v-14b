@@ -100,11 +100,12 @@ def make_sp_forward(model):
         # L/sp each -> full L), NOT the world group. TP ranks hold identical data
         # so they gather the same result.
         B = x.shape[0]
-        x_full = torch.empty(B, L, model.dim, dtype=x.dtype, device=x.device)
-        x_flat = x.reshape(B * L_local, model.dim).contiguous()
-        x_full_flat = x_full.reshape(B * L, model.dim)
-        dist.all_gather_into_tensor(x_full_flat, x_flat, group=get_sp_group())
-        x = x_full_flat.reshape(B, L, model.dim)
+        # all_gather output = input with dim0*sp_degree: [sp*B, L_local, dim].
+        # Then [sp,B,...] -> [B,sp,...] -> [B, L, dim] so each batch item's shards
+        # concatenate correctly (avoids batch/seq-shard interleaving at B>1).
+        gathered = torch.empty(sp_degree * B, L_local, model.dim, dtype=x.dtype, device=x.device)
+        dist.all_gather_into_tensor(gathered, x.contiguous(), group=get_sp_group())
+        x = gathered.reshape(sp_degree, B, L_local, model.dim).permute(1, 0, 2, 3).reshape(B, L, model.dim)
 
         # Head (on full sequence)
         x = model.head(x, e)
