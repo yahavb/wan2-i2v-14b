@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import logging
+import os
 
 import torch
 # import torch.cuda.amp as amp (patched)
@@ -14,6 +15,28 @@ __all__ = [
 CACHE_T = 2
 
 
+# Streaming temporal feature-cache via NKI. OFF by default (one-shot generation
+# rebuilds the cache each decode, so the host-side torch.cat path is fine and the
+# kernel would only add overhead). Turn on with VAE_CONV_CACHE=1 for STREAMING use
+# (decode a few frames per call), where the on-device shift/copy removes a
+# recurring HBM round-trip from the per-chunk hot path.
+_VAE_CONV_CACHE = os.environ.get("VAE_CONV_CACHE", "0") == "1"
+_nki_cache_shift = None
+_nki_cache_copy = None
+if _VAE_CONV_CACHE:
+    try:
+        from torch_neuronx.nki_hop import wrap_nki
+        from kernels.causal_conv3d_cache import (
+            causal_conv3d_cache_shift as _raw_shift,
+            causal_conv3d_cache_copy as _raw_copy)
+        _nki_cache_shift = wrap_nki(_raw_shift)
+        _nki_cache_copy = wrap_nki(_raw_copy)
+        print("[vae2_1.py] NKI causal_conv3d_cache kernels: LOADED")
+    except Exception as e:
+        print(f"[vae2_1.py] NKI causal_conv3d_cache kernels: FAILED ({e})")
+        _VAE_CONV_CACHE = False
+
+
 class CausalConv3d(nn.Conv3d):
     """
     Causal 3d convolusion.
@@ -24,6 +47,9 @@ class CausalConv3d(nn.Conv3d):
         self._padding = (self.padding[2], self.padding[2], self.padding[1],
                          self.padding[1], 2 * self.padding[0], 0)
         self.padding = (0, 0, 0)
+        # Persistent on-device cache for streaming (VAE_CONV_CACHE=1). Holds the
+        # last CACHE_T frames flattened as (C, CACHE_T*HW); updated by NKI kernel.
+        self._stream_cache = None
 
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
@@ -32,8 +58,32 @@ class CausalConv3d(nn.Conv3d):
             x = torch.cat([cache_x, x], dim=2)
             padding[4] -= cache_x.shape[2]
         x = F.pad(x, padding)
+        out = super().forward(x)
 
-        return super().forward(x)
+        # Streaming: update the persistent temporal cache on-device. Only meaningful
+        # for temporally-padded convs (self._padding[4] > 0). One-shot path never
+        # enters here, so the validated 111s baseline is untouched.
+        if _VAE_CONV_CACHE and self._padding[4] > 0 and _nki_cache_shift is not None:
+            self._update_stream_cache(x)
+        return out
+
+    def _update_stream_cache(self, x_in):
+        """Refresh self._stream_cache with the last CACHE_T frames of x_in.
+
+        x_in: padded conv input [B, C, T, H, W]. We cache the post-pad temporal
+        tail so the next chunk can prepend it. B is assumed 1 in streaming decode.
+        """
+        B, C, T, H, W = x_in.shape
+        HW = H * W
+        x2d = x_in[0].reshape(C, T * HW).contiguous()
+        if self._stream_cache is None:
+            self._stream_cache = torch.zeros(
+                C, CACHE_T * HW, dtype=x_in.dtype, device=x_in.device)
+        if T < CACHE_T:
+            self._stream_cache = _nki_cache_shift(
+                self._stream_cache, x2d[:, -HW:].contiguous(), HW)
+        else:
+            self._stream_cache = _nki_cache_copy(self._stream_cache, x2d)
 
 
 class RMS_norm(nn.Module):
