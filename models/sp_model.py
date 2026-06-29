@@ -67,11 +67,18 @@ def make_sp_forward(model):
         # Round seq_len up to multiple of world_size for even sharding
         seq_len_padded = ((seq_len + world_size - 1) // world_size) * world_size
 
-        # Pad to seq_len_padded: [B, seq_len_padded, dim]
-        x = torch.cat([
-            torch.cat([u, u.new_zeros(1, seq_len_padded - u.size(1), u.size(2))],
-                      dim=1) for u in x
-        ])
+        # Pad to seq_len_padded: [B, seq_len_padded, dim]. Skip the pad entirely
+        # when each item is ALREADY seq_len_padded (common: seq_len divisible by
+        # world_size) — the old unconditional torch.cat ran a full 188MB copy that
+        # appended ZERO rows, surfacing as a 0-matmul pad NEFF. Only cat when a row
+        # actually needs adding.
+        if all(u.size(1) == seq_len_padded for u in x):
+            x = torch.cat([u for u in x], dim=0) if len(x) > 1 else x[0]
+        else:
+            x = torch.cat([
+                torch.cat([u, u.new_zeros(1, seq_len_padded - u.size(1), u.size(2))],
+                          dim=1) for u in x
+            ])
         L = seq_len_padded
         _padlog("sp_model:seq_pad(line52)", x)
 
