@@ -6,10 +6,29 @@ modulations are sharded to match. The head gathers back to full.
 """
 
 import math
+import os
 import torch
 import torch.distributed as dist
 from models.parallel_state import get_sp_rank, get_sp_degree, get_sp_group
 from models.tp_utils import get_tp_rank, get_tp_world_size
+
+# One-time dedup'd shape logger — pins which copy/pad NEFF a trace corresponds to.
+# Gated by PAD_DEBUG=1 so it's silent in normal runs. Logs each distinct (tag,shape)
+# once, with byte size, so we can match a trace's "moved=NNN MB" to a source line.
+_PAD_DBG_SEEN = set()
+def _padlog(tag, t):
+    if os.environ.get("PAD_DEBUG", "0") != "1":
+        return
+    try:
+        key = (tag, tuple(t.shape), str(t.dtype))
+        if key in _PAD_DBG_SEEN:
+            return
+        _PAD_DBG_SEEN.add(key)
+        nbytes = t.element_size() * t.nelement()
+        print(f"[PAD_DEBUG] {tag}: shape={tuple(t.shape)} dtype={t.dtype} "
+              f"bytes={nbytes/1e6:.1f}MB", flush=True)
+    except Exception as e:
+        print(f"[PAD_DEBUG] {tag}: <err {e}>", flush=True)
 
 
 def make_sp_forward(model):
@@ -54,6 +73,7 @@ def make_sp_forward(model):
                       dim=1) for u in x
         ])
         L = seq_len_padded
+        _padlog("sp_model:seq_pad(line52)", x)
 
         # Time embedding (compute full, then shard)
         if t.dim() == 1:
@@ -106,6 +126,7 @@ def make_sp_forward(model):
         gathered = torch.empty(sp_degree * B, L_local, model.dim, dtype=x.dtype, device=x.device)
         dist.all_gather_into_tensor(gathered, x.contiguous(), group=get_sp_group())
         x = gathered.reshape(sp_degree, B, L_local, model.dim).permute(1, 0, 2, 3).reshape(B, L, model.dim)
+        _padlog("sp_model:head_gather(line128)", x)
 
         # Head (on full sequence)
         x = model.head(x, e)

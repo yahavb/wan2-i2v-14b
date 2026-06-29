@@ -116,6 +116,8 @@ def make_sp_self_attn_forward(self_attn):
         # gathered = [sp0_b0, sp0_b1, sp1_b0, sp1_b1] -> [sp, b, L_local, dim]
         # -> [b, sp, L_local, dim] -> [b, L_full, dim] (each item's shards concatenated)
         x_full = gathered.reshape(sp_degree, b, L_local, dim).permute(1, 0, 2, 3).reshape(b, L_full, dim)
+        from models.sp_model import _padlog
+        _padlog("sp_attn:x_full_gather", x_full)
 
         # QKV (projections already TP-sharded over heads)
         q = self_attn.norm_q(self_attn.q(x_full)).view(b, L_full, n, d)
