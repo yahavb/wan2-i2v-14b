@@ -89,7 +89,7 @@ def _sp_nki_self_attention(q_local, k_full, v_full, dtype=torch.bfloat16):
 def make_sp_self_attn_forward(self_attn):
     """Create SP-aware self-attention forward."""
     from wan.modules.attention import _NKI_SELF_AVAILABLE, attention as flash_attention
-    from wan.modules.rope_neuron import rope_apply_neuron
+    from wan.modules.rope_neuron import rope_apply_neuron, rope_apply_neuron_offset
 
     sp_degree = get_sp_degree()
     tp_degree = get_tp_world_size()
@@ -97,6 +97,10 @@ def make_sp_self_attn_forward(self_attn):
     sp_rank = get_sp_rank()
     tp_rank = get_tp_rank()
     use_nki = _NKI_SELF_AVAILABLE and os.environ.get("USE_NKI_KERNELS", "1") == "1"
+    # LOCAL_Q=1: project Q only on this rank's L/sp slice (half the Q-proj matmul)
+    # instead of full Q then discard. K/V stay full. Offset RoPE keeps positions
+    # correct. Gated so it A/Bs cleanly and reverts instantly if video regresses.
+    local_q = os.environ.get("LOCAL_Q", "0") == "1"
 
     def forward(x, seq_lens, grid_sizes, freqs):
         b = x.shape[0]
@@ -119,18 +123,24 @@ def make_sp_self_attn_forward(self_attn):
         from models.sp_model import _padlog
         _padlog("sp_attn:x_full_gather", x_full)
 
-        # QKV (projections already TP-sharded over heads)
-        q = self_attn.norm_q(self_attn.q(x_full)).view(b, L_full, n, d)
+        # K, V always full (attention needs the full sequence).
         k = self_attn.norm_k(self_attn.k(x_full)).view(b, L_full, n, d)
         v = self_attn.v(x_full).view(b, L_full, n, d)
-
-        # RoPE on full sequence (position-indexed, head-broadcast)
-        q = rope_apply_neuron(q, grid_sizes, freqs)
         k = rope_apply_neuron(k, grid_sizes, freqs)
 
-        # SP: this rank computes attention for ITS L/sp query tokens vs full K/V.
         sp_start = sp_rank * L_local
-        q_local = q[:, sp_start:sp_start + L_local]
+        if local_q:
+            # Project Q ONLY on this rank's slice — half the Q-proj matmul. Apply
+            # RoPE at the matching position offset so rotations are identical to
+            # the full-Q path. x_full[:, sp_start:...] is this rank's tokens.
+            x_q = x_full[:, sp_start:sp_start + L_local]
+            q_local = self_attn.norm_q(self_attn.q(x_q)).view(b, L_local, n, d)
+            q_local = rope_apply_neuron_offset(q_local, grid_sizes, freqs, sp_start)
+        else:
+            # Full Q then slice (original path).
+            q = self_attn.norm_q(self_attn.q(x_full)).view(b, L_full, n, d)
+            q = rope_apply_neuron(q, grid_sizes, freqs)
+            q_local = q[:, sp_start:sp_start + L_local]
 
         # Attention: Q shard against full K, V
         if use_nki and q_local.device.type == "neuron":

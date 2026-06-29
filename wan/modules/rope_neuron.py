@@ -24,6 +24,71 @@ def rope_params_neuron(max_seq_len, dim, theta=10000):
     return angles
 
 
+def rope_apply_neuron_offset(x_local, grid_sizes, freqs, offset):
+    """Apply RoPE to a CONTIGUOUS SLICE of the sequence starting at `offset`.
+
+    Same math as rope_apply_neuron, but x_local holds only tokens
+    [offset : offset+L_local] of the full sequence. Because the angle grid is
+    built in the SAME f*h*w raster order as the tokens, slicing the precomputed
+    cos/sin grid at [offset : offset+L_local] aligns exactly with x_local. Tokens
+    at absolute position >= seq_len (padding) get no rotation, matching the
+    full-sequence function's `x[:, seq_len:]` passthrough.
+
+    Args:
+        x_local: [B, L_local, N, D] — this rank's SP slice of Q (on device)
+        grid_sizes: [B, 3] (f,h,w) per sample
+        freqs: [max_seq_len, D//2] angles
+        offset: int — absolute position of x_local[:, 0]
+    Returns: [B, L_local, N, D]
+    """
+    n, c = x_local.size(2), x_local.size(3) // 2
+    L_local = x_local.size(1)
+    s0 = c - 2 * (c // 3)
+    s1 = c // 3
+    freqs_cpu = freqs.cpu().float()
+    freqs_split = freqs_cpu.split([s0, s1, s1], dim=1)
+    device = x_local.device
+
+    output = []
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        seq_len = f * h * w
+        # Full angle grid in raster order: [seq_len, 1, c]
+        angles_grid = torch.cat([
+            freqs_split[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs_split[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs_split[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+        ], dim=-1).reshape(seq_len, 1, c)
+
+        # How many of this rank's local tokens fall within the real sequence.
+        # [offset : offset+L_local] intersected with [0 : seq_len].
+        rot_len = max(0, min(offset + L_local, seq_len) - offset)
+
+        x_li = x_local[i:i+1].to(torch.float32)              # [1, L_local, N, D]
+        if rot_len <= 0:
+            # entirely in the padding region — no rotation
+            output.append(x_li)
+            continue
+
+        cos_grid = torch.cos(angles_grid[offset:offset + rot_len]).to(device)
+        sin_grid = torch.sin(angles_grid[offset:offset + rot_len]).to(device)
+
+        x_rot = x_li[:, :rot_len]                            # tokens to rotate
+        x_pairs = x_rot.reshape(1, rot_len, n, c, 2)
+        x_re = x_pairs[:, :, :, :, 0:1].reshape(1, rot_len, n, c)
+        x_im = x_pairs[:, :, :, :, 1:2].reshape(1, rot_len, n, c)
+        out_re = x_re * cos_grid - x_im * sin_grid
+        out_im = x_re * sin_grid + x_im * cos_grid
+        x_out = torch.cat([out_re.unsqueeze(-1), out_im.unsqueeze(-1)], dim=-1)
+        x_out = x_out.reshape(1, rot_len, n, c * 2)
+
+        x_rest = x_li[:, rot_len:]                           # padding tail, unchanged
+        x_i = torch.cat([x_out, x_rest], dim=1)
+        output.append(x_i)
+
+    result = torch.cat(output, dim=0)
+    return result.to(x_local.dtype)
+
+
 def rope_apply_neuron(x, grid_sizes, freqs):
     """Apply rotary position embeddings using real-valued math.
     
