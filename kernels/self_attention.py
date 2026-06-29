@@ -49,7 +49,7 @@ def wan_flash_self_attn(q, k, v, identity, mask, softmax_scale=None,
     # All inner-loop tile counts derive from it; the online softmax is section-size
     # invariant and the mask handles the tail, so correctness is independent of it.
     # Must be a multiple of 2048 (phase-2 exp chunk) and 512 (qk/mask tiling).
-    SECTION = 2048
+    SECTION = 4096
     tiles_512 = SECTION // 512
     tiles_128 = SECTION // P
     tiles_2048 = SECTION // 2048

@@ -25,7 +25,7 @@ from models.tp_utils import get_tp_rank, get_tp_world_size
 
 # MUST equal SECTION in kernels/self_attention.py and SELF_ATTN_SEQLEN_MULTIPLE
 # in wan/modules/attention.py. 2048 cuts the SP K-pad waste (45%->12%).
-SELF_ATTN_SEQLEN_MULTIPLE = 2048
+SELF_ATTN_SEQLEN_MULTIPLE = 4096
 
 # Cached attention mask. Shape/contents are identical across every self-attn
 # call (l_q, l_k constant), so build once instead of ~800x per generation.
