@@ -53,9 +53,13 @@ spec:
 
               # torch.compile(backend='neuron') writes NEFFs to this cache. Pin it
               # so the per-NEFF capture loop knows exactly where to look.
-              # One cache PER ATTN_IMPL (set in the stage loop) so each stage's DiT
-              # profile only ever sees that stage's NEFFs.
+              # Eager torch-neuronx writes NEFFs to its DEFAULT cache and ignores
+              # NEURON_COMPILE_CACHE_URL (a per-stage URL left 0 NEFFs to profile), so
+              # each stage EMPTIES these dirs before its warmup instead: a stage's DiT
+              # profile then only ever sees that stage's NEFFs.
+              NEFF_DIRS="/var/tmp/neuron-compile-cache /tmp/neff_cache"
               NEFF_CACHE=/var/tmp/neuron-compile-cache
+              export NEURON_COMPILE_CACHE_URL=$NEFF_CACHE
 
               REFERENCE_LINE="(none — clean median is the baseline)"
 
@@ -121,7 +125,7 @@ spec:
               run_explorer() {
                 local POUT=/tmp/perneff_prof; rm -rf "$POUT"; mkdir -p "$POUT"
                 # auto-detect NEFFs from torch.compile cache AND /tmp/neff_cache
-                mapfile -t NEFFS < <(find "$NEFF_CACHE" -name "*.neff" 2>/dev/null | sort -u)
+                mapfile -t NEFFS < <(find $NEFF_DIRS -name "*.neff" 2>/dev/null | sort -u)
                 local TOTAL=${#NEFFS[@]}
                 echo "NEFFs found: $TOTAL"
                 echo "(step [4] captures+views each NEFF — this is the SLOW part, ~minutes; progress every 25)"
@@ -141,7 +145,7 @@ spec:
                 python3 scripts/neuron/profile_all_neffs.py "$POUT" 2>&1 | tee "$LOCAL_RESULTS/perneff_breakdown.txt" || echo "aggregation failed"
                 local BIGHASH BIGNEFF
                 BIGHASH=$(python3 scripts/neuron/pick_neffs.py "$POUT" "$NEFF_CACHE" | head -1)
-                BIGNEFF=$(find "$NEFF_CACHE" -name "${BIGHASH}.neff" 2>/dev/null | head -1)
+                BIGNEFF=$(find $NEFF_DIRS -name "${BIGHASH}.neff" 2>/dev/null | head -1)
                 neff_hotspots "$BIGNEFF" "$POUT/${BIGHASH}.ntff" "$LOCAL_RESULTS/hotspots_${BIGHASH}.txt"
 
                 # ─── PRESERVE heavy NEFF+NTFF pairs for instruction-level (SQL) query ───
@@ -151,7 +155,7 @@ spec:
                 local kept=0
                 while read -r h; do
                   [ -n "$h" ] || continue
-                  local nf; nf=$(find "$NEFF_CACHE" -name "${h}.neff" 2>/dev/null | head -1)
+                  local nf; nf=$(find $NEFF_DIRS -name "${h}.neff" 2>/dev/null | head -1)
                   if [ -n "$nf" ] && [ -f "$POUT/${h}.ntff" ]; then
                     cp "$nf" "$PAIRS/${h}.neff" && cp "$POUT/${h}.ntff" "$PAIRS/${h}.ntff" && kept=$((kept+1))
                   fi
@@ -172,7 +176,7 @@ spec:
                 local TAG="$1" OUT="$LOCAL_RESULTS/dit_pairs_$1"; rm -rf "$OUT"; mkdir -p "$OUT"
                 # DiT token count before padding: T_lat * (H/8/2) * (W/8/2)
                 local SEQ=$(( ((FRAME_NUM - 1) / 4 + 1) * (OUT_H / 16) * (OUT_W / 16) ))
-                local PICK=(scripts/neuron/pick_dit_neffs.py "$NEFF_CACHE" --seq "$SEQ")
+                local PICK=(scripts/neuron/pick_dit_neffs.py $NEFF_DIRS --seq "$SEQ")
                 python3 "${PICK[@]}" 2>&1 | tee "$OUT/dit_neff_identify.txt" || true
                 local n=0 other=0 role ws neff
                 while IFS=$'\t' read -r role ws neff; do
@@ -237,13 +241,12 @@ spec:
               LAST_IMPL=""
               for IMPL in $ATTN_IMPLS; do
                 export ATTN_IMPL="$IMPL"
-                NEFF_CACHE=/var/tmp/neuron-compile-cache-$IMPL; mkdir -p "$NEFF_CACHE"
-                export NEURON_COMPILE_CACHE_URL="$NEFF_CACHE"
-                echo "████ STAGE ATTN_IMPL=$IMPL (cache $NEFF_CACHE) ████"
+                rm -rf $NEFF_DIRS; mkdir -p $NEFF_DIRS   # this stage compiles from scratch
+                echo "████ STAGE ATTN_IMPL=$IMPL (cache emptied: $NEFF_DIRS) ████"
 
                 echo "=== [1/3 $IMPL] WARMUP (compile into this stage's cache; NOT timed) ==="
                 PAD_DEBUG=1 run_wan "$LOCAL_RESULTS/warmup_$IMPL.txt" 1 | grep -iE "ATTN_IMPL|kernel: |Compiling|total=|FAILED|Error|Traceback|\[SP\]|SP degree|TP degree|World size" || echo "(warmup output captured)"
-                echo "NEFFs in cache after warmup: $(find "$NEFF_CACHE" -name '*.neff' 2>/dev/null | wc -l)"
+                echo "NEFFs in cache after warmup: $(find $NEFF_DIRS -name '*.neff' 2>/dev/null | wc -l)"
 
                 echo "=== [1b $IMPL] DiT NEFF+NTFF PAIRS ==="
                 capture_dit_pairs "$IMPL"
