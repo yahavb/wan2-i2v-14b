@@ -33,13 +33,13 @@ spec:
 
               LOCAL_RESULTS=/tmp/results; mkdir -p "$LOCAL_RESULTS"
 
-              # ─── PERSISTENT RUN DIR (the uploadable layout the user expects) ───
-              # /var/mdl/wan2_2_i2v/runs/<TS>/ will hold, for THIS execution:
-              #   trace_info.pb (required) + *.pb + .ntff + .neff  (Neuron Profiler 2.0 upload)
-              #   + explorer/breakdown txts + the output .mp4 for validation.
+              # ─── RUN DIR: LOCAL disk only. /var/mdl (S3 PVC) gets tar.gz copies, nothing else ───
+              # /tmp/results holds, for THIS execution:
+              #   systrace/ trace_info.pb + *.pb + .ntff + .neff  (Neuron Profiler 2.0 upload)
+              #   dit_pairs/ DiT NEFF+NTFF pairs, breakdown txts, the output .mp4s.
               RUN_TS=$(date +%Y%m%d_%H%M%S)
-              RUN_DIR=/var/mdl/wan2_2_i2v/runs/$RUN_TS
-              mkdir -p "$RUN_DIR" && echo "RUN_DIR=$RUN_DIR" || echo "WARN: cannot create $RUN_DIR (PVC?)"
+              RUN_DIR=$LOCAL_RESULTS/systrace; mkdir -p "$RUN_DIR"
+              ARCHIVE_DIR=/var/mdl/wan2_2_i2v; mkdir -p "$ARCHIVE_DIR" || echo "WARN: no $ARCHIVE_DIR (PVC?)"
 
               # ─── PROVENANCE part 1: which code (no deps needed) ───
               GIT_SHA=$(git rev-parse HEAD)
@@ -57,6 +57,17 @@ spec:
               mkdir -p /var/tmp/neuron-compile-cache /tmp/neff_cache
 
               REFERENCE_LINE="(none — clean median is the baseline)"
+
+              # ─── profiler CLI, resolved at runtime ───
+              # From cc 2.27 neuron-profile is deprecated (every capture fails with a
+              # banner pointing at neuron-explorer). Prefer neuron-profile only while
+              # it still works on this image; never start the explorer view SERVER.
+              PROF_CLI=neuron-profile
+              if ! command -v neuron-profile >/dev/null 2>&1 || \
+                 neuron-profile capture --help 2>&1 | grep -qi deprecat; then
+                PROF_CLI=$(command -v neuron-explorer || echo /opt/aws/neuron/bin/neuron-explorer)
+              fi
+              echo "PROFILER CLI: $PROF_CLI"
 
               # ─── deps + model download (no run) ───
               bash scripts/prepare.sh 2>&1 | tee "$LOCAL_RESULTS/prepare.txt" | tail -5 || { echo "PREPARE FAILED"; exit 1; }
@@ -83,21 +94,21 @@ spec:
                   awk '{a[NR]=$1} END{ if(NR==0){print "N/A"} else if(NR%2){print a[(NR+1)/2]} else {printf "%.1f", (a[NR/2]+a[NR/2+1])/2} }'
               }
 
-              # ─── dominant-NEFF detail via neuron-profile view summary-text ───
-              # neuron-profile CLI ONLY. NO neuron-explorer/server/SQL/parquet/curl,
+              # ─── dominant-NEFF detail via $PROF_CLI view summary-text ───
+              # $PROF_CLI only. NO explorer view server/SQL/parquet/curl,
               # NO --output-format json (returns EMPTY on this image).
               neff_hotspots() {
                 local NEFF="$1" NTFF="$2" HOTS="$3"
                 [ -n "$NEFF" ] && [ -f "$NTFF" ] || { echo "no NEFF/NTFF — skip detail"; return; }
                 echo "═══ dominant NEFF detail (summary-text) ═══" | tee "$HOTS"
-                timeout 180 neuron-profile view -n "$NEFF" -s "$NTFF" \
+                timeout 180 "$PROF_CLI" view -n "$NEFF" -s "$NTFF" \
                   --output-format summary-text 2>/dev/null | tee -a "$HOTS" || echo "  view failed"
                 echo "  (name the hot op from: gpsimd_engine_active_time_percent,"
                 echo "   software_dynamic_dma_packet_percent + _count, hardware_dynamic_dma_packet_percent,"
                 echo "   dma_transfer_average_bytes, matmul_instruction_count, transpose_flops)"
               }
 
-              # ─── run_explorer: PROVEN method, neuron-profile CLI ONLY ───
+              # ─── run_explorer: PROVEN method, $PROF_CLI CLI ───
               # For EACH cached NEFF: capture --single-io -> view summary-json -> aggregate.
               # Then summary-text on the dominant NEFF.
               run_explorer() {
@@ -113,9 +124,9 @@ spec:
                   local hash; hash=$(basename "$neff" .neff)
                   local ntff="$POUT/${hash}.ntff" json="$POUT/${hash}.json"
                   NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 180 \
-                    neuron-profile capture --single-io -n "$neff" -s "$ntff" >/dev/null 2>&1 || continue
+                    "$PROF_CLI" capture --single-io -n "$neff" -s "$ntff" >/dev/null 2>&1 || continue
                   [ -f "$ntff" ] || continue
-                  timeout 120 neuron-profile view -n "$neff" -s "$ntff" --output-format summary-json > "$json" 2>/dev/null || true
+                  timeout 120 "$PROF_CLI" view -n "$neff" -s "$ntff" --output-format summary-json > "$json" 2>/dev/null || true
                   [ -s "$json" ] && OK=$((OK+1))
                   if [ $((i % 25)) -eq 0 ]; then echo "  [4] progress: $i/$TOTAL NEFFs (OK=$OK)"; fi
                 done
@@ -141,6 +152,57 @@ spec:
                 echo "preserved $kept heavy NEFF+NTFF pairs in $PAIRS (for SQL/parquet query)"
               }
 
+              # ─── capture_dit_pairs: the DiT NEFF+NTFF pairs (THE deliverable) ───
+              # Same method as odyssey-trainium capture_dit_pair, adapted: the Wan2.2
+              # DiT is several NEFFs (compiled ffn + eager NKI attention + proj/embed),
+              # so pick_dit_neffs.py identifies each by its IO shapes, not file size.
+              # Collective NEFFs replay with -r <world_size> -i 0 (a 1-process replay
+              # hangs in the bootstrap); NEVER --single-io / --profile-nth-exec here.
+              # Every command is guarded: set -e must not throw away a captured pair.
+              capture_dit_pairs() {
+                local OUT="$LOCAL_RESULTS/dit_pairs"; rm -rf "$OUT"; mkdir -p "$OUT"
+                python3 scripts/neuron/pick_dit_neffs.py /var/tmp/neuron-compile-cache /tmp/neff_cache \
+                  2>&1 | tee "$OUT/dit_neff_identify.txt" || true
+                local n=0 role ws neff
+                while IFS=$'\t' read -r role ws neff; do
+                  [ -s "$neff" ] || continue
+                  n=$((n+1)); [ "$n" -le "${DIT_MAX_PAIRS:-12}" ] || break
+                  local h d; h=$(basename "$neff" .neff)
+                  d="$OUT/$(printf '%02d' "$n")_${role}_${h}"; mkdir -p "$d"
+                  cp "$neff" "$d/$h.neff" || continue
+                  [ "$ws" = "0" ] && ws=$WORLD_SIZE
+                  local extra=(); [ "$ws" -gt 1 ] && extra=(-r "$ws" -i 0)
+                  echo "  [$n] $role ws=$ws $h — capturing"
+                  ( cd "$d" && timeout "${DIT_CAP_TIMEOUT:-1800}" "$PROF_CLI" capture \
+                      -n "$h.neff" -s "$h.ntff" ${extra[@]+"${extra[@]}"} --num-exec=1 --enable-dge-notifs \
+                  ) > "$d/capture.log" 2>&1 || echo "      capture rc=$?"
+                  # -r N writes <stem>_rank_K.ntff; explorer appends _exec_N. Promote rank 0.
+                  if [ ! -s "$d/$h.ntff" ]; then
+                    local f; f=$(ls -S "$d/$h"*rank_0*.ntff "$d/$h"*.ntff 2>/dev/null | head -1) || true
+                    [ -n "$f" ] && [ -s "$f" ] && mv "$f" "$d/$h.ntff" || true
+                  fi
+                  rm -f "$d/$h"*rank_*.ntff 2>/dev/null || true
+                  if [ -s "$d/$h.ntff" ]; then
+                    timeout 900 "$PROF_CLI" view -n "$d/$h.neff" -s "$d/$h.ntff" \
+                      --output-format summary-json > "$d/summary.json" 2>/dev/null || true
+                    # A structurally valid ntff can hold nothing at all. Assert counters.
+                    { [ -s "$d/summary.json" ] && python3 scripts/neuron/check_trace_nonempty.py \
+                        "$d/summary.json" "$h"; } || echo "      (no summary json)"
+                    timeout 900 "$PROF_CLI" view -n "$d/$h.neff" -s "$d/$h.ntff" \
+                      --output-format summary-text > "$d/summary.txt" 2>/dev/null || true
+                    echo "      ntff $(du -h "$d/$h.ntff" | cut -f1)  -> $d"
+                  else
+                    echo "      !! no ntff produced. capture.log tail:"; tail -8 "$d/capture.log" || true
+                  fi
+                done < <(python3 scripts/neuron/pick_dit_neffs.py /var/tmp/neuron-compile-cache /tmp/neff_cache \
+                           --print-paths 2>/dev/null || true)
+                echo "  DiT pairs with ntff: $(find "$OUT" -name '*.ntff' | wc -l) / $n"
+                tar -czf "$LOCAL_RESULTS/dit_pairs.tar.gz" -C "$LOCAL_RESULTS" dit_pairs 2>/dev/null \
+                  && echo "  dit_pairs.tar.gz: $(du -h "$LOCAL_RESULTS/dit_pairs.tar.gz" | cut -f1)" || echo "  dit_pairs tar failed"
+                cp "$LOCAL_RESULTS/dit_pairs.tar.gz" "$ARCHIVE_DIR/dit_pairs_$RUN_TS.tar.gz" 2>/dev/null \
+                  && echo "  archived -> $ARCHIVE_DIR/dit_pairs_$RUN_TS.tar.gz" || echo "  PVC copy skipped"
+              }
+
               echo "════════════ NEURON 3-RUN BENCHMARK (Wan2.2-I2V-A14B) ════════════"
               echo "  reference: $REFERENCE_LINE"
               echo "  TP=${TP_DEGREE} SP=${SP_DEGREE} world=${WORLD_SIZE} frames=${FRAME_NUM} steps=${NUM_STEPS}"
@@ -155,9 +217,15 @@ spec:
               grep -iE "\[SP\]|\[PAD_DEBUG\]|SP degree|TP degree|World size|Patched .* blocks" "$LOCAL_RESULTS/warmup.txt" | sort -u | head -20
               echo "NEFFs in cache after warmup: $(find /var/tmp/neuron-compile-cache /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)"
 
+              echo "=== [1b] DiT NEFF+NTFF PAIRS (profiler capture; captured first so it survives later failures) ==="
+              capture_dit_pairs
+
               echo "=== [2/3] CLEAN RUN (NO profiler) — median total = REAL LATENCY ==="
               run_wan "$LOCAL_RESULTS/clean.txt" 3 | grep -iE "denoise=|vae=|total=|FAILED" || echo "CLEAN RUN FAILED"
               T_CLEAN=$(median_total_s "$LOCAL_RESULTS/clean.txt")
+              # The accuracy-gate video: from the CLEAN run (no profiler).
+              cp /tmp/wan2_i2v_output.mp4 "$LOCAL_RESULTS/wan2_i2v_output_clean.mp4" 2>/dev/null \
+                && echo "clean video saved" || echo "NO VIDEO FROM CLEAN RUN"
 
               echo "=== [3/3] PROFILED RUN (NEURON_RT_INSPECT_ENABLE=1 — overhead delta) ==="
               NEURON_RT_INSPECT_ENABLE=1 run_wan "$LOCAL_RESULTS/profiled.txt" 3 | grep -iE "denoise=|vae=|total=|FAILED" || echo "PROFILED RUN FAILED"
@@ -166,7 +234,7 @@ spec:
               echo "=== [3b] SYSTEM-TRACE BUNDLE (Neuron Profiler 2.0 -> trace_info.pb, uploadable) ==="
               # The profiled run above set INSPECT_ENABLE but NOT OUTPUT_DIR, so its
               # trace_info.pb went to ./output and was lost. Here we point OUTPUT_DIR
-              # straight at the persistent RUN_DIR and turn on DEVICE_PROFILE so the
+              # straight at the local RUN_DIR and turn on DEVICE_PROFILE so the
               # runtime writes trace_info.pb + per-rank .ntff/.neff into the upload dir.
               NEURON_RT_INSPECT_ENABLE=1 NEURON_RT_INSPECT_SYSTEM_PROFILE=1 \
               NEURON_RT_INSPECT_DEVICE_PROFILE=1 NEURON_RT_INSPECT_OUTPUT_DIR="$RUN_DIR" \
@@ -175,7 +243,7 @@ spec:
               echo "  rank subdirs       : $(find "$RUN_DIR" -maxdepth 1 -type d -name 'i-*' 2>/dev/null | wc -l)"
               echo "  .ntff / .neff      : $(find "$RUN_DIR" -name '*.ntff' 2>/dev/null | wc -l) / $(find "$RUN_DIR" -name '*.neff' 2>/dev/null | wc -l)"
 
-              echo "=== [4] per-NEFF engine breakdown + dominant-NEFF metrics (neuron-profile CLI) ==="
+              echo "=== [4] per-NEFF engine breakdown + dominant-NEFF metrics ($PROF_CLI) ==="
               run_explorer
 
               echo "=== PROFILER-OVERHEAD COMPARISON ==="
@@ -193,16 +261,16 @@ spec:
 
               # ─── persist results + VIDEO into the SAME run dir as trace_info.pb ───
               cp /tmp/wan2_i2v_output.mp4 "$LOCAL_RESULTS/" 2>/dev/null && echo "video archived" || echo "NO VIDEO PRODUCED"
-              # Explorer/breakdown txts, heavy NEFF+NTFF pairs, video, provenance.
-              cp -r "$LOCAL_RESULTS"/. "$RUN_DIR"/ 2>/dev/null || echo "WARN: results copy to RUN_DIR failed"
-              # Keep the flat tarball too (back-compat with prior runs).
-              ARCHIVE=/tmp/wan2-i2v-14b_results.tar.gz
+              # Everything (systrace, DiT pairs, breakdowns, videos) as ONE tar.gz on the PVC.
+              ARCHIVE=/tmp/wan2-i2v-14b_results_$RUN_TS.tar.gz
               tar -czf "$ARCHIVE" -C /tmp results 2>/dev/null || true
-              cp "$ARCHIVE" /var/mdl/ 2>/dev/null && echo "Saved: /var/mdl/$(basename "$ARCHIVE")" || echo "persist skipped"
-              echo "╔══════════════════ RUN DIR (upload this) ══════════════════╗"
-              echo "  $RUN_DIR"
-              find "$RUN_DIR" -maxdepth 2 -type f 2>/dev/null | sed 's/^/    /' | head -40
-              echo "╚════════════════════════════════════════════════════════════╝"
+              cp "$ARCHIVE" "$ARCHIVE_DIR/" 2>/dev/null && echo "Saved: $ARCHIVE_DIR/$(basename "$ARCHIVE")" || echo "persist skipped"
+              echo "╔══════════════════ kubectl cp (from your laptop) ══════════════════╗"
+              echo "  kubectl cp default/$HOSTNAME:/tmp/results/dit_pairs.tar.gz ./dit_pairs.tar.gz"
+              echo "  kubectl cp default/$HOSTNAME:/tmp/results/wan2_i2v_output_clean.mp4 ./wan2_i2v_output_clean.mp4"
+              echo "  kubectl cp default/$HOSTNAME:$ARCHIVE ./$(basename "$ARCHIVE")   # everything"
+              find "$LOCAL_RESULTS" -maxdepth 2 -type f 2>/dev/null | sed 's/^/    /' | head -40
+              echo "╚════════════════════════════════════════════════════════════════════╝"
               echo "╔══ VALIDATE video. $GIT_BRANCH @ ${GIT_SHA:0:12} SP=${SP_DEGREE} steps=${NUM_STEPS} ══╗"
 
               # ─── EXPLICIT COMPLETION MARKER — grep for this to know the run is DONE ───
@@ -211,14 +279,14 @@ spec:
               echo ""
               echo "████████████████████████████████████████████████████████████████"
               echo "███ BENCHMARK COMPLETE — clean=${T_CLEAN:-N/A}s profiled=${T_PROF:-N/A}s ($GIT_BRANCH @ ${GIT_SHA:0:12})"
-              echo "███ run dir: $RUN_DIR"
+              echo "███ results: $LOCAL_RESULTS  (archive: $ARCHIVE_DIR/$(basename "$ARCHIVE"))"
               echo "███ grep 'BENCHMARK COMPLETE' to confirm; pod now idles for kubectl cp"
               echo "████████████████████████████████████████████████████████████████"
 
               # ─── keep-alive: hold the pod open so results can be kubectl cp'd ───
-              # (Data already persisted to $RUN_DIR on the PVC; this is for convenience.)
-              echo "Pod stays alive 2h for kubectl cp. RUN_DIR=$RUN_DIR"
-              sleep 7200
+              # 10 days. Data is also on the PVC as tar.gz; this is for kubectl cp.
+              echo "Pod stays alive 10 days for kubectl cp. Results: $LOCAL_RESULTS"
+              sleep 864000
           resources:
             claims:
               - name: m-trn2
