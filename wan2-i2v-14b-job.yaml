@@ -156,19 +156,27 @@ spec:
 
               # ─── capture_dit_pairs: the DiT NEFF+NTFF pairs (THE deliverable) ───
               # Same method as odyssey-trainium capture_dit_pair, adapted: the Wan2.2
-              # DiT is several NEFFs (compiled ffn + eager NKI attention + proj/embed),
+              # DiT is ~570 small NEFFs (compiled ffn + eager attention + proj/embed),
               # so pick_dit_neffs.py identifies each by its IO shapes, not file size.
+              # The WHOLE attention chain (kernel + proj/norm/rope/permute/pad +
+              # collectives) is captured uncapped; other DiT NEFFs up to DIT_MAX_PAIRS.
               # Collective NEFFs replay with -r <world_size> -i 0 (a 1-process replay
               # hangs in the bootstrap); NEVER --single-io / --profile-nth-exec here.
               # Every command is guarded: set -e must not throw away a captured pair.
               capture_dit_pairs() {
                 local OUT="$LOCAL_RESULTS/dit_pairs"; rm -rf "$OUT"; mkdir -p "$OUT"
-                python3 scripts/neuron/pick_dit_neffs.py /var/tmp/neuron-compile-cache /tmp/neff_cache \
-                  2>&1 | tee "$OUT/dit_neff_identify.txt" || true
-                local n=0 role ws neff
+                # DiT token count before padding: T_lat * (H/8/2) * (W/8/2)
+                local SEQ=$(( ((FRAME_NUM - 1) / 4 + 1) * (OUT_H / 16) * (OUT_W / 16) ))
+                local PICK=(scripts/neuron/pick_dit_neffs.py /var/tmp/neuron-compile-cache /tmp/neff_cache --seq "$SEQ")
+                python3 "${PICK[@]}" 2>&1 | tee "$OUT/dit_neff_identify.txt" || true
+                local n=0 other=0 role ws neff
                 while IFS=$'\t' read -r role ws neff; do
                   [ -s "$neff" ] || continue
-                  n=$((n+1)); [ "$n" -le "${DIT_MAX_PAIRS:-12}" ] || break
+                  case "$role" in
+                    attn_kernel|attn_path|collective) ;;
+                    *) other=$((other+1)); [ "$other" -le "${DIT_MAX_PAIRS:-6}" ] || continue ;;
+                  esac
+                  n=$((n+1))
                   local h d; h=$(basename "$neff" .neff)
                   d="$OUT/$(printf '%02d' "$n")_${role}_${h}"; mkdir -p "$d"
                   cp "$neff" "$d/$h.neff" || continue
@@ -196,8 +204,7 @@ spec:
                   else
                     echo "      !! no ntff produced. capture.log tail:"; tail -8 "$d/capture.log" || true
                   fi
-                done < <(python3 scripts/neuron/pick_dit_neffs.py /var/tmp/neuron-compile-cache /tmp/neff_cache \
-                           --print-paths 2>/dev/null || true)
+                done < <(python3 "${PICK[@]}" --print-paths 2>/dev/null || true)
                 echo "  DiT pairs with ntff: $(find "$OUT" -name '*.ntff' | wc -l) / $n"
                 tar -czf "$LOCAL_RESULTS/dit_pairs.tar.gz" -C "$LOCAL_RESULTS" dit_pairs 2>/dev/null \
                   && echo "  dit_pairs.tar.gz: $(du -h "$LOCAL_RESULTS/dit_pairs.tar.gz" | cut -f1)" || echo "  dit_pairs tar failed"
