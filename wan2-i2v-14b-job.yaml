@@ -220,6 +220,13 @@ spec:
                   fi
                 done < <(python3 "${PICK[@]}" --print-paths 2>/dev/null || true)
                 echo "  DiT pairs with ntff: $(find "$OUT" -name '*.ntff' | wc -l) / $n"
+                # The code behind this stage's attention kernel, next to its NEFF+NTFF.
+                mkdir -p "$OUT/code"; cp wan/modules/attention.py models/sp_attention.py "$OUT/code/" || true
+                case "$TAG" in
+                  legacy)   cp kernels/self_attention.py kernels/cross_attention.py "$OUT/code/" || true ;;
+                  cte)      cp "$(python3 -c 'import nkilib.core.attention.attention_cte as m; print(m.__file__)')" "$OUT/code/" || true ;;
+                  constmax) cp kernels/nkilib/experimental/attention/{attention_const_max,ring_attention_const_max_fwd}.py "$OUT/code/" || true ;;
+                esac
                 tar -czf "$LOCAL_RESULTS/dit_pairs_$TAG.tar.gz" -C "$LOCAL_RESULTS" "dit_pairs_$TAG" 2>/dev/null \
                   && echo "  dit_pairs_$TAG.tar.gz: $(du -h "$LOCAL_RESULTS/dit_pairs_$TAG.tar.gz" | cut -f1)" || echo "  dit_pairs tar failed"
                 cp "$LOCAL_RESULTS/dit_pairs_$TAG.tar.gz" "$ARCHIVE_DIR/dit_pairs_${TAG}_$RUN_TS.tar.gz" 2>/dev/null \
@@ -270,6 +277,8 @@ spec:
               T_CLEAN=$(median_total_s "$LOCAL_RESULTS/clean_$LAST_IMPL.txt")
 
               # The deep-profile steps below run once, on the LAST stage (its cache).
+              T_PROF=N/A
+              if [ "${DEEP_PROFILE:-1}" = "1" ]; then
               echo "████ DEEP PROFILE on ATTN_IMPL=$LAST_IMPL ████"
               echo "=== [3/3] PROFILED RUN (NEURON_RT_INSPECT_ENABLE=1 — overhead delta) ==="
               NEURON_RT_INSPECT_ENABLE=1 run_wan "$LOCAL_RESULTS/profiled.txt" 3 | grep -iE "denoise=|vae=|total=|FAILED" || echo "PROFILED RUN FAILED"
@@ -302,6 +311,9 @@ spec:
               # + source line driving the DMA. Tees into results so it's archived too.
               bash scripts/neuron/run_dma_analysis.sh "$LOCAL_RESULTS/ntff_pairs" \
                 2>&1 | tee "$LOCAL_RESULTS/dma_analysis.txt" || echo "DMA analysis skipped"
+              else
+                echo "DEEP_PROFILE=0: skipped profiled run, system trace, per-NEFF sweep, DMA analysis"
+              fi
 
               # ─── persist results + VIDEO into the SAME run dir as trace_info.pb ───
               cp /tmp/wan2_i2v_output.mp4 "$LOCAL_RESULTS/" 2>/dev/null && echo "video archived" || echo "NO VIDEO PRODUCED"
@@ -375,7 +387,9 @@ spec:
             - name: USE_NKI_KERNELS
               value: "1"
             - name: ATTN_IMPLS
-              value: "legacy cte constmax"
+              value: "cte"
+            - name: DEEP_PROFILE
+              value: "0"
             - name: OUT_H
               value: "368"
             - name: OUT_W

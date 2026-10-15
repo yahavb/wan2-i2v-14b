@@ -115,8 +115,10 @@ def probe(path, tp, tokens):
     n_local = NUM_HEADS // tp
     h_local = n_local * HEAD_DIM
     numels = {s[-1] for s in shapes if s}              # flattened row sizes
-    head_layout = any(len(s) == 2 and s[0] == n_local and s[1] in {HEAD_DIM * t for t in tokens}
-                      for s in shapes)
+    head_layout = any(
+        (len(s) == 2 and s[0] == n_local and s[1] in {HEAD_DIM * t for t in tokens})
+        or (len(s) == 3 and s[0] % n_local == 0 and HEAD_DIM in s[1:] and set(s[1:]) & tokens)
+        for s in shapes)
     attn_rows = bool(numels & {t * h_local for t in tokens})
     attn_weight = any(s in ((h_local, DIM), (DIM, h_local)) for s in shapes)
     dit_rows = bool(numels & ({t * DIM for t in tokens} | {t * h_local for t in tokens}))
