@@ -18,6 +18,10 @@ FAST_ATTN_IMPL: cte (default, nkilib attention_cte) | sdpa (F.scaled_dot_product
                   attention/ring_attention_const_max_fwd.py, num_workers=1; cross-attn: cte,
                   as staging does).
 FAST_KERNEL_WRAP: hop (default, torch_neuronx.nki_hop.wrap_nki) | op (torch_neuronx.nki_op).
+FAST_MLP=1   : FFN via nkilib mlp (staging feed_forward._wan_mlp_kernel: skip_gate_proj,
+               GELU_Tanh_Approx), down bias pre-divided by TP, then the in-graph all-reduce.
+FAST_OPROJ=1 : self/cross O-proj via nkilib output_projection_cte (staging cp_attention
+               _wan_o_proj_kernel) on d-major attention output (attention_cte tp_out=True).
 """
 
 import logging
@@ -36,46 +40,107 @@ logger = logging.getLogger(__name__)
 FAST_ATTN_IMPL = os.environ.get("FAST_ATTN_IMPL", "cte")
 FAST_KERNEL_WRAP = os.environ.get("FAST_KERNEL_WRAP", "hop")
 LNC = int(os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2"))
+FAST_MLP = os.environ.get("FAST_MLP", "0") == "1"
+FAST_OPROJ = os.environ.get("FAST_OPROJ", "0") == "1"
 COMPILE_KW = dict(backend="neuron", dynamic=False, fullgraph=True)
 
 
 # ─── attention_cte kernel (staging cp_attention._wan_attention_kernel, tp_out=False) ───
 
-_cte_call = None
+def _wrap(kernel, op_name):
+    """Launch an @nki.jit kernel from inside a fullgraph graph, on all LNC cores."""
+    if FAST_KERNEL_WRAP == "op":
+        from torch_neuronx import nki_op
+
+        @nki_op(op_name)
+        def _op(*args: torch.Tensor) -> torch.Tensor:
+            return kernel[LNC](*args)
+
+        return _op
+    from torch_neuronx.nki_hop import wrap_nki
+    w = wrap_nki(kernel)
+    try:
+        return w[LNC]
+    except Exception:  # noqa: BLE001 -- no grid launch on this wrap_nki
+        return w
 
 
-def _get_cte():
-    global _cte_call
-    if _cte_call is None:
+_cte_calls = {}
+
+
+def _get_cte(tp_out=False):
+    """attention_cte: [BN, Sq, D] x [BN, Sk, D] -> [BN, Sq, D] (tp_out=False) or
+    [BN, D, Sq] (tp_out=True, the d-major layout output_projection_cte consumes)."""
+    if tp_out not in _cte_calls:
         import nki
         import nki.language as nl
         from nkilib.core.attention.attention_cte import attention_cte
 
         @nki.jit
         def _cte_kernel(q, k, v):
-            """[BN, Sq, D] x [BN, Sk, D] -> [BN, Sq, D]; q pre-scaled by the caller."""
             return attention_cte(
                 q=q, k=k, v=v, scale=1.0, causal_mask=False,
-                tp_q=True, tp_k=True, tp_out=False, cache_softmax=False,
+                tp_q=True, tp_k=True, tp_out=tp_out, cache_softmax=False,
                 softmax_dtype=nl.float32, mm_out_dtype=nl.float32)
 
-        if FAST_KERNEL_WRAP == "op":
-            from torch_neuronx import nki_op
+        _cte_calls[tp_out] = _wrap(_cte_kernel, f"wan14b::attention_cte_tp{int(tp_out)}")
+        logger.info(f"[fast_dit] attention_cte tp_out={tp_out} via {FAST_KERNEL_WRAP} lnc={LNC}")
+    return _cte_calls[tp_out]
 
-            @nki_op("wan14b::attention_cte")
-            def _op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-                return _cte_kernel[LNC](q, k, v)
 
-            _cte_call = _op
-        else:
-            from torch_neuronx.nki_hop import wrap_nki
-            w = wrap_nki(_cte_kernel)
-            try:
-                _cte_call = w[LNC]
-            except Exception:  # noqa: BLE001 -- no grid launch on this wrap_nki
-                _cte_call = w
-        logger.info(f"[fast_dit] attention_cte via {FAST_KERNEL_WRAP} lnc={LNC}")
-    return _cte_call
+_mlp_call = None
+
+
+def _get_mlp():
+    global _mlp_call
+    if _mlp_call is None:
+        import nki
+        from nkilib.core.mlp.mlp import mlp as nkilib_mlp
+        from nkilib.core.utils.common_types import ActFnType, DtypeMode, NormType, QuantizationType
+
+        @nki.jit
+        def _mlp_kernel(hidden, up_weight, down_weight, up_bias, down_bias):
+            """GELU_tanh(hidden @ up + up_b) @ down + down_b; hidden [B, T, H], up [H, I],
+            down [I, H], biases [1, *]. Same arguments as staging _wan_mlp_kernel."""
+            return nkilib_mlp(
+                hidden_tensor=hidden, gate_proj_weights_tensor=up_weight,
+                up_proj_weights_tensor=up_weight, down_proj_weights_tensor=down_weight,
+                normalization_weights_tensor=None, gate_proj_bias_tensor=up_bias,
+                up_proj_bias_tensor=up_bias, down_proj_bias_tensor=down_bias,
+                normalization_bias_tensor=None, fused_add_tensor=None, store_fused_add_result=False,
+                activation_fn=ActFnType.GELU_Tanh_Approx, normalization_type=NormType.NO_NORM,
+                quantization_type=QuantizationType.NONE, gate_w_scale=None, up_w_scale=None,
+                down_w_scale=None, gate_up_in_scale=None, down_in_scale=None,
+                quant_clipping_bound=0.0, output_dtype=None, store_output_in_sbuf=False, eps=1e-6,
+                skip_gate_proj=True, use_tkg_gate_up_proj_column_tiling=True,
+                use_tkg_down_proj_column_tiling=True, use_tkg_down_proj_optimized_layout=False,
+                gate_clamp_upper_limit=None, gate_clamp_lower_limit=None,
+                up_clamp_upper_limit=None, up_clamp_lower_limit=None,
+                force_cte_mode=False, dtype_mode=DtypeMode.AUTO)
+
+        _mlp_call = _wrap(_mlp_kernel, "wan14b::mlp")
+        logger.info(f"[fast_dit] nkilib mlp via {FAST_KERNEL_WRAP} lnc={LNC}")
+    return _mlp_call
+
+
+_oproj_call = None
+
+
+def _get_oproj():
+    global _oproj_call
+    if _oproj_call is None:
+        import nki
+        from nkilib.core.output_projection.output_projection_cte import output_projection_cte
+        from nkilib.core.utils.common_types import QuantizationType
+
+        @nki.jit
+        def _oproj_kernel(active, weight, bias):
+            """active [B, N, D, S], weight [N*D, H], bias [1, H] -> [B, S, H]."""
+            return output_projection_cte(active, weight, bias, QuantizationType.NONE, None, None)
+
+        _oproj_call = _wrap(_oproj_kernel, "wan14b::output_projection_cte")
+        logger.info(f"[fast_dit] nkilib output_projection_cte via {FAST_KERNEL_WRAP} lnc={LNC}")
+    return _oproj_call
 
 
 _constmax_call = None
@@ -112,6 +177,23 @@ def _self_attn(q, k, v):
     if FAST_ATTN_IMPL == "constmax":
         return _get_constmax()(q.contiguous(), k.contiguous(), v.contiguous()).transpose(1, 2)  # [B, n, L, d] -> [B, L, n, d]
     return _attn(q, k, v)
+
+
+def _attn_dmajor(q, k, v):
+    """q [B, Lq, n, d], k/v [B, Lk, n, d] -> d-major [B, n, d, Lq] (attention_cte tp_out=True)."""
+    B, Lq, n, d = q.shape
+    Lk = k.shape[1]
+    q3 = (q * (d ** -0.5)).permute(0, 2, 1, 3).reshape(B * n, Lq, d)
+    k3 = k.permute(0, 2, 1, 3).reshape(B * n, Lk, d)
+    v3 = v.permute(0, 2, 1, 3).reshape(B * n, Lk, d)
+    return _get_cte(True)(q3, k3, v3).reshape(B, n, d, Lq)
+
+
+def _o_proj(layer, y_tok, y_dmajor):
+    """O projection + in-graph all-reduce. FAST_OPROJ uses the kernel on the d-major output."""
+    if FAST_OPROJ:
+        return _all_reduce(_get_oproj()(y_dmajor, layer.o_w_t, layer.o_b_scaled))
+    return _row_linear(layer, y_tok)
 
 
 def _attn(q, k, v):
@@ -186,16 +268,28 @@ class _FastBlock(nn.Module):
         q, k = _tp_rms_qk(F.linear(h, sa.q.weight, sa.q.bias),
                           F.linear(h, sa.k.weight, sa.k.bias), sa.norm_q, sa.norm_k)
         v = F.linear(h, sa.v.weight, sa.v.bias).view(B, L, n, d)
-        y = _self_attn(_rope(q.view(B, L, n, d), cos, sin), _rope(k.view(B, L, n, d), cos, sin), v)
-        x = x + _row_linear(sa.o, y.reshape(B, L, n * d)) * e[2]
+        q, k = _rope(q.view(B, L, n, d), cos, sin), _rope(k.view(B, L, n, d), cos, sin)
+        if FAST_OPROJ and FAST_ATTN_IMPL == "cte":
+            x = x + _o_proj(sa, None, _attn_dmajor(q, k, v)) * e[2]
+        else:
+            y = _self_attn(q, k, v)
+            x = x + _row_linear(sa.o, y.reshape(B, L, n * d)) * e[2]
 
         h = blk.norm3(x)
         q = _tp_rms(F.linear(h, ca.q.weight, ca.q.bias), ca.norm_q).view(B, L, n, d)
-        x = x + _row_linear(ca.o, _attn(q, ck, cv).reshape(B, L, n * d))
+        if FAST_OPROJ:
+            x = x + _o_proj(ca, None, _attn_dmajor(q, ck, cv))
+        else:
+            x = x + _row_linear(ca.o, _attn(q, ck, cv).reshape(B, L, n * d))
 
         h = blk.norm2(x).to(torch.bfloat16) * (1 + e[4]) + e[3]
-        h = blk.ffn[1](F.linear(h, blk.ffn[0].weight, blk.ffn[0].bias))
-        return x + _row_linear(blk.ffn[2], h) * e[5]
+        if FAST_MLP:
+            f = blk.ffn
+            y = _get_mlp()(h.reshape(1, B * L, -1), f.up_w_t, f.down_w_t, f.up_b2, f.down_b_scaled)
+            y = _all_reduce(y).reshape(B, L, -1)
+        else:
+            y = _row_linear(blk.ffn[2], blk.ffn[1](F.linear(h, blk.ffn[0].weight, blk.ffn[0].bias)))
+        return x + y * e[5]
 
 
 class _FastCrossKV(nn.Module):
@@ -266,6 +360,30 @@ class _FastHead(nn.Module):
         return uncond + self.guide_scale * (cond - uncond)
 
 
+def _prepare_kernel_weights(model):
+    """Kernel weight layouts, made once (both kernels take [in, out]); originals freed.
+    Row-parallel biases are pre-divided by TP so the all-reduce sum adds them once."""
+    tp = get_tp_world_size()
+
+    def buf(mod, name, t):
+        mod.register_buffer(name, t.contiguous(), persistent=False)
+
+    for blk in model.blocks:
+        if FAST_MLP:
+            f = blk.ffn
+            buf(f, "up_w_t", f[0].weight.t())                    # [H, I_local]
+            buf(f, "up_b2", f[0].bias.view(1, -1))
+            buf(f, "down_w_t", f[2].weight.t())                  # [I_local, H]
+            buf(f, "down_b_scaled", (f[2].bias / tp).view(1, -1))
+            for lin in (f[0], f[2]):
+                lin.weight.data = torch.empty(0, dtype=lin.weight.dtype, device=lin.weight.device)
+        if FAST_OPROJ:
+            for att in (blk.self_attn, blk.cross_attn):
+                buf(att, "o_w_t", att.o.weight.t())              # [N*D local, H]
+                buf(att, "o_b_scaled", (att.o.bias / tp).view(1, -1))
+                att.o.weight.data = torch.empty(0, dtype=att.o.weight.dtype, device=att.o.weight.device)
+
+
 def _rope_tables(freqs, grid, head_dim, device):
     """Same angle grid as rope_apply_neuron, built once -> cos/sin [1, L, 1, d/2]."""
     f, h, w = grid
@@ -298,6 +416,12 @@ class FastWanDiT:
             _get_cte()          # cross-attention (and self-attention for cte)
         if FAST_ATTN_IMPL == "constmax":
             _get_constmax()
+        if FAST_OPROJ:
+            _get_cte(True)
+            _get_oproj()
+        if FAST_MLP:
+            _get_mlp()
+        _prepare_kernel_weights(model)
         self.time = torch.compile(_FastTime(model), **COMPILE_KW)
         self.patch = torch.compile(_FastPatch(model.patch_embedding), **COMPILE_KW)
         self.text = torch.compile(_FastText(model.text_embedding), **COMPILE_KW)
