@@ -20,6 +20,9 @@ FAST_ATTN_IMPL: cte (default, nkilib attention_cte) | sdpa (F.scaled_dot_product
 FAST_KERNEL_WRAP: hop (default, torch_neuronx.nki_hop.wrap_nki) | op (torch_neuronx.nki_op).
 FAST_MLP=1   : FFN via nkilib mlp (staging feed_forward._wan_mlp_kernel: skip_gate_proj,
                GELU_Tanh_Approx), down bias pre-divided by TP, then the in-graph all-reduce.
+FAST_ADALN=1 : staging fused adaln kernel (kernels/nkilib/experimental/norm/adaln_quant.py) for
+               norm1+modulation, norm3 (cross-attn affine LN) with the self-attn gated residual
+               add, and norm2+modulation with the cross-attn residual add (staging block order).
 FAST_OPROJ=1 : self/cross O-proj via nkilib output_projection_cte (staging cp_attention
                _wan_o_proj_kernel) on d-major attention output (attention_cte tp_out=True).
 """
@@ -42,6 +45,7 @@ FAST_KERNEL_WRAP = os.environ.get("FAST_KERNEL_WRAP", "hop")
 LNC = int(os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2"))
 FAST_MLP = os.environ.get("FAST_MLP", "0") == "1"
 FAST_OPROJ = os.environ.get("FAST_OPROJ", "0") == "1"
+FAST_ADALN = os.environ.get("FAST_ADALN", "0") == "1"
 COMPILE_KW = dict(backend="neuron", dynamic=False, fullgraph=True)
 
 
@@ -121,6 +125,46 @@ def _get_mlp():
         _mlp_call = _wrap(_mlp_kernel, "wan14b::mlp")
         logger.info(f"[fast_dit] nkilib mlp via {FAST_KERNEL_WRAP} lnc={LNC}")
     return _mlp_call
+
+
+_adaln_calls = None
+
+
+def _get_adaln():
+    """Three tensor-only launchers (kargs are built inside the jit, never passed through the graph):
+    plain (norm -> *mul + add), residual+gate, residual without gate. All LayerNorm, OCP dtype mode."""
+    global _adaln_calls
+    if _adaln_calls is None:
+        import nki
+        from kernels.nkilib.core.utils.common_types import DtypeMode, NormType, QuantizationType
+        from kernels.nkilib.experimental.norm.adaln_quant import AdaLNQuantKernelArgs, adaln_quant_kernel
+
+        def kargs(eps):
+            return AdaLNQuantKernelArgs(norm_type=NormType.LAYER_NORM,
+                                        quantization_type=QuantizationType.NONE, eps=eps)
+
+        @nki.jit
+        def _plain(hidden, mul, add):
+            return adaln_quant_kernel(hidden, kargs(1e-6), mul=mul, add=add, dtype_mode=DtypeMode.OCP)
+
+        @nki.jit
+        def _res_gate(hidden, mul, add, residual, gate):
+            return adaln_quant_kernel(hidden, kargs(1e-6), mul=mul, add=add, dtype_mode=DtypeMode.OCP,
+                                      residual=residual, gate=gate)
+
+        @nki.jit
+        def _res(hidden, mul, add, residual):
+            return adaln_quant_kernel(hidden, kargs(1e-6), mul=mul, add=add, dtype_mode=DtypeMode.OCP,
+                                      residual=residual)
+
+        _adaln_calls = (_wrap(_plain, "wan14b::adaln"), _wrap(_res_gate, "wan14b::adaln_res_gate"),
+                        _wrap(_res, "wan14b::adaln_res"))
+        logger.info(f"[fast_dit] adaln_quant via {FAST_KERNEL_WRAP} lnc={LNC}")
+    return _adaln_calls
+
+
+def _row(v, H, dtype):
+    return v.reshape(1, H).to(dtype)
 
 
 _oproj_call = None
@@ -264,25 +308,41 @@ class _FastBlock(nn.Module):
         n, d = sa.num_heads, sa.head_dim
         e = [t.squeeze(2) for t in (blk.modulation.unsqueeze(0) + e).chunk(6, dim=2)]  # [1, 1, C]
 
-        h = blk.norm1(x).to(torch.bfloat16) * (1 + e[1]) + e[0]
+        C = x.shape[-1]
+        if FAST_ADALN:
+            plain, res_gate, res = _get_adaln()
+            h = plain(x.reshape(B * L, C), _row(1 + e[1], C, x.dtype), _row(e[0], C, x.dtype)).view(B, L, C)
+        else:
+            h = blk.norm1(x).to(torch.bfloat16) * (1 + e[1]) + e[0]
         q, k = _tp_rms_qk(F.linear(h, sa.q.weight, sa.q.bias),
                           F.linear(h, sa.k.weight, sa.k.bias), sa.norm_q, sa.norm_k)
         v = F.linear(h, sa.v.weight, sa.v.bias).view(B, L, n, d)
         q, k = _rope(q.view(B, L, n, d), cos, sin), _rope(k.view(B, L, n, d), cos, sin)
         if FAST_OPROJ and FAST_ATTN_IMPL == "cte":
-            x = x + _o_proj(sa, None, _attn_dmajor(q, k, v)) * e[2]
+            y = _o_proj(sa, None, _attn_dmajor(q, k, v))
         else:
-            y = _self_attn(q, k, v)
-            x = x + _row_linear(sa.o, y.reshape(B, L, n * d)) * e[2]
-
-        h = blk.norm3(x)
+            y = _row_linear(sa.o, _self_attn(q, k, v).reshape(B, L, n * d))
+        if FAST_ADALN:   # x = x + gate*y ; h = norm3(x) (affine LN), one kernel
+            n3 = blk.norm3
+            x, h = res_gate(y.reshape(B * L, C), _row(n3.weight, C, x.dtype), _row(n3.bias, C, x.dtype),
+                            x.reshape(B * L, C), _row(e[2], C, torch.float32))
+            x, h = x.view(B, L, C), h.view(B, L, C)
+        else:
+            x = x + y * e[2]
+            h = blk.norm3(x)
         q = _tp_rms(F.linear(h, ca.q.weight, ca.q.bias), ca.norm_q).view(B, L, n, d)
         if FAST_OPROJ:
-            x = x + _o_proj(ca, None, _attn_dmajor(q, ck, cv))
+            y = _o_proj(ca, None, _attn_dmajor(q, ck, cv))
         else:
-            x = x + _row_linear(ca.o, _attn(q, ck, cv).reshape(B, L, n * d))
+            y = _row_linear(ca.o, _attn(q, ck, cv).reshape(B, L, n * d))
 
-        h = blk.norm2(x).to(torch.bfloat16) * (1 + e[4]) + e[3]
+        if FAST_ADALN:   # x = x + y ; h = norm2(x) * (1 + e4) + e3, one kernel
+            x, h = res(y.reshape(B * L, C), _row(1 + e[4], C, x.dtype), _row(e[3], C, x.dtype),
+                       x.reshape(B * L, C))
+            x, h = x.view(B, L, C), h.view(B, L, C)
+        else:
+            x = x + y
+            h = blk.norm2(x).to(torch.bfloat16) * (1 + e[4]) + e[3]
         if FAST_MLP:
             f = blk.ffn
             y = _get_mlp()(h.reshape(1, B * L, -1), f.up_w_t, f.down_w_t, f.up_b2, f.down_b_scaled)
@@ -421,6 +481,8 @@ class FastWanDiT:
             _get_oproj()
         if FAST_MLP:
             _get_mlp()
+        if FAST_ADALN:
+            _get_adaln()
         _prepare_kernel_weights(model)
         self.time = torch.compile(_FastTime(model), **COMPILE_KW)
         self.patch = torch.compile(_FastPatch(model.patch_embedding), **COMPILE_KW)
