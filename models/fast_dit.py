@@ -13,7 +13,10 @@ at CP=1). Every compiled unit uses torch.compile(fullgraph=True, dynamic=False):
               O-proj, cross-attn, FFN, with the TP all-reduces in-graph (funcol)
   _FastHead   head + unpatchify + CFG combine (guide scale per expert)
 
-FAST_ATTN_IMPL: cte (default, nkilib attention_cte) | sdpa (F.scaled_dot_product_attention).
+FAST_ATTN_IMPL: cte (default, nkilib attention_cte) | sdpa (F.scaled_dot_product_attention)
+                | constmax (self-attn: staging const-max kernel, kernels/nkilib/experimental/
+                  attention/ring_attention_const_max_fwd.py, num_workers=1; cross-attn: cte,
+                  as staging does).
 FAST_KERNEL_WRAP: hop (default, torch_neuronx.nki_hop.wrap_nki) | op (torch_neuronx.nki_op).
 """
 
@@ -73,6 +76,42 @@ def _get_cte():
                 _cte_call = w
         logger.info(f"[fast_dit] attention_cte via {FAST_KERNEL_WRAP} lnc={LNC}")
     return _cte_call
+
+
+_constmax_call = None
+
+
+def _get_constmax():
+    global _constmax_call
+    if _constmax_call is None:
+        from kernels.nkilib.experimental.attention.ring_attention_const_max_fwd import (
+            ring_attention_const_max_fwd)
+        if FAST_KERNEL_WRAP == "op":
+            from torch_neuronx import nki_op
+
+            @nki_op("wan14b::attention_const_max")
+            def _op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+                return ring_attention_const_max_fwd[LNC](
+                    q, k, v, num_workers=1, softmax_scale=q.shape[-1] ** -0.5)
+
+            _constmax_call = lambda q, k, v: _op(q, k, v)
+        else:
+            from torch_neuronx.nki_hop import wrap_nki
+            w = wrap_nki(ring_attention_const_max_fwd)
+            try:
+                w = w[LNC]
+            except Exception:  # noqa: BLE001
+                pass
+            _constmax_call = lambda q, k, v: w(q, k, v, num_workers=1, softmax_scale=q.shape[-1] ** -0.5)
+        logger.info(f"[fast_dit] const-max self-attention via {FAST_KERNEL_WRAP} lnc={LNC}")
+    return _constmax_call
+
+
+def _self_attn(q, k, v):
+    """q/k/v [B, L, n, d] token-major -> [B, L, n, d]."""
+    if FAST_ATTN_IMPL == "constmax":
+        return _get_constmax()(q.contiguous(), k.contiguous(), v.contiguous()).transpose(1, 2)  # [B, n, L, d] -> [B, L, n, d]
+    return _attn(q, k, v)
 
 
 def _attn(q, k, v):
@@ -147,7 +186,7 @@ class _FastBlock(nn.Module):
         q, k = _tp_rms_qk(F.linear(h, sa.q.weight, sa.q.bias),
                           F.linear(h, sa.k.weight, sa.k.bias), sa.norm_q, sa.norm_k)
         v = F.linear(h, sa.v.weight, sa.v.bias).view(B, L, n, d)
-        y = _attn(_rope(q.view(B, L, n, d), cos, sin), _rope(k.view(B, L, n, d), cos, sin), v)
+        y = _self_attn(_rope(q.view(B, L, n, d), cos, sin), _rope(k.view(B, L, n, d), cos, sin), v)
         x = x + _row_linear(sa.o, y.reshape(B, L, n * d)) * e[2]
 
         h = blk.norm3(x)
@@ -254,8 +293,11 @@ class FastWanDiT:
         self.grid = tuple(int(g) for g in grid)
         self.device = device
         self.cos, self.sin = _rope_tables(model.freqs, self.grid, model.dim // model.num_heads, device)
-        if FAST_ATTN_IMPL == "cte":
-            _get_cte()  # build the kernel wrapper BEFORE tracing (imports inside a trace break fullgraph)
+        # Build kernel wrappers BEFORE tracing (imports inside a trace break fullgraph).
+        if FAST_ATTN_IMPL in ("cte", "constmax"):
+            _get_cte()          # cross-attention (and self-attention for cte)
+        if FAST_ATTN_IMPL == "constmax":
+            _get_constmax()
         self.time = torch.compile(_FastTime(model), **COMPILE_KW)
         self.patch = torch.compile(_FastPatch(model.patch_embedding), **COMPILE_KW)
         self.text = torch.compile(_FastText(model.text_embedding), **COMPILE_KW)

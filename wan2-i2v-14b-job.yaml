@@ -187,7 +187,8 @@ spec:
                   legacy)   cp kernels/self_attention.py kernels/cross_attention.py "$OUT/code/" || true ;;
                   cte)      cp "$(python3 -c 'import nkilib.core.attention.attention_cte as m; print(m.__file__)')" "$OUT/code/" || true ;;
                   constmax) cp kernels/nkilib/experimental/attention/{attention_const_max,ring_attention_const_max_fwd}.py "$OUT/code/" || true ;;
-                  fast)     cp models/fast_dit.py "$OUT/code/" || true
+                  fast*)    cp models/fast_dit.py "$OUT/code/" || true
+                            [ "$TAG" = fast_constmax ] && cp kernels/nkilib/experimental/attention/{attention_const_max,ring_attention_const_max_fwd}.py "$OUT/code/" || true
                             cp "$(python3 -c 'import nkilib.core.attention.attention_cte as m; print(m.__file__)')" "$OUT/code/" || true ;;
                 esac
                 tar -czf "$LOCAL_RESULTS/dit_pairs_$TAG.tar.gz" -C "$LOCAL_RESULTS" "dit_pairs_$TAG" 2>/dev/null \
@@ -212,6 +213,7 @@ spec:
               LAST_IMPL=""
               for IMPL in $ATTN_IMPLS; do
                 export ATTN_IMPL="$IMPL"
+                case "$IMPL" in fast_*) export ATTN_IMPL=fast FAST_ATTN_IMPL="${IMPL#fast_}" ;; esac
                 rm -rf $NEFF_DIRS; mkdir -p $NEFF_DIRS
                 touch "/tmp/stage_start_$IMPL"; sleep 1
                 echo "████ STAGE ATTN_IMPL=$IMPL (cache emptied: $NEFF_DIRS) ████"
@@ -329,7 +331,7 @@ spec:
             - name: USE_NKI_KERNELS
               value: "1"
             - name: ATTN_IMPLS
-              value: "fast"
+              value: "fast_cte fast_constmax"
             - name: FAST_DIT
               value: "1"
             - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
