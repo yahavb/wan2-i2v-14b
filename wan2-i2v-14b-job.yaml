@@ -219,7 +219,9 @@ spec:
                   case "$IMPL" in *+mlp*) export FAST_MLP=1 ;; esac
                   case "$IMPL" in *+oproj*) export FAST_OPROJ=1 ;; esac
                   case "$IMPL" in *+adaln*) export FAST_ADALN=1 ;; esac
-                  echo "  FAST_ATTN_IMPL=$FAST_ATTN_IMPL FAST_MLP=$FAST_MLP FAST_OPROJ=$FAST_OPROJ FAST_ADALN=$FAST_ADALN" ;;
+                  export VAE_IMPL=tp
+                  case "$IMPL" in *+vae*) export VAE_IMPL=static ;; esac
+                  echo "  FAST_ATTN_IMPL=$FAST_ATTN_IMPL FAST_MLP=$FAST_MLP FAST_OPROJ=$FAST_OPROJ FAST_ADALN=$FAST_ADALN VAE_IMPL=$VAE_IMPL" ;;
                 esac
                 rm -rf $NEFF_DIRS; mkdir -p $NEFF_DIRS
                 touch "/tmp/stage_start_$IMPL"; sleep 1
@@ -338,7 +340,7 @@ spec:
             - name: USE_NKI_KERNELS
               value: "1"
             - name: ATTN_IMPLS
-              value: "fast_cte fast_cte+oproj fast_cte+oproj+adaln"
+              value: "fast_cte+oproj+adaln fast_cte+oproj+adaln+vae"
             - name: FAST_DIT
               value: "1"
             - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE

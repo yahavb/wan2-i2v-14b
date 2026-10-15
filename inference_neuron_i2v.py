@@ -195,7 +195,10 @@ def main():
     msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
     msk = msk.transpose(1, 2)[0]
 
-    VAE_TP_DEGREE = int(os.environ.get("VAE_TP_DEGREE", "8"))
+    # VAE_IMPL=static: models/vae_static21.py -- fullgraph encode/decode on rank 0, whole
+    # frame, no channel TP (in-graph nkilib conv3d + attention_cte); y is broadcast.
+    VAE_IMPL = os.environ.get("VAE_IMPL", "tp")
+    VAE_TP_DEGREE = 1 if VAE_IMPL == "static" else int(os.environ.get("VAE_TP_DEGREE", "8"))
     VAE_TP_RANKS = list(range(VAE_TP_DEGREE))
 
     # Load VAE on all VAE TP ranks, shard decoder
@@ -210,12 +213,17 @@ def main():
         vae.std = vae.std.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
         vae.scale = [vae.mean, 1.0 / vae.std]
 
-        # Create VAE TP group and shard decoder
-        create_vae_tp_group(VAE_TP_RANKS)
-        vae_tp_rank = VAE_TP_RANKS.index(rank)
-        shard_vae_model_tp(vae.model, vae_tp_rank, VAE_TP_DEGREE)
-        if rank == 0:
-            logger.info(f"VAE TP={VAE_TP_DEGREE} sharded on all ranks")
+        if VAE_IMPL == "static":
+            from models.vae_static21 import StaticWanVAE
+            vae = StaticWanVAE(vae)
+            logger.info("VAE_IMPL=static: fullgraph encode/decode on rank 0")
+        else:
+            # Create VAE TP group and shard decoder
+            create_vae_tp_group(VAE_TP_RANKS)
+            vae_tp_rank = VAE_TP_RANKS.index(rank)
+            shard_vae_model_tp(vae.model, vae_tp_rank, VAE_TP_DEGREE)
+            if rank == 0:
+                logger.info(f"VAE TP={VAE_TP_DEGREE} sharded on all ranks")
 
     else:
         vae = None
