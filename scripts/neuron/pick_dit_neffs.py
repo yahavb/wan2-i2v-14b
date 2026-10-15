@@ -4,7 +4,7 @@
 Adapted from odyssey-trainium/bringup/scripts/neuron/pick_dit_neff.py. Unlike
 odyssey, the Wan2.2 DiT is NOT one fullgraph NEFF: only block.ffn,
 patch_embedding, text_embedding and head are torch.compile'd; self/cross
-attention run eagerly through the NKI kernels. So the DiT is a SET of NEFFs,
+attention is outside torch.compile and calls the NKI kernels. So the DiT is a SET of NEFFs,
 and we identify each one by the tensor shapes in its IO signature
 (NeffInfo metadata -- never `strings | grep`, NEFFs are binary):
 

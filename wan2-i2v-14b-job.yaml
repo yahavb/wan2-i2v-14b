@@ -53,13 +53,18 @@ spec:
 
               # torch.compile(backend='neuron') writes NEFFs to this cache. Pin it
               # so the per-NEFF capture loop knows exactly where to look.
-              # Eager torch-neuronx writes NEFFs to its DEFAULT cache and ignores
-              # NEURON_COMPILE_CACHE_URL (a per-stage URL left 0 NEFFs to profile), so
-              # each stage EMPTIES these dirs before its warmup instead: a stage's DiT
-              # profile then only ever sees that stage's NEFFs.
+              # NEFF locations, same setup as odyssey-trainium bench-dit-only-job.yaml.
+              # Each stage empties both dirs before its warmup, so a stage's DiT profile
+              # only sees that stage's NEFFs. (A per-stage NEURON_COMPILE_CACHE_URL alone
+              # left 0 NEFFs in that dir; TORCH_NEURONX_NEFF_CACHE_DIR was not set then.)
               NEFF_DIRS="/var/tmp/neuron-compile-cache /tmp/neff_cache"
               NEFF_CACHE=/var/tmp/neuron-compile-cache
               export NEURON_COMPILE_CACHE_URL=$NEFF_CACHE
+              export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
+              export NEURON_FRAMEWORK_DEBUG=1
+              export TORCH_NEURONX_DEBUG_DIR=/tmp/neff_debug
+              export TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS=1
+              mkdir -p /tmp/neff_debug
 
               REFERENCE_LINE="(none — clean median is the baseline)"
 
@@ -165,7 +170,7 @@ spec:
 
               # ─── capture_dit_pairs: the DiT NEFF+NTFF pairs (THE deliverable) ───
               # Same method as odyssey-trainium capture_dit_pair, adapted: the Wan2.2
-              # DiT is ~570 small NEFFs (compiled ffn + eager attention + proj/embed),
+              # DiT is ~570 NEFFs (torch.compile ffn/embed/head + attention ops outside torch.compile),
               # so pick_dit_neffs.py identifies each by its IO shapes, not file size.
               # The WHOLE attention chain (kernel + proj/norm/rope/permute/pad +
               # collectives) is captured uncapped; other DiT NEFFs up to DIT_MAX_PAIRS.

@@ -57,7 +57,7 @@ ATTN_CORE_LNC = None
 
 
 def _wrap_lnc(kernel):
-    """wrap_nki for eager torch-neuronx, launched on all LNC cores when supported."""
+    """torch_neuronx wrap_nki, launched on all LNC cores when supported."""
     from torch_neuronx.nki_hop import wrap_nki
     wrapped = wrap_nki(kernel)
     lnc = int(os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2"))
