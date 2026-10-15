@@ -8,13 +8,18 @@ attention run eagerly through the NKI kernels. So the DiT is a SET of NEFFs,
 and we identify each one by the tensor shapes in its IO signature
 (NeffInfo metadata -- never `strings | grep`, NEFFs are binary):
 
+  attn_kernel: the embedded HLO debug text names an NKI attention kernel
+               (wan_flash_self_attn / wan_cross_attn). Shapes can't find these:
+               activations are flattened to 2-D (B, numel) in the signature.
+  nki_kernel : an unnamed custom-call (kernel name not in the text). May be a VAE
+               kernel too -- check its shapes in the report.
   ffn        : a dim == ffn_dim/TP            (13824/4 = 3456)
-  attn_kernel: a dim == num_heads/TP AND a dim == head_dim  ([n, d, L] NKI layout)
   dit_other  : a dim == model dim             (5120: qkv/o proj, norms, embed, head)
 
 T5 (dim 4096, head_dim 64) and the VAE (channels <= 384, 5-D convs) match none.
 
-Output order: ffn, attn_kernel, dit_other; inside each role largest first.
+Output order: attn_kernel, ffn, dit_other; inside each role most MACs first
+(HloMacCount from the NEFF's hlo_stats.json), then largest file.
 The ffn / attention NEFFs run 40 blocks x NUM_STEPS per generation
 (see neff-time-accounting), so they are the ones that matter.
 
@@ -26,14 +31,38 @@ Exit 1 if no DiT NEFF found.
 import argparse
 import glob
 import hashlib
+import io
+import json
 import os
+import struct
 import sys
+import tarfile
 
 from neuronxcc.kra.NeffInfo import NeffInfo
 
-DIM, FFN_DIM, NUM_HEADS = 5120, 13824, 40   # wan/configs/wan_i2v_A14B.py
-HEAD_DIM = DIM // NUM_HEADS                  # 128
-ROLE_ORDER = {"ffn": 0, "attn_kernel": 1, "dit_other": 2}
+DIM, FFN_DIM = 5120, 13824                   # wan/configs/wan_i2v_A14B.py
+ROLE_ORDER = {"attn_kernel": 0, "nki_kernel": 1, "ffn": 2, "dit_other": 3}
+KERNEL_NAMES = ("wan_flash_self_attn", "wan_cross_attn")
+
+
+def neff_contents(path):
+    """(HLO debug text, MAC count) from the tar.gz embedded after the NEFF header.
+    Header size is the u64 at offset 8 (1024 on this SDK)."""
+    text, macs = "", -1
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        hdr = struct.unpack_from("<Q", raw, 8)[0] or 1024
+        with tarfile.open(fileobj=io.BytesIO(raw[hdr:]), mode="r:gz") as tf:
+            for m in tf.getmembers():
+                name = os.path.basename(m.name)
+                if name == "hlo_stats.json":
+                    macs = json.load(tf.extractfile(m)).get("HloMacCount", -1)
+                elif name.startswith("debug_info_hlo"):
+                    text += tf.extractfile(m).read().decode("latin-1")
+    except Exception:  # noqa: BLE001
+        pass
+    return text, macs
 
 
 def md5(path):
@@ -54,10 +83,14 @@ def probe(path, tp):
     shapes = [tuple(t.get("shape") or ()) for t in tensors]
     dims = {d for s in shapes for d in s}
 
-    if FFN_DIM // tp in dims:
-        role = "ffn"
-    elif any((NUM_HEADS // tp) in s and HEAD_DIM in s for s in shapes):
+    text, macs = neff_contents(path)
+    kernel = next((k for k in KERNEL_NAMES if k in text), None)
+    if kernel:
         role = "attn_kernel"
+    elif "custom-call(" in text:
+        role = "nki_kernel"
+    elif FFN_DIM // tp in dims:
+        role = "ffn"
     elif DIM in dims:
         role = "dit_other"
     else:
@@ -68,7 +101,7 @@ def probe(path, tp):
     except Exception:
         ws = 0  # unknown -> caller assumes collectives (safe)
     return {
-        "path": path, "role": role, "ws": ws,
+        "path": path, "role": role, "ws": ws, "macs": macs, "kernel": kernel,
         "size": os.path.getsize(path),
         "n_in": len(sig.get("inputs", {})), "n_out": len(sig.get("outputs", {})),
         "shapes": shapes[:6],
@@ -95,7 +128,7 @@ def main():
         if r is None:
             continue
         (errors if "error" in r else cands).append(r)
-    cands.sort(key=lambda c: (ROLE_ORDER[c["role"]], -c["size"]))
+    cands.sort(key=lambda c: (ROLE_ORDER[c["role"]], -c["macs"], -c["size"]))
 
     if args.print_paths:
         for c in cands:
@@ -106,13 +139,13 @@ def main():
     for e in errors:
         print(f"  unreadable: {os.path.basename(e['path'])} -- {e['error']}")
     if not cands:
-        print("NO DiT NEFF FOUND (no NEFF has a dim of "
-              f"{FFN_DIM // args.tp}, {DIM}, or [{NUM_HEADS // args.tp}, {HEAD_DIM}, L])")
+        print(f"NO DiT NEFF FOUND (no NKI attention kernel, no dim of {FFN_DIM // args.tp} or {DIM})")
         return 1
     print(f"DiT NEFFs: {len(cands)}")
     for c in cands:
         print(f"  {c['role']:<11} ws={c['ws']:<2} {c['size'] / 1e6:7.1f} MB  "
-              f"io={c['n_in']}/{c['n_out']}  {os.path.basename(c['path'])}  {c['shapes']}")
+              f"GMAC={c['macs'] / 1e9:8.1f}  io={c['n_in']}/{c['n_out']}  "
+              f"{os.path.basename(c['path'])}  {c['kernel'] or c['shapes']}")
     return 0
 
 

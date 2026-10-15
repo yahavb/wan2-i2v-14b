@@ -14,12 +14,12 @@ spec:
       nodeSelector:
         node-type: trn2
       resourceClaims:
-        - name: m-trn2
-          resourceClaimTemplateName: m-trn2
+        - name: neurons
+          resourceClaimTemplateName: m-lnc2
       containers:
         - name: inference
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           command:
             - /bin/bash
             - "-ec"
@@ -59,14 +59,11 @@ spec:
               REFERENCE_LINE="(none — clean median is the baseline)"
 
               # ─── profiler CLI, resolved at runtime ───
-              # From cc 2.27 neuron-profile is deprecated (every capture fails with a
-              # banner pointing at neuron-explorer). Prefer neuron-profile only while
-              # it still works on this image; never start the explorer view SERVER.
-              PROF_CLI=neuron-profile
-              if ! command -v neuron-profile >/dev/null 2>&1 || \
-                 neuron-profile capture --help 2>&1 | grep -qi deprecat; then
-                PROF_CLI=$(command -v neuron-explorer || echo /opt/aws/neuron/bin/neuron-explorer)
-              fi
+              # From cc 2.27 neuron-profile is deprecated: every capture fails with a
+              # banner pointing at neuron-explorer (`--help` does NOT show it, so it
+              # can't be probed). Prefer neuron-explorer whenever it exists; never
+              # start the explorer view SERVER.
+              PROF_CLI=$(command -v neuron-explorer || ls /opt/aws/neuron/bin/neuron-explorer 2>/dev/null || command -v neuron-profile || echo neuron-profile)
               echo "PROFILER CLI: $PROF_CLI"
 
               # ─── deps + model download (no run) ───
@@ -302,7 +299,7 @@ spec:
               sleep 864000
           resources:
             claims:
-              - name: m-trn2
+              - name: neurons
             requests:
               cpu: 22
               memory: 220Gi
