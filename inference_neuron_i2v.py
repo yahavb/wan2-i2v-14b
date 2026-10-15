@@ -150,10 +150,18 @@ def main():
 
     ih, iw = img.height, img.width
     aspect_ratio = ih / iw
-    lat_h = round(
-        np.sqrt(max_area * aspect_ratio) // vae_stride[1] // patch_size[1] * patch_size[1])
-    lat_w = round(
-        np.sqrt(max_area / aspect_ratio) // vae_stride[2] // patch_size[2] * patch_size[2])
+    # OUT_H/OUT_W pin the output size exactly (must be multiples of 16);
+    # otherwise derive it from max_area and the input aspect ratio.
+    OUT_H, OUT_W = int(os.environ.get("OUT_H", "0")), int(os.environ.get("OUT_W", "0"))
+    if OUT_H and OUT_W:
+        mult = vae_stride[1] * patch_size[1]
+        assert OUT_H % mult == 0 and OUT_W % mult == 0, f"OUT_H/OUT_W must be multiples of {mult}"
+        lat_h, lat_w = OUT_H // vae_stride[1], OUT_W // vae_stride[2]
+    else:
+        lat_h = round(
+            np.sqrt(max_area * aspect_ratio) // vae_stride[1] // patch_size[1] * patch_size[1])
+        lat_w = round(
+            np.sqrt(max_area / aspect_ratio) // vae_stride[2] // patch_size[2] * patch_size[2])
     oh = lat_h * vae_stride[1]
     ow = lat_w * vae_stride[2]
 
@@ -190,8 +198,6 @@ def main():
     VAE_TP_DEGREE = int(os.environ.get("VAE_TP_DEGREE", "8"))
     VAE_TP_RANKS = list(range(VAE_TP_DEGREE))
 
-    y_device = torch.zeros((z_dim + 4, T_latent, lat_h, lat_w), dtype=torch.bfloat16, device=NEURON_DEVICE)
-
     # Load VAE on all VAE TP ranks, shard decoder
     if rank in VAE_TP_RANKS:
         if rank == 0:
@@ -211,24 +217,32 @@ def main():
         if rank == 0:
             logger.info(f"VAE TP={VAE_TP_DEGREE} sharded on all ranks")
 
-        # Encode image (encoder is replicated, all ranks get same result)
-        img_for_vae = torch.nn.functional.interpolate(
-            img_tensor[None], size=(oh, ow), mode='bicubic').transpose(0, 1)
-        img_seq = torch.cat([img_for_vae, torch.zeros(3, F - 1, oh, ow)], dim=1)
-        z = vae.encode([img_seq.to(device=NEURON_DEVICE, dtype=torch.bfloat16)])
-        z_result = z[0].to(torch.bfloat16)
-        msk_device = msk.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
-        y_device = torch.cat([msk_device, z_result], dim=0)
-        if rank == 0:
-            logger.info(f"VAE encode done: y shape = {y_device.shape}")
-        del z, z_result, img_seq, img_for_vae
-        gc.collect()
     else:
         vae = None
 
-    # Broadcast y to any ranks not in VAE TP group (if VAE_TP_DEGREE < TP_DEGREE)
-    if VAE_TP_DEGREE < TP_DEGREE:
-        dist.broadcast(y_device, src=VAE_RANK)
+    def encode_image():
+        """VAE-encode the conditioning image -> y (encoder replicated on VAE ranks),
+        broadcast to the other ranks. Called once here (warms the NEFFs) and again,
+        timed, at the start of every run."""
+        y = torch.zeros((z_dim + 4, T_latent, lat_h, lat_w), dtype=torch.bfloat16, device=NEURON_DEVICE)
+        if rank in VAE_TP_RANKS:
+            img_for_vae = torch.nn.functional.interpolate(
+                img_tensor[None], size=(oh, ow), mode='bicubic').transpose(0, 1)
+            img_seq = torch.cat([img_for_vae, torch.zeros(3, F - 1, oh, ow)], dim=1)
+            z = vae.encode([img_seq.to(device=NEURON_DEVICE, dtype=torch.bfloat16)])
+            msk_device = msk.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
+            y = torch.cat([msk_device, z[0].to(torch.bfloat16)], dim=0)
+            del z, img_seq, img_for_vae
+        # Broadcast y to any ranks not in VAE TP group (if VAE_TP_DEGREE < TP_DEGREE)
+        if VAE_TP_DEGREE < TP_DEGREE:
+            dist.broadcast(y, src=VAE_RANK)
+        y[0, 0, 0, 0].item()  # force execution so the encode timing is real
+        return y
+
+    y_device = encode_image()
+    if rank == 0:
+        logger.info(f"VAE encode done: y shape = {y_device.shape}")
+    gc.collect()
 
     # ── Load DiT models with TP + SP sharding ──
     init_tp_group(tp_degree=TP_DEGREE)
@@ -278,8 +292,6 @@ def main():
     NUM_STEPS = int(os.environ.get("NUM_STEPS", "10"))
     NUM_RUNS = int(os.environ.get("NUM_RUNS", "1"))
 
-    arg_c = {'context': [ctx_tensor[0]], 'seq_len': seq_len, 'y': [y_device]}
-    arg_null = {'context': [ctx_null_tensor[0]], 'seq_len': seq_len, 'y': [y_device]}
 
     latent_orig = noise.clone()
     run_results = []
@@ -299,7 +311,11 @@ def main():
         sample_scheduler.set_timesteps(NUM_STEPS, device=torch.device("cpu"), shift=config.sample_shift)
         timesteps = sample_scheduler.timesteps
 
+        dist.barrier()
         run_start = time.time()
+        y_device = encode_image()
+        dist.barrier()
+        encode_time = time.time() - run_start
         denoise_start = time.time()
 
         for step_idx, t in enumerate(tqdm(timesteps, disable=(rank != 0), desc=run_label)):
@@ -380,9 +396,10 @@ def main():
         run_time = time.time() - run_start
 
         if rank == 0:
-            logger.info(f"═══ {run_label} DONE: denoise={denoise_time:.1f}s, vae={vae_time:.1f}s, total={run_time:.1f}s ═══")
+            logger.info(f"═══ {run_label} DONE: encode={encode_time:.2f}s, denoise={denoise_time:.1f}s, vae={vae_time:.1f}s, total={run_time:.1f}s ═══")
             run_results.append({
                 'run': run_idx + 1,
+                'encode': encode_time,
                 'denoise': denoise_time,
                 'vae': vae_time,
                 'total': run_time,
@@ -396,7 +413,7 @@ def main():
         logger.info(f"  TP={TP_DEGREE}, {config.num_heads//TP_DEGREE} heads/rank")
         logger.info(f"  {oh}x{ow}, {frame_num} frames, {NUM_STEPS} steps")
         for r in run_results:
-            logger.info(f"  Run {r['run']}: denoise={r['denoise']:.1f}s ({r['denoise']/NUM_STEPS:.1f}s/step), vae={r['vae']:.1f}s, total={r['total']:.1f}s")
+            logger.info(f"  Run {r['run']}: encode={r['encode']:.2f}s, denoise={r['denoise']:.1f}s ({r['denoise']/NUM_STEPS:.1f}s/step), vae={r['vae']:.1f}s, total={r['total']:.1f}s")
         logger.info("=" * 70)
 
     dist.destroy_process_group()
