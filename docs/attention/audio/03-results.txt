@@ -1,0 +1,4 @@
+Section three. The results.
+Per call, runtime drops from thirteen point seven milliseconds to one point six seven milliseconds. Hardware flops utilization rises from nine point five percent to thirty three point four percent.
+The legacy kernel is called twice per block per step, once per guidance half. The new kernel is called once. Over forty blocks and ten steps, self-attention goes from about eleven seconds to about point seven seconds, an estimate from the per-call times.
+Measured end to end, median of three clean runs, denoise drops from thirty five point five seconds to twenty five point two seconds, and the total from forty point seven seconds to thirty point six seconds. That is ten seconds, or twenty five percent, faster.

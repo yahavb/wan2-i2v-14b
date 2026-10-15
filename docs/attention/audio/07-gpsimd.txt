@@ -1,0 +1,3 @@
+Change four. G P SIMD engine, more activity.
+In the analysis view, the G P SIMD rows are sparse blips in legacy, lined up with the D M A bursts, and dense in every block of the new kernel.
+In the code, one visible cause is the new kernel initialising its max buffers on G P SIMD, with a memset on the G P SIMD engine, line thirty five oh nine. The rest of its G P SIMD work is not traced here.

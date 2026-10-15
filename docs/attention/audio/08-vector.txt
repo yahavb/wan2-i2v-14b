@@ -1,0 +1,3 @@
+Change five. Vector engine, less activity.
+In the analysis view, the legacy vector rows are solid across the whole window, about eighty eight percent busy. In the new kernel they are interleaved with the other engines, about sixty one percent.
+In the code, legacy runs every per-tile step on the vector engine, self attention dot p y lines one seventeen to one seventy six: a copy out of P SUM, a scale multiply, a mask add, a max, two conversions from float thirty two to bfloat sixteen, and an add for the running P V sum. The new kernel moved the exponent and its sum to the scalar engine, and the transpose to D M A.

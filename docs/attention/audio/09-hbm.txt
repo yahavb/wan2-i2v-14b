@@ -1,0 +1,4 @@
+Change six. H B M reads and writes, less.
+In the summary view, H B M read drops from eighty two point seven to fifty point six mebibytes per call, and write from ten point six to ten point one.
+The new kernel reads each input exactly once: twenty head instances, times two thousand seventy two query plus four thousand one hundred forty four key plus four thousand one hundred forty four value tokens, times one hundred twenty eight, times two bytes, which is fifty point six mebibytes. It writes the output exactly once, ten point one mebibytes.
+Legacy reads more because keys and values are padded to six thousand one hundred forty four tokens, queries are reloaded for every key section, and the mask is reloaded per section per head. Those do not fully add up to eighty two point seven, and legacy's write is about twice its output. The remainder is not explained by the code.
