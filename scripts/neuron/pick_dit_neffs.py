@@ -11,8 +11,8 @@ and we identify each one by the tensor shapes in its IO signature
   attn_kernel: the embedded HLO debug text names an NKI attention kernel
                (wan_flash_self_attn / wan_cross_attn). Shapes can't find these:
                activations are flattened to 2-D (B, numel) in the signature.
-  nki_kernel : an unnamed custom-call (kernel name not in the text). May be a VAE
-               kernel too -- check its shapes in the report.
+  nki_kernel : an unnamed custom-call WITH matmul work (HloMacCount > 0). The
+               zero-MAC custom-calls are copies/fills and are skipped.
   ffn        : a dim == ffn_dim/TP            (13824/4 = 3456)
   dit_other  : a dim == model dim             (5120: qkv/o proj, norms, embed, head)
 
@@ -88,6 +88,8 @@ def probe(path, tp):
     if kernel:
         role = "attn_kernel"
     elif "custom-call(" in text:
+        if macs <= 0:
+            return None  # zero-MAC custom-call: a copy/fill, not DiT compute
         role = "nki_kernel"
     elif FFN_DIM // tp in dims:
         role = "ffn"
@@ -129,6 +131,15 @@ def main():
             continue
         (errors if "error" in r else cands).append(r)
     cands.sort(key=lambda c: (ROLE_ORDER[c["role"]], -c["macs"], -c["size"]))
+    # The same op is often compiled twice with its inputs in a different order
+    # (e.g. fc1 as [x, W, b] and [W, b, x]). Keep one per (role, MACs, shapes).
+    seen, kept = set(), []
+    for c in cands:
+        key = (c["role"], c["macs"], tuple(sorted(c["shapes"])))
+        if key not in seen:
+            seen.add(key)
+            kept.append(c)
+    cands = kept
 
     if args.print_paths:
         for c in cands:
