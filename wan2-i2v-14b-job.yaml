@@ -207,7 +207,8 @@ spec:
                 ENC=$(median_key "$C" encode); DEN=$(median_key "$C" denoise)
                 DEC=$(median_key "$C" vae);    TOT=$(median_key "$C" total)
                 SPS=$(awk -v d="$DEN" -v n="$NUM_STEPS" 'BEGIN{ if(d=="N/A"){print "N/A"} else printf "%.2f", d/n }')
-                echo "RESULT [$1] ${OUT_H}x${OUT_W} ${FRAME_NUM}f ${NUM_STEPS}steps: denoise=${DEN}s  s/step=${SPS}  vae_encode=${ENC}s  vae_decode+output=${DEC}s  total=${TOT}s"
+                local TXT; TXT=$(grep -ohE "text_encode=[0-9.]+s" "$C" 2>/dev/null | tail -1 | cut -d= -f2) || true
+                echo "RESULT [$1] ${OUT_H}x${OUT_W} ${FRAME_NUM}f ${NUM_STEPS}steps: denoise=${DEN}s  s/step=${SPS}  vae_encode=${ENC}s  vae_decode+output=${DEC}s  total=${TOT}s  text_encode=${TXT:-N/A}"
               }
 
               LAST_IMPL=""
@@ -221,7 +222,9 @@ spec:
                   case "$IMPL" in *+adaln*) export FAST_ADALN=1 ;; esac
                   export VAE_IMPL=tp
                   case "$IMPL" in *+vae*) export VAE_IMPL=static ;; esac
-                  echo "  FAST_ATTN_IMPL=$FAST_ATTN_IMPL FAST_MLP=$FAST_MLP FAST_OPROJ=$FAST_OPROJ FAST_ADALN=$FAST_ADALN VAE_IMPL=$VAE_IMPL" ;;
+                  export T5_IMPL=eager
+                  case "$IMPL" in *+t5*) export T5_IMPL=fast ;; esac
+                  echo "  FAST_ATTN_IMPL=$FAST_ATTN_IMPL FAST_MLP=$FAST_MLP FAST_OPROJ=$FAST_OPROJ FAST_ADALN=$FAST_ADALN VAE_IMPL=$VAE_IMPL T5_IMPL=$T5_IMPL" ;;
                 esac
                 rm -rf $NEFF_DIRS; mkdir -p $NEFF_DIRS
                 touch "/tmp/stage_start_$IMPL"; sleep 1
@@ -340,7 +343,7 @@ spec:
             - name: USE_NKI_KERNELS
               value: "1"
             - name: ATTN_IMPLS
-              value: "fast_cte+oproj+adaln fast_cte+oproj+adaln+vae"
+              value: "fast_cte+oproj+adaln+vae fast_cte+oproj+adaln+vae+t5"
             - name: FAST_DIT
               value: "1"
             - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE

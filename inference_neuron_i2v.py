@@ -107,7 +107,30 @@ def main():
     ctx_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
     ctx_null_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
 
-    if rank == T5_RANK:
+    # T5_IMPL=fast: models/fast_t5.py -- UMT5 TP over all ranks, fullgraph per block.
+    T5_IMPL = os.environ.get("T5_IMPL", "eager")
+    if T5_IMPL == "fast":
+        from models.fast_t5 import FastT5
+        te = T5EncoderModel(
+            text_len=config.text_len, dtype=config.t5_dtype, device=torch.device('cpu'),
+            checkpoint_path=os.path.join(MODEL_PATH, config.t5_checkpoint),
+            tokenizer_path=os.path.join(MODEL_PATH, config.t5_tokenizer))
+        ft5 = FastT5(te, NEURON_DEVICE)
+        del te
+        gc.collect()
+        ctx = ft5.encode([prompt, n_prompt])            # warm (compile / NEFF load)
+        dist.barrier()
+        t0 = time.time()
+        ctx = ft5.encode([prompt, n_prompt])
+        ctx[0:1].sum().item()
+        dist.barrier()
+        if rank == 0:
+            logger.info(f"[T5_IMPL=fast] text_encode={time.time() - t0:.3f}s")
+        ctx_tensor.copy_(ctx[0:1])
+        ctx_null_tensor.copy_(ctx[1:2])
+        del ft5, ctx
+        gc.collect()
+    elif rank == T5_RANK:
         logger.info("Loading T5...")
         text_encoder = T5EncoderModel(
             text_len=config.text_len,
@@ -118,14 +141,20 @@ def main():
         text_encoder.model = text_encoder.model.to(NEURON_DEVICE)
         context = text_encoder([prompt], NEURON_DEVICE)
         context_null = text_encoder([n_prompt], NEURON_DEVICE)
+        t0 = time.time()
+        context = text_encoder([prompt], NEURON_DEVICE)
+        context_null = text_encoder([n_prompt], NEURON_DEVICE)
+        context_null[0].sum().item()
+        logger.info(f"[T5_IMPL=eager] text_encode={time.time() - t0:.3f}s")
         ctx_tensor[0, :context[0].shape[0]] = context[0].to(torch.bfloat16)
         ctx_null_tensor[0, :context_null[0].shape[0]] = context_null[0].to(torch.bfloat16)
         del text_encoder, context, context_null
         gc.collect()
         logger.info("T5 encoded and freed")
 
-    dist.broadcast(ctx_tensor, src=T5_RANK)
-    dist.broadcast(ctx_null_tensor, src=T5_RANK)
+    if T5_IMPL != "fast":
+        dist.broadcast(ctx_tensor, src=T5_RANK)
+        dist.broadcast(ctx_null_tensor, src=T5_RANK)
 
     if rank == 0:
         logger.info("Prompt encoded and broadcast")
