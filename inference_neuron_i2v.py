@@ -249,35 +249,58 @@ def main():
     init_sp_group(tp_degree=TP_DEGREE)
     tp_rank = get_tp_rank()
 
-    if rank == 0:
+    # FAST_DIT=1: models/fast_dit.py -- both experts resident on device, every DiT unit
+    # torch.compile(fullgraph=True), TP all-reduces in-graph, batched CFG. Needs SP=1.
+    FAST_DIT = os.environ.get("FAST_DIT", "0") == "1"
+    if FAST_DIT:
+        assert SP_DEGREE == 1 and TP_DEGREE == world_size, "FAST_DIT needs SP_DEGREE=1, TP_DEGREE=world size"
+        from models.fast_dit import FastWanDiT
+        grid = (T_latent, lat_h // 2, lat_w // 2)
+        fast = {}
+        for name, sub, g in (("high", config.high_noise_checkpoint, config.sample_guide_scale[1]),
+                             ("low", config.low_noise_checkpoint, config.sample_guide_scale[0])):
+            if rank == 0:
+                logger.info(f"[FAST_DIT] loading {name}_noise_model (resident)...")
+            m = WanModel.from_pretrained(MODEL_PATH, subfolder=sub)
+            m.eval().requires_grad_(False)
+            shard_model_tp(m, tp_rank, TP_DEGREE)
+            m = m.to(torch.bfloat16).to(NEURON_DEVICE)
+            fast[name] = FastWanDiT(m, grid=grid, guide_scale=g, device=NEURON_DEVICE)
+            fast[name].set_context(ctx_tensor, ctx_null_tensor)
+        dist.barrier()
+        if rank == 0:
+            logger.info("[FAST_DIT] both experts resident, contexts set")
+
+    if rank == 0 and not FAST_DIT:
         logger.info(f"Loading high_noise_model (on device first — runs for t >= boundary)...")
-    high_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.high_noise_checkpoint)
-    high_noise_model.eval().requires_grad_(False)
-    shard_model_tp(high_noise_model, tp_rank, TP_DEGREE)
-    patch_model_for_sp(high_noise_model)
-    make_sp_forward(high_noise_model)
-    high_noise_model = high_noise_model.to(torch.bfloat16).to(NEURON_DEVICE)
+    if not FAST_DIT:
+        high_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.high_noise_checkpoint)
+        high_noise_model.eval().requires_grad_(False)
+        shard_model_tp(high_noise_model, tp_rank, TP_DEGREE)
+        patch_model_for_sp(high_noise_model)
+        make_sp_forward(high_noise_model)
+        high_noise_model = high_noise_model.to(torch.bfloat16).to(NEURON_DEVICE)
 
-    if rank == 0:
-        logger.info("Compiling high_noise_model...")
-    high_noise_model.patch_embedding = torch.compile(high_noise_model.patch_embedding, backend='neuron', dynamic=False)
-    high_noise_model.text_embedding = torch.compile(high_noise_model.text_embedding, backend='neuron', dynamic=False)
-    high_noise_model.head = torch.compile(high_noise_model.head, backend='neuron', dynamic=False)
-    for block in high_noise_model.blocks:
-        block.ffn = torch.compile(block.ffn, backend='neuron', dynamic=False)
+        if rank == 0:
+            logger.info("Compiling high_noise_model...")
+        high_noise_model.patch_embedding = torch.compile(high_noise_model.patch_embedding, backend='neuron', dynamic=False)
+        high_noise_model.text_embedding = torch.compile(high_noise_model.text_embedding, backend='neuron', dynamic=False)
+        high_noise_model.head = torch.compile(high_noise_model.head, backend='neuron', dynamic=False)
+        for block in high_noise_model.blocks:
+            block.ffn = torch.compile(block.ffn, backend='neuron', dynamic=False)
 
-    if rank == 0:
-        logger.info(f"Loading low_noise_model (stays on CPU until boundary)...")
-    low_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.low_noise_checkpoint)
-    low_noise_model.eval().requires_grad_(False)
-    shard_model_tp(low_noise_model, tp_rank, TP_DEGREE)
-    patch_model_for_sp(low_noise_model)
-    make_sp_forward(low_noise_model)
-    low_noise_model = low_noise_model.to(torch.bfloat16)
+        if rank == 0:
+            logger.info(f"Loading low_noise_model (stays on CPU until boundary)...")
+        low_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.low_noise_checkpoint)
+        low_noise_model.eval().requires_grad_(False)
+        shard_model_tp(low_noise_model, tp_rank, TP_DEGREE)
+        patch_model_for_sp(low_noise_model)
+        make_sp_forward(low_noise_model)
+        low_noise_model = low_noise_model.to(torch.bfloat16)
 
-    dist.barrier()
-    if rank == 0:
-        logger.info("DiT ready (high_noise on device, low_noise on CPU)")
+        dist.barrier()
+        if rank == 0:
+            logger.info("DiT ready (high_noise on device, low_noise on CPU)")
 
     if rank == 0:
         logger.info("-" * 70)
@@ -329,7 +352,9 @@ def main():
                 needed = 'low'
                 guide_scale = config.sample_guide_scale[0]
 
-            if needed != current_on_device:
+            if FAST_DIT:
+                noise_pred = fast[needed](latent, y_device, t.item())
+            elif needed != current_on_device:
                 if rank == 0:
                     logger.info(f"  Step {step_idx}: swapping to {needed}_noise_model")
                 if current_on_device == 'high':
@@ -341,19 +366,19 @@ def main():
                 current_on_device = needed
                 gc.collect()
 
-            model = high_noise_model if current_on_device == 'high' else low_noise_model
+            if not FAST_DIT:
+                model = high_noise_model if current_on_device == 'high' else low_noise_model
 
-            # Batched CFG: cond+uncond in ONE B=2 forward (shared latent/t/y,
-            # differ only in context). ~halves denoise vs two sequential forwards.
-            out = model(
-                [latent, latent], t=timestep, seq_len=seq_len,
-                context=[ctx_tensor[0], ctx_null_tensor[0]],
-                y=[y_device, y_device])
-            noise_pred_cond = out[0]
-            noise_pred_uncond = out[1]
+                # Batched CFG: cond+uncond in ONE B=2 forward (shared latent/t/y,
+                # differ only in context). ~halves denoise vs two sequential forwards.
+                out = model(
+                    [latent, latent], t=timestep, seq_len=seq_len,
+                    context=[ctx_tensor[0], ctx_null_tensor[0]],
+                    y=[y_device, y_device])
+                noise_pred_cond = out[0]
+                noise_pred_uncond = out[1]
 
-
-            noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
+                noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
 
             temp_x0 = sample_scheduler.step(
                 noise_pred.cpu().unsqueeze(0), t,
@@ -365,12 +390,13 @@ def main():
         if rank == 0:
             logger.info(f"{run_label} denoising: {denoise_time:.1f}s ({denoise_time/NUM_STEPS:.1f}s/step)")
 
-        # ── Free DiT for VAE decode ──
-        if current_on_device == 'high':
-            high_noise_model = high_noise_model.to('cpu')
-        else:
-            low_noise_model = low_noise_model.to('cpu')
-        gc.collect()
+        # ── Free DiT for VAE decode (FAST_DIT keeps both experts resident) ──
+        if not FAST_DIT:
+            if current_on_device == 'high':
+                high_noise_model = high_noise_model.to('cpu')
+            else:
+                low_noise_model = low_noise_model.to('cpu')
+            gc.collect()
 
         # ── Decode with VAE (TP across all VAE ranks) ──
         vae_start = time.time()

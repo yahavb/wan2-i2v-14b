@@ -134,7 +134,7 @@ def make_sp_self_attn_forward(self_attn):
         q_local = q[:, sp_start:sp_start + L_local]
 
         # Attention: Q shard against full K, V
-        if ATTN_IMPL != "legacy" and q_local.device.type == "neuron":
+        if ATTN_IMPL in ("cte", "constmax") and q_local.device.type == "neuron":
             out = attn_core(q_local, k, v)   # Lq = L/sp vs full K/V, no pad/mask
         elif use_nki and q_local.device.type == "neuron":
             out = _sp_nki_self_attention(q_local, k, v)

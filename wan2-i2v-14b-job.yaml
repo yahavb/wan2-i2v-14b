@@ -187,6 +187,8 @@ spec:
                   legacy)   cp kernels/self_attention.py kernels/cross_attention.py "$OUT/code/" || true ;;
                   cte)      cp "$(python3 -c 'import nkilib.core.attention.attention_cte as m; print(m.__file__)')" "$OUT/code/" || true ;;
                   constmax) cp kernels/nkilib/experimental/attention/{attention_const_max,ring_attention_const_max_fwd}.py "$OUT/code/" || true ;;
+                  fast)     cp models/fast_dit.py "$OUT/code/" || true
+                            cp "$(python3 -c 'import nkilib.core.attention.attention_cte as m; print(m.__file__)')" "$OUT/code/" || true ;;
                 esac
                 tar -czf "$LOCAL_RESULTS/dit_pairs_$TAG.tar.gz" -C "$LOCAL_RESULTS" "dit_pairs_$TAG" 2>/dev/null \
                   && echo "  dit_pairs_$TAG.tar.gz: $(du -h "$LOCAL_RESULTS/dit_pairs_$TAG.tar.gz" | cut -f1)" || echo "  dit_pairs tar failed"
@@ -317,9 +319,9 @@ spec:
             - name: NEURON_CC_FLAGS
               value: "--model-type=transformer"
             - name: TP_DEGREE
-              value: "4"
+              value: "8"
             - name: SP_DEGREE
-              value: "2"
+              value: "1"
             - name: T5_RANK
               value: "0"
             - name: VAE_TP_DEGREE
@@ -327,7 +329,11 @@ spec:
             - name: USE_NKI_KERNELS
               value: "1"
             - name: ATTN_IMPLS
-              value: "cte"
+              value: "fast"
+            - name: FAST_DIT
+              value: "1"
+            - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
+              value: "134217728"
             - name: DEEP_PROFILE
               value: "0"
             - name: OUT_H

@@ -51,7 +51,8 @@ if USE_NKI_KERNELS:
 # A requested non-legacy impl that fails to load is a HARD error, so a run can
 # never report a speedup for a kernel that did not actually run.
 ATTN_IMPL = os.environ.get("ATTN_IMPL", "legacy")
-assert ATTN_IMPL in ("legacy", "cte", "constmax"), f"unknown ATTN_IMPL={ATTN_IMPL}"
+# "fast": models/fast_dit.py owns attention (FAST_DIT=1); nothing to load here.
+assert ATTN_IMPL in ("legacy", "cte", "constmax", "fast"), f"unknown ATTN_IMPL={ATTN_IMPL}"
 _attn_core_kernel = None
 ATTN_CORE_LNC = None
 
@@ -85,7 +86,7 @@ elif ATTN_IMPL == "constmax":
     from kernels.nkilib.experimental.attention.ring_attention_const_max_fwd import (
         ring_attention_const_max_fwd)
     _attn_core_kernel, ATTN_CORE_LNC = _wrap_lnc(ring_attention_const_max_fwd)
-if ATTN_IMPL != "legacy":
+if ATTN_IMPL in ("cte", "constmax"):
     print(f"[attention.py] ATTN_IMPL={ATTN_IMPL}: LOADED (lnc={ATTN_CORE_LNC})")
 
 
@@ -219,7 +220,7 @@ def attention(
     """
     # Try NKI kernels first (Neuron device)
     if q.device.type == "neuron":
-        if ATTN_IMPL != "legacy":
+        if ATTN_IMPL in ("cte", "constmax"):
             return attn_core(q, k, v)
         if is_cross_attn and _NKI_CROSS_AVAILABLE:
             return _nki_cross_attention(q, k, v, dtype=dtype)
