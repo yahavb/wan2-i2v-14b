@@ -14,7 +14,8 @@ import sys
 
 def main():
     root, impl = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else "?")
-    dirs = sorted(glob.glob(os.path.join(root, "*attn_kernel*")))
+    dirs = sorted(glob.glob(os.path.join(root, "*_attn_kernel_*")) +
+                  glob.glob(os.path.join(root, "*_nki_kernel_*")))
     if not dirs:
         print(f"ATTN_KERNEL [{impl}] none captured under {root}")
         return 0
