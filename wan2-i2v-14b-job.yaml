@@ -27,7 +27,7 @@ spec:
               set -euo pipefail
 
               cd /tmp
-              BRANCH=exp/480p-channelvae
+              BRANCH=exp/staging-attn
               git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-i2v-14b.git wan2-i2v-14b
               cd wan2-i2v-14b
 
@@ -53,8 +53,9 @@ spec:
 
               # torch.compile(backend='neuron') writes NEFFs to this cache. Pin it
               # so the per-NEFF capture loop knows exactly where to look.
-              export NEURON_COMPILE_CACHE_URL=/var/tmp/neuron-compile-cache
-              mkdir -p /var/tmp/neuron-compile-cache /tmp/neff_cache
+              # One cache PER ATTN_IMPL (set in the stage loop) so each stage's DiT
+              # profile only ever sees that stage's NEFFs.
+              NEFF_CACHE=/var/tmp/neuron-compile-cache
 
               REFERENCE_LINE="(none — clean median is the baseline)"
 
@@ -73,6 +74,10 @@ spec:
               NKI_STATUS=$(python3 -c 'import wan.modules.attention as a; print("self="+str(a._NKI_SELF_AVAILABLE), "cross="+str(a._NKI_CROSS_AVAILABLE), "SEQLEN_MULT="+str(a.SELF_ATTN_SEQLEN_MULTIPLE))' 2>&1 | tr '\n' ' ')
               echo "PROVENANCE NKI: $NKI_STATUS"
               echo "nki=$NKI_STATUS" >> "$LOCAL_RESULTS/provenance.txt"
+              # attention_cte (ATTN_IMPL=cte) comes from the image's nkilib package.
+              NKILIB_STATUS=$(python3 -c 'import nkilib.core.attention.attention_cte as m; print("nkilib attention_cte: OK", m.__file__)' 2>&1 | tail -1)
+              echo "PROVENANCE $NKILIB_STATUS"
+              echo "ATTN_IMPLS=$ATTN_IMPLS  $NKILIB_STATUS" >> "$LOCAL_RESULTS/provenance.txt"
 
               export WAN_DIR=/tmp/wan2-i2v-14b
               export MODEL_PATH=/tmp/Wan2.2-I2V-A14B
@@ -88,7 +93,7 @@ spec:
               # median (in seconds) of all "total=<N>s" lines in a log
               # median of "<key>=<N>s" over the per-run DONE lines only ($1=log $2=key)
               median_key() {
-                { grep "DONE:" "$1" | grep -oE "$2=[0-9.]+s" | grep -oE "[0-9.]+" || true; } | sort -n | \
+                { grep "DONE:" "$1" 2>/dev/null | grep -oE "$2=[0-9.]+s" | grep -oE "[0-9.]+" || true; } | sort -n | \
                   awk '{a[NR]=$1} END{ if(NR==0){print "N/A"} else if(NR%2){print a[(NR+1)/2]} else {printf "%.2f", (a[NR/2]+a[NR/2+1])/2} }'
               }
               median_total_s() {
@@ -116,7 +121,7 @@ spec:
               run_explorer() {
                 local POUT=/tmp/perneff_prof; rm -rf "$POUT"; mkdir -p "$POUT"
                 # auto-detect NEFFs from torch.compile cache AND /tmp/neff_cache
-                mapfile -t NEFFS < <(find /var/tmp/neuron-compile-cache /tmp/neff_cache -name "*.neff" 2>/dev/null | sort -u)
+                mapfile -t NEFFS < <(find "$NEFF_CACHE" -name "*.neff" 2>/dev/null | sort -u)
                 local TOTAL=${#NEFFS[@]}
                 echo "NEFFs found: $TOTAL"
                 echo "(step [4] captures+views each NEFF — this is the SLOW part, ~minutes; progress every 25)"
@@ -135,8 +140,8 @@ spec:
                 echo "captured+viewed OK: $OK / $TOTAL"
                 python3 scripts/neuron/profile_all_neffs.py "$POUT" 2>&1 | tee "$LOCAL_RESULTS/perneff_breakdown.txt" || echo "aggregation failed"
                 local BIGHASH BIGNEFF
-                BIGHASH=$(python3 scripts/neuron/pick_neffs.py "$POUT" /var/tmp/neuron-compile-cache | head -1)
-                BIGNEFF=$(find /var/tmp/neuron-compile-cache /tmp/neff_cache -name "${BIGHASH}.neff" 2>/dev/null | head -1)
+                BIGHASH=$(python3 scripts/neuron/pick_neffs.py "$POUT" "$NEFF_CACHE" | head -1)
+                BIGNEFF=$(find "$NEFF_CACHE" -name "${BIGHASH}.neff" 2>/dev/null | head -1)
                 neff_hotspots "$BIGNEFF" "$POUT/${BIGHASH}.ntff" "$LOCAL_RESULTS/hotspots_${BIGHASH}.txt"
 
                 # ─── PRESERVE heavy NEFF+NTFF pairs for instruction-level (SQL) query ───
@@ -146,7 +151,7 @@ spec:
                 local kept=0
                 while read -r h; do
                   [ -n "$h" ] || continue
-                  local nf; nf=$(find /var/tmp/neuron-compile-cache /tmp/neff_cache -name "${h}.neff" 2>/dev/null | head -1)
+                  local nf; nf=$(find "$NEFF_CACHE" -name "${h}.neff" 2>/dev/null | head -1)
                   if [ -n "$nf" ] && [ -f "$POUT/${h}.ntff" ]; then
                     cp "$nf" "$PAIRS/${h}.neff" && cp "$POUT/${h}.ntff" "$PAIRS/${h}.ntff" && kept=$((kept+1))
                   fi
@@ -164,10 +169,10 @@ spec:
               # hangs in the bootstrap); NEVER --single-io / --profile-nth-exec here.
               # Every command is guarded: set -e must not throw away a captured pair.
               capture_dit_pairs() {
-                local OUT="$LOCAL_RESULTS/dit_pairs"; rm -rf "$OUT"; mkdir -p "$OUT"
+                local TAG="$1" OUT="$LOCAL_RESULTS/dit_pairs_$1"; rm -rf "$OUT"; mkdir -p "$OUT"
                 # DiT token count before padding: T_lat * (H/8/2) * (W/8/2)
                 local SEQ=$(( ((FRAME_NUM - 1) / 4 + 1) * (OUT_H / 16) * (OUT_W / 16) ))
-                local PICK=(scripts/neuron/pick_dit_neffs.py /var/tmp/neuron-compile-cache /tmp/neff_cache --seq "$SEQ")
+                local PICK=(scripts/neuron/pick_dit_neffs.py "$NEFF_CACHE" --seq "$SEQ")
                 python3 "${PICK[@]}" 2>&1 | tee "$OUT/dit_neff_identify.txt" || true
                 local n=0 other=0 role ws neff
                 while IFS=$'\t' read -r role ws neff; do
@@ -206,10 +211,10 @@ spec:
                   fi
                 done < <(python3 "${PICK[@]}" --print-paths 2>/dev/null || true)
                 echo "  DiT pairs with ntff: $(find "$OUT" -name '*.ntff' | wc -l) / $n"
-                tar -czf "$LOCAL_RESULTS/dit_pairs.tar.gz" -C "$LOCAL_RESULTS" dit_pairs 2>/dev/null \
-                  && echo "  dit_pairs.tar.gz: $(du -h "$LOCAL_RESULTS/dit_pairs.tar.gz" | cut -f1)" || echo "  dit_pairs tar failed"
-                cp "$LOCAL_RESULTS/dit_pairs.tar.gz" "$ARCHIVE_DIR/dit_pairs_$RUN_TS.tar.gz" 2>/dev/null \
-                  && echo "  archived -> $ARCHIVE_DIR/dit_pairs_$RUN_TS.tar.gz" || echo "  PVC copy skipped"
+                tar -czf "$LOCAL_RESULTS/dit_pairs_$TAG.tar.gz" -C "$LOCAL_RESULTS" "dit_pairs_$TAG" 2>/dev/null \
+                  && echo "  dit_pairs_$TAG.tar.gz: $(du -h "$LOCAL_RESULTS/dit_pairs_$TAG.tar.gz" | cut -f1)" || echo "  dit_pairs tar failed"
+                cp "$LOCAL_RESULTS/dit_pairs_$TAG.tar.gz" "$ARCHIVE_DIR/dit_pairs_${TAG}_$RUN_TS.tar.gz" 2>/dev/null \
+                  && echo "  archived -> $ARCHIVE_DIR/dit_pairs_${TAG}_$RUN_TS.tar.gz" || echo "  PVC copy skipped"
               }
 
               echo "════════════ NEURON 3-RUN BENCHMARK (Wan2.2-I2V-A14B) ════════════"
@@ -217,25 +222,47 @@ spec:
               echo "  TP=${TP_DEGREE} SP=${SP_DEGREE} world=${WORLD_SIZE} frames=${FRAME_NUM} steps=${NUM_STEPS} size=${OUT_H}x${OUT_W} batched-CFG"
               echo "=================================================================="
 
-              echo "=== [1/3] WARMUP (compile-if-cold / populate NEFF cache; NOT timed) ==="
-              # PAD_DEBUG=1 logs each distinct big copy/pad tensor's shape+bytes ONCE,
-              # so we can match a trace's "moved=NNN MB" pad to the exact source line.
-              # Warmup only — silent in the timed runs.
-              PAD_DEBUG=1 run_wan "$LOCAL_RESULTS/warmup.txt" 1 | grep -iE "Compiling|total=|FAILED|Error|\[SP\]|\[PAD_DEBUG\]|SP degree|TP degree|World size|Initialized" || echo "(warmup output captured)"
-              echo "=== SP/TP PROOF + PAD_DEBUG shapes (from warmup.txt) ==="
-              grep -iE "\[SP\]|\[PAD_DEBUG\]|SP degree|TP degree|World size|Patched .* blocks" "$LOCAL_RESULTS/warmup.txt" | sort -u | head -20
-              echo "NEFFs in cache after warmup: $(find /var/tmp/neuron-compile-cache /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)"
+              # ─── result_line $1=impl: the RESULT numbers for one stage (clean-run medians) ───
+              result_line() {
+                local C="$LOCAL_RESULTS/clean_$1.txt" ENC DEN DEC TOT SPS
+                ENC=$(median_key "$C" encode); DEN=$(median_key "$C" denoise)
+                DEC=$(median_key "$C" vae);    TOT=$(median_key "$C" total)
+                SPS=$(awk -v d="$DEN" -v n="$NUM_STEPS" 'BEGIN{ if(d=="N/A"){print "N/A"} else printf "%.2f", d/n }')
+                echo "RESULT [$1] ${OUT_H}x${OUT_W} ${FRAME_NUM}f ${NUM_STEPS}steps: denoise=${DEN}s  s/step=${SPS}  vae_encode=${ENC}s  vae_decode+output=${DEC}s  total=${TOT}s"
+              }
 
-              echo "=== [1b] DiT NEFF+NTFF PAIRS (profiler capture; captured first so it survives later failures) ==="
-              capture_dit_pairs
+              # ═══ STAGES: same spec, one attention implementation each (ATTN_IMPLS) ═══
+              #   legacy -> cte -> constmax  ==  ours -> staging attention_cte -> staging const-max
+              # Each stage: warmup (compile into its OWN cache) -> DiT pairs -> 3 clean runs.
+              LAST_IMPL=""
+              for IMPL in $ATTN_IMPLS; do
+                export ATTN_IMPL="$IMPL"
+                NEFF_CACHE=/var/tmp/neuron-compile-cache-$IMPL; mkdir -p "$NEFF_CACHE"
+                export NEURON_COMPILE_CACHE_URL="$NEFF_CACHE"
+                echo "████ STAGE ATTN_IMPL=$IMPL (cache $NEFF_CACHE) ████"
 
-              echo "=== [2/3] CLEAN RUN (NO profiler) — median total = REAL LATENCY ==="
-              run_wan "$LOCAL_RESULTS/clean.txt" 3 | grep -iE "denoise=|vae=|total=|FAILED" || echo "CLEAN RUN FAILED"
-              T_CLEAN=$(median_total_s "$LOCAL_RESULTS/clean.txt")
-              # The accuracy-gate video: from the CLEAN run (no profiler).
-              cp /tmp/wan2_i2v_output.mp4 "$LOCAL_RESULTS/wan2_i2v_output_clean.mp4" 2>/dev/null \
-                && echo "clean video saved" || echo "NO VIDEO FROM CLEAN RUN"
+                echo "=== [1/3 $IMPL] WARMUP (compile into this stage's cache; NOT timed) ==="
+                PAD_DEBUG=1 run_wan "$LOCAL_RESULTS/warmup_$IMPL.txt" 1 | grep -iE "ATTN_IMPL|kernel: |Compiling|total=|FAILED|Error|Traceback|\[SP\]|SP degree|TP degree|World size" || echo "(warmup output captured)"
+                echo "NEFFs in cache after warmup: $(find "$NEFF_CACHE" -name '*.neff' 2>/dev/null | wc -l)"
 
+                echo "=== [1b $IMPL] DiT NEFF+NTFF PAIRS ==="
+                capture_dit_pairs "$IMPL"
+                python3 scripts/neuron/attn_kernel_report.py "$LOCAL_RESULTS/dit_pairs_$IMPL" "$IMPL" \
+                  2>&1 | tee "$LOCAL_RESULTS/attn_kernel_$IMPL.txt" || true
+
+                echo "=== [2/3 $IMPL] CLEAN RUN (NO profiler) — median total = REAL LATENCY ==="
+                run_wan "$LOCAL_RESULTS/clean_$IMPL.txt" 3 | grep -iE "denoise=|vae=|total=|FAILED" || echo "CLEAN RUN FAILED"
+                # The accuracy-gate video for this stage: from its CLEAN run (no profiler).
+                cp /tmp/wan2_i2v_output.mp4 "$LOCAL_RESULTS/wan2_i2v_output_clean_$IMPL.mp4" 2>/dev/null \
+                  && echo "clean video saved: wan2_i2v_output_clean_$IMPL.mp4" || echo "NO VIDEO FROM CLEAN RUN"
+                rm -f /tmp/wan2_i2v_output.mp4
+                result_line "$IMPL" | tee -a "$LOCAL_RESULTS/results.txt"
+                LAST_IMPL="$IMPL"
+              done
+              T_CLEAN=$(median_total_s "$LOCAL_RESULTS/clean_$LAST_IMPL.txt")
+
+              # The deep-profile steps below run once, on the LAST stage (its cache).
+              echo "████ DEEP PROFILE on ATTN_IMPL=$LAST_IMPL ████"
               echo "=== [3/3] PROFILED RUN (NEURON_RT_INSPECT_ENABLE=1 — overhead delta) ==="
               NEURON_RT_INSPECT_ENABLE=1 run_wan "$LOCAL_RESULTS/profiled.txt" 3 | grep -iE "denoise=|vae=|total=|FAILED" || echo "PROFILED RUN FAILED"
               T_PROF=$(median_total_s "$LOCAL_RESULTS/profiled.txt")
@@ -275,8 +302,10 @@ spec:
               tar -czf "$ARCHIVE" -C /tmp results 2>/dev/null || true
               cp "$ARCHIVE" "$ARCHIVE_DIR/" 2>/dev/null && echo "Saved: $ARCHIVE_DIR/$(basename "$ARCHIVE")" || echo "persist skipped"
               echo "╔══════════════════ kubectl cp (from your laptop) ══════════════════╗"
-              echo "  kubectl cp default/$HOSTNAME:/tmp/results/dit_pairs.tar.gz ./dit_pairs.tar.gz"
-              echo "  kubectl cp default/$HOSTNAME:/tmp/results/wan2_i2v_output_clean.mp4 ./wan2_i2v_output_clean.mp4"
+              for IMPL in $ATTN_IMPLS; do
+                echo "  kubectl cp default/$HOSTNAME:/tmp/results/dit_pairs_$IMPL.tar.gz ./dit_pairs_$IMPL.tar.gz"
+                echo "  kubectl cp default/$HOSTNAME:/tmp/results/wan2_i2v_output_clean_$IMPL.mp4 ./wan2_i2v_output_clean_$IMPL.mp4"
+              done
               echo "  kubectl cp default/$HOSTNAME:$ARCHIVE ./$(basename "$ARCHIVE")   # everything"
               find "$LOCAL_RESULTS" -maxdepth 2 -type f 2>/dev/null | sed 's/^/    /' | head -40
               echo "╚════════════════════════════════════════════════════════════════════╝"
@@ -296,13 +325,11 @@ spec:
               # 10 days. Data is also on the PVC as tar.gz; this is for kubectl cp.
               echo "Pod stays alive 10 days for kubectl cp. Results: $LOCAL_RESULTS"
 
-              # ─── LAST LOG LINE: clean-run medians (no profiler) ───
-              ENC=$(median_key "$LOCAL_RESULTS/clean.txt" encode)
-              DEN=$(median_key "$LOCAL_RESULTS/clean.txt" denoise)
-              DEC=$(median_key "$LOCAL_RESULTS/clean.txt" vae)
-              TOT=$(median_key "$LOCAL_RESULTS/clean.txt" total)
-              SPS=$(awk -v d="$DEN" -v n="$NUM_STEPS" 'BEGIN{ if(d=="N/A"){print "N/A"} else printf "%.2f", d/n }')
-              echo "RESULT ${OUT_H}x${OUT_W} ${FRAME_NUM}f ${NUM_STEPS}steps: denoise=${DEN}s  s/step=${SPS}  vae_encode=${ENC}s  vae_decode+output=${DEC}s  total=${TOT}s"
+              # ─── PROGRESSION: attention kernel profile + RESULT per stage ───
+              echo "════════ ATTENTION PROGRESSION (same spec, same node) ════════"
+              cat "$LOCAL_RESULTS"/attn_kernel_*.txt 2>/dev/null || true
+              # LAST LOG LINES: one RESULT per stage, in stage order (last = final stage).
+              for IMPL in $ATTN_IMPLS; do result_line "$IMPL"; done
               sleep 864000
           resources:
             claims:
@@ -339,6 +366,8 @@ spec:
               value: "2"
             - name: USE_NKI_KERNELS
               value: "1"
+            - name: ATTN_IMPLS
+              value: "legacy cte constmax"
             - name: OUT_H
               value: "368"
             - name: OUT_W

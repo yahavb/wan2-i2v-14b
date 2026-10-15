@@ -8,8 +8,9 @@ attention run eagerly through the NKI kernels. So the DiT is a SET of NEFFs,
 and we identify each one by the tensor shapes in its IO signature
 (NeffInfo metadata -- never `strings | grep`, NEFFs are binary):
 
-  attn_kernel: the embedded HLO debug text names an NKI attention kernel
-               (wan_flash_self_attn / wan_cross_attn). Shapes can't find these:
+  attn_kernel: the embedded HLO debug text names an NKI attention kernel, OR a
+               custom-call with matmul work whose IO has the attention layout below
+               (the kernel name usually does not survive into the HLO text). Shapes can't find these:
                activations are flattened to 2-D (B, numel) in the signature.
   attn_path  : the ops AROUND the kernel in self/cross attention (q/k/v/o proj,
                qk-norm, RoPE, permute/contiguous, Q/K/V pad, output slice/cat).
@@ -69,7 +70,8 @@ def attn_tokens(seq, sp, tp, ctx):
     local = full // sp
     return {seq, full, local, ceil_to(local, Q_TILE), ceil_to(full, K_SECTION),
             ctx, ceil_to(ctx, Q_TILE)}
-KERNEL_NAMES = ("wan_flash_self_attn", "wan_cross_attn")
+KERNEL_NAMES = ("wan_flash_self_attn", "wan_cross_attn", "attention_cte",
+                "ring_attention_const_max_fwd", "attention_const_max")
 
 
 def neff_contents(path):
@@ -127,8 +129,9 @@ def probe(path, tp, tokens):
 
     text, macs = neff_contents(path)
     kernel = next((k for k in KERNEL_NAMES if k in text), None)
-    if kernel:
-        role = "attn_kernel"
+    on_attn_path = head_layout or attn_rows or attn_weight
+    if kernel or ("custom-call(" in text and macs > 0 and on_attn_path):
+        role = "attn_kernel"   # the attention core, whichever ATTN_IMPL compiled it
     elif head_layout or attn_rows or attn_weight:
         role = "attn_path"
     elif has_cc and dit_rows:

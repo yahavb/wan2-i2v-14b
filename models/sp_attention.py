@@ -96,6 +96,7 @@ def make_sp_self_attn_forward(self_attn):
     world_size = sp_degree * tp_degree
     sp_rank = get_sp_rank()
     tp_rank = get_tp_rank()
+    from wan.modules.attention import ATTN_IMPL, attn_core
     use_nki = _NKI_SELF_AVAILABLE and os.environ.get("USE_NKI_KERNELS", "1") == "1"
 
     def forward(x, seq_lens, grid_sizes, freqs):
@@ -133,7 +134,9 @@ def make_sp_self_attn_forward(self_attn):
         q_local = q[:, sp_start:sp_start + L_local]
 
         # Attention: Q shard against full K, V
-        if use_nki and q_local.device.type == "neuron":
+        if ATTN_IMPL != "legacy" and q_local.device.type == "neuron":
+            out = attn_core(q_local, k, v)   # Lq = L/sp vs full K/V, no pad/mask
+        elif use_nki and q_local.device.type == "neuron":
             out = _sp_nki_self_attention(q_local, k, v)
         else:
             # Fallback: SDPA (works with different Q/K lengths)
