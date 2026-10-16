@@ -55,6 +55,18 @@ all-reduces of a [2, 4140, 5120] bf16 tensor (85 MB) across 8 ranks on 2 chips
 (self-attn O-proj, cross-attn O-proj, FFN down). Candidate fix: TP4 x CFG2 (one CFG half
 per chip, all-reduces half the size and intra-chip).
 
+## torch.compile scope ladder (`exp/compile-scope` @ `0d435e0`, details in `docs/torch_compile_scope.md`)
+
+| Step | Attention | Scope | fullgraph | Denoise | Total |
+|---|---|---|---|---|---|
+| 1 | SDPA | block + 2 breaks (120 graphs/step) | False | 8.8 s | 9.6 s |
+| 2 | SDPA | 3 units per block (120 graphs/step) | True | 8.8 s | 9.7 s |
+| 3 | SDPA | block (40 graphs/step) | True | 8.4 s | 9.3 s |
+| 4 | SDPA | whole model (1 graph/step) | True | 8.5 s | 9.4 s |
+| 5 | legacy NKI, in-graph | block | True | 16.9 s | 17.8 s |
+| 6 | `attention_cte` | block | True | 6.3 s | 7.2 s |
+| 7 | cte + o_proj + adaln | block | True | 5.8 s | 6.7 s |
+
 ## Attention kernel alone (eager DiT, per call)
 
 | Kernel | Time per call | Calls per block per step | MFU | HBM read / write |

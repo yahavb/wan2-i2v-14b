@@ -215,20 +215,20 @@ spec:
               for IMPL in $ATTN_IMPLS; do
                 export ATTN_IMPL="$IMPL"
                 case "$IMPL" in fast_*)
-                  F="${IMPL#fast_}"; export ATTN_IMPL=fast FAST_ATTN_IMPL="${F%%+*}"
+                  F="${IMPL#fast_}"; export ATTN_IMPL=fast FAST_ATTN_IMPL="${F%%-*}"
                   export FAST_MLP=0 FAST_OPROJ=0 FAST_ADALN=0
-                  case "$IMPL" in *+mlp*) export FAST_MLP=1 ;; esac
-                  case "$IMPL" in *+oproj*) export FAST_OPROJ=1 ;; esac
-                  case "$IMPL" in *+adaln*) export FAST_ADALN=1 ;; esac
+                  case "$IMPL" in *-mlp*) export FAST_MLP=1 ;; esac
+                  case "$IMPL" in *-oproj*) export FAST_OPROJ=1 ;; esac
+                  case "$IMPL" in *-adaln*) export FAST_ADALN=1 ;; esac
                   export VAE_IMPL=tp
-                  case "$IMPL" in *+vae*) export VAE_IMPL=static ;; esac
-                  case "$IMPL" in *+vaetile*) export VAE_IMPL=static_tiled ;; esac
+                  case "$IMPL" in *-vae*) export VAE_IMPL=static ;; esac
+                  case "$IMPL" in *-vaetile*) export VAE_IMPL=static_tiled ;; esac
                   export T5_IMPL=eager
-                  case "$IMPL" in *+t5*) export T5_IMPL=fast ;; esac
+                  case "$IMPL" in *-t5*) export T5_IMPL=fast ;; esac
                   export FAST_SCOPE=block
-                  case "$IMPL" in *+scope_breaks*) export FAST_SCOPE=block_breaks ;; esac
-                  case "$IMPL" in *+scope_sub*) export FAST_SCOPE=sublayer ;; esac
-                  case "$IMPL" in *+scope_model*) export FAST_SCOPE=model ;; esac
+                  case "$IMPL" in *-scope_breaks*) export FAST_SCOPE=block_breaks ;; esac
+                  case "$IMPL" in *-scope_sub*) export FAST_SCOPE=sublayer ;; esac
+                  case "$IMPL" in *-scope_model*) export FAST_SCOPE=model ;; esac
                   echo "  FAST_ATTN_IMPL=$FAST_ATTN_IMPL FAST_MLP=$FAST_MLP FAST_OPROJ=$FAST_OPROJ FAST_ADALN=$FAST_ADALN VAE_IMPL=$VAE_IMPL T5_IMPL=$T5_IMPL FAST_SCOPE=$FAST_SCOPE" ;;
                 esac
                 mkdir -p $NEFF_DIRS
@@ -371,7 +371,7 @@ spec:
             - name: USE_NKI_KERNELS
               value: "1"
             - name: ATTN_IMPLS
-              value: "fast_sdpa+scope_breaks+vaetile+t5 fast_sdpa+scope_sub+vaetile+t5 fast_sdpa+vaetile+t5 fast_sdpa+scope_model+vaetile+t5 fast_legacy+vaetile+t5 fast_cte+vaetile+t5 fast_cte+oproj+adaln+vaetile+t5"
+              value: "fast_sdpa-scope_breaks-vaetile-t5 fast_sdpa-scope_sub-vaetile-t5 fast_sdpa-vaetile-t5 fast_sdpa-scope_model-vaetile-t5 fast_legacy-vaetile-t5 fast_cte-vaetile-t5 fast_cte-oproj-adaln-vaetile-t5"
             - name: SYSTRACE
               value: "1"
             - name: FAST_DIT

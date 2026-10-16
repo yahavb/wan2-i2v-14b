@@ -66,7 +66,7 @@ Steps 5-7: on the best scope, kernels are added.
 | Step | Attention | Other kernels | Compile scope | `fullgraph` | Graphs per denoise step |
 |---|---|---|---|---|---|
 | 1 | native `F.scaled_dot_product_attention` | none | sub-layer pieces, by explicit `graph_break()` (3 per block) | `False` | 120 |
-| 2 | native SDPA | none | sub-layer pieces, each its own compiled unit | `True` | 120 |
+| 2 | native SDPA | none | 3 compiled units per block: the self-attention sub-layer, the cross-attention sub-layer, the FFN | `True` | 120 |
 | 3 | native SDPA | none | one graph per transformer block | `True` | 40 |
 | 4 | native SDPA | none | all 40 blocks in one graph | `True` | 1 |
 | 5 | legacy NKI `wan_flash_self_attn` | none | block | `True` | 40 |
@@ -168,17 +168,33 @@ Three numbers read from each trace:
 
 Step time ≈ total NEFF time + total gap time; breaks raise both.
 
-## 5. Results (to fill in after the runs)
+## 5. Results (job on pod `wan2-i2v-14b-k6zcb`, branch `exp/compile-scope` @ `0d435e0`)
 
-| Step | Graphs/step (dynamo) | Break reasons | Warm-up compile | Graph NEFF time | Denoise | s/step | Total | Exec/step (trace) | Busy fraction | Median gap |
+Same node, one job, VAE (tiled) and UMT5 identical in every step. Denoise and total are
+medians of 3 clean runs. "Graph types" is dynamo's `unique_graphs`: distinct graphs
+compiled in the process (the 40 blocks share one graph), not launches per step.
+Warm-up denoise is the first denoise in a fresh cache and includes compiling.
+
+| Step | Attention | Scope | `fullgraph` | Graph types | Graph breaks | Warm-up denoise | Block NEFF | Denoise | s/step | Total |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 1 | | | | | | | | | | |
-| 2 | | | | | | | | | | |
-| 3 | | | | | | | | | | |
-| 4 | | | | | | | | | | |
-| 5 | | | | | | | | | | |
-| 6 | | | | | | | | | | |
-| 7 | | | | | | | | | | |
+| 1 | SDPA | block + 2 breaks | `False` | 12 | 2 (user-inserted) | 37.1 s | in traces | 8.8 s | 0.88 | 9.6 s |
+| 2 | SDPA | 3 units per block | `True` | 12 | 0 | 36.1 s | in traces | 8.8 s | 0.88 | 9.7 s |
+| 3 | SDPA | block | `True` | 10 | 0 | 45.4 s | in traces | 8.4 s | 0.84 | 9.3 s |
+| 4 | SDPA | whole model | `True` | 10 | 0 | 116.7 s | in traces | 8.5 s | 0.85 | 9.4 s |
+| 5 | legacy NKI (in-graph) | block | `True` | 10 | 0 | 163.5 s | 41.63 ms | 16.9 s | 1.69 | 17.8 s |
+| 6 | `attention_cte` | block | `True` | 10 | 0 | 52.1 s | 14.96 ms | 6.3 s | 0.63 | 7.2 s |
+| 7 | cte + o_proj + adaln | block | `True` | 10 | 0 | 39.1 s | 13.62 ms | 5.8 s | 0.58 | 6.7 s |
+
+What the numbers say:
+
+- 1 vs 2: same 120 boundaries, `fullgraph` False vs True: 8.8 s both. The flag does not
+  change speed; the boundaries do.
+- 2 vs 3: 120 -> 40 graphs per step: -0.4 s denoise (-5%).
+- 3 vs 4: 40 -> 1 graph: no gain (8.5 vs 8.4 s), and warm-up denoise (compile) 45 s -> 117 s.
+- 3 vs 5 vs 6 (same block scope): native SDPA 8.4 s, our hand-written NKI kernel 16.9 s
+  (2x slower than native), nkilib `attention_cte` 6.3 s. The kernel choice is worth up to
+  2.7x; the scope about 5%.
+- 6 vs 7: o_proj + adaln kernels, -0.5 s.
 
 ## 6. System traces (Neuron Explorer screenshots, to add)
 
