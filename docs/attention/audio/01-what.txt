@@ -1,0 +1,3 @@
+Section one. What this attention is.
+Self-attention is the step inside each of the DiT's forty transformer blocks where every video token, four thousand one hundred forty of them, looks at every other token and decides what to take from it.
+It runs forty blocks, times ten denoising steps, for both halves of classifier-free guidance. So it is the most expensive operation in denoising, and a faster attention kernel directly shortens the time to generate the video.

@@ -107,7 +107,30 @@ def main():
     ctx_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
     ctx_null_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
 
-    if rank == T5_RANK:
+    # T5_IMPL=fast: models/fast_t5.py -- UMT5 TP over all ranks, fullgraph per block.
+    T5_IMPL = os.environ.get("T5_IMPL", "eager")
+    if T5_IMPL == "fast":
+        from models.fast_t5 import FastT5
+        te = T5EncoderModel(
+            text_len=config.text_len, dtype=config.t5_dtype, device=torch.device('cpu'),
+            checkpoint_path=os.path.join(MODEL_PATH, config.t5_checkpoint),
+            tokenizer_path=os.path.join(MODEL_PATH, config.t5_tokenizer))
+        ft5 = FastT5(te, NEURON_DEVICE)
+        del te
+        gc.collect()
+        ctx = ft5.encode([prompt, n_prompt])            # warm (compile / NEFF load)
+        dist.barrier()
+        t0 = time.time()
+        ctx = ft5.encode([prompt, n_prompt])
+        ctx[0:1].sum().item()
+        dist.barrier()
+        if rank == 0:
+            logger.info(f"[T5_IMPL=fast] text_encode={time.time() - t0:.3f}s")
+        ctx_tensor.copy_(ctx[0:1])
+        ctx_null_tensor.copy_(ctx[1:2])
+        del ft5, ctx
+        gc.collect()
+    elif rank == T5_RANK:
         logger.info("Loading T5...")
         text_encoder = T5EncoderModel(
             text_len=config.text_len,
@@ -118,14 +141,20 @@ def main():
         text_encoder.model = text_encoder.model.to(NEURON_DEVICE)
         context = text_encoder([prompt], NEURON_DEVICE)
         context_null = text_encoder([n_prompt], NEURON_DEVICE)
+        t0 = time.time()
+        context = text_encoder([prompt], NEURON_DEVICE)
+        context_null = text_encoder([n_prompt], NEURON_DEVICE)
+        context_null[0].sum().item()
+        logger.info(f"[T5_IMPL=eager] text_encode={time.time() - t0:.3f}s")
         ctx_tensor[0, :context[0].shape[0]] = context[0].to(torch.bfloat16)
         ctx_null_tensor[0, :context_null[0].shape[0]] = context_null[0].to(torch.bfloat16)
         del text_encoder, context, context_null
         gc.collect()
         logger.info("T5 encoded and freed")
 
-    dist.broadcast(ctx_tensor, src=T5_RANK)
-    dist.broadcast(ctx_null_tensor, src=T5_RANK)
+    if T5_IMPL != "fast":
+        dist.broadcast(ctx_tensor, src=T5_RANK)
+        dist.broadcast(ctx_null_tensor, src=T5_RANK)
 
     if rank == 0:
         logger.info("Prompt encoded and broadcast")
@@ -146,14 +175,22 @@ def main():
     vae_stride = config.vae_stride  # (4, 8, 8)
     patch_size = config.patch_size  # (1, 2, 2)
     frame_num = FRAME_NUM
-    max_area = 320 * 576
+    max_area = 832 * 480  # 480p output
 
     ih, iw = img.height, img.width
     aspect_ratio = ih / iw
-    lat_h = round(
-        np.sqrt(max_area * aspect_ratio) // vae_stride[1] // patch_size[1] * patch_size[1])
-    lat_w = round(
-        np.sqrt(max_area / aspect_ratio) // vae_stride[2] // patch_size[2] * patch_size[2])
+    # OUT_H/OUT_W pin the output size exactly (must be multiples of 16);
+    # otherwise derive it from max_area and the input aspect ratio.
+    OUT_H, OUT_W = int(os.environ.get("OUT_H", "0")), int(os.environ.get("OUT_W", "0"))
+    if OUT_H and OUT_W:
+        mult = vae_stride[1] * patch_size[1]
+        assert OUT_H % mult == 0 and OUT_W % mult == 0, f"OUT_H/OUT_W must be multiples of {mult}"
+        lat_h, lat_w = OUT_H // vae_stride[1], OUT_W // vae_stride[2]
+    else:
+        lat_h = round(
+            np.sqrt(max_area * aspect_ratio) // vae_stride[1] // patch_size[1] * patch_size[1])
+        lat_w = round(
+            np.sqrt(max_area / aspect_ratio) // vae_stride[2] // patch_size[2] * patch_size[2])
     oh = lat_h * vae_stride[1]
     ow = lat_w * vae_stride[2]
 
@@ -187,10 +224,15 @@ def main():
     msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
     msk = msk.transpose(1, 2)[0]
 
-    VAE_TP_DEGREE = int(os.environ.get("VAE_TP_DEGREE", "8"))
+    # VAE_IMPL=static: models/vae_static21.py -- fullgraph encode/decode on rank 0, whole
+    # frame, no channel TP (in-graph nkilib conv3d + attention_cte); y is broadcast.
+    VAE_IMPL = os.environ.get("VAE_IMPL", "tp")
+    # VAE_IMPL=static_tiled: same graphs on EVERY rank; decode is spatial patch-parallel
+    # (one fixed-size latent tile per rank, all-gathered and cross-faded on rank 0);
+    # encode runs whole-frame on every rank (identical y, no broadcast).
+    VAE_TP_DEGREE = (1 if VAE_IMPL == "static" else world_size if VAE_IMPL == "static_tiled"
+                     else int(os.environ.get("VAE_TP_DEGREE", "8")))
     VAE_TP_RANKS = list(range(VAE_TP_DEGREE))
-
-    y_device = torch.zeros((z_dim + 4, T_latent, lat_h, lat_w), dtype=torch.bfloat16, device=NEURON_DEVICE)
 
     # Load VAE on all VAE TP ranks, shard decoder
     if rank in VAE_TP_RANKS:
@@ -204,66 +246,102 @@ def main():
         vae.std = vae.std.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
         vae.scale = [vae.mean, 1.0 / vae.std]
 
-        # Create VAE TP group and shard decoder
-        create_vae_tp_group(VAE_TP_RANKS)
-        vae_tp_rank = VAE_TP_RANKS.index(rank)
-        shard_vae_model_tp(vae.model, vae_tp_rank, VAE_TP_DEGREE)
-        if rank == 0:
-            logger.info(f"VAE TP={VAE_TP_DEGREE} sharded on all ranks")
+        if VAE_IMPL in ("static", "static_tiled"):
+            from models.vae_static21 import StaticWanVAE
+            vae = StaticWanVAE(vae)
+            logger.info("VAE_IMPL=static: fullgraph encode/decode on rank 0")
+        else:
+            # Create VAE TP group and shard decoder
+            create_vae_tp_group(VAE_TP_RANKS)
+            vae_tp_rank = VAE_TP_RANKS.index(rank)
+            shard_vae_model_tp(vae.model, vae_tp_rank, VAE_TP_DEGREE)
+            if rank == 0:
+                logger.info(f"VAE TP={VAE_TP_DEGREE} sharded on all ranks")
 
-        # Encode image (encoder is replicated, all ranks get same result)
-        img_for_vae = torch.nn.functional.interpolate(
-            img_tensor[None], size=(oh, ow), mode='bicubic').transpose(0, 1)
-        img_seq = torch.cat([img_for_vae, torch.zeros(3, F - 1, oh, ow)], dim=1)
-        z = vae.encode([img_seq.to(device=NEURON_DEVICE, dtype=torch.bfloat16)])
-        z_result = z[0].to(torch.bfloat16)
-        msk_device = msk.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
-        y_device = torch.cat([msk_device, z_result], dim=0)
-        if rank == 0:
-            logger.info(f"VAE encode done: y shape = {y_device.shape}")
-        del z, z_result, img_seq, img_for_vae
-        gc.collect()
     else:
         vae = None
 
-    # Broadcast y to any ranks not in VAE TP group (if VAE_TP_DEGREE < TP_DEGREE)
-    if VAE_TP_DEGREE < TP_DEGREE:
-        dist.broadcast(y_device, src=VAE_RANK)
+    def encode_image():
+        """VAE-encode the conditioning image -> y (encoder replicated on VAE ranks),
+        broadcast to the other ranks. Called once here (warms the NEFFs) and again,
+        timed, at the start of every run."""
+        y = torch.zeros((z_dim + 4, T_latent, lat_h, lat_w), dtype=torch.bfloat16, device=NEURON_DEVICE)
+        if rank in VAE_TP_RANKS:
+            img_for_vae = torch.nn.functional.interpolate(
+                img_tensor[None], size=(oh, ow), mode='bicubic').transpose(0, 1)
+            img_seq = torch.cat([img_for_vae, torch.zeros(3, F - 1, oh, ow)], dim=1)
+            z = vae.encode([img_seq.to(device=NEURON_DEVICE, dtype=torch.bfloat16)])
+            msk_device = msk.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
+            y = torch.cat([msk_device, z[0].to(torch.bfloat16)], dim=0)
+            del z, img_seq, img_for_vae
+        # Broadcast y to any ranks not in VAE TP group (if VAE_TP_DEGREE < TP_DEGREE)
+        if VAE_TP_DEGREE < TP_DEGREE:
+            dist.broadcast(y, src=VAE_RANK)
+        y[0, 0, 0, 0].item()  # force execution so the encode timing is real
+        return y
+
+    y_device = encode_image()
+    if rank == 0:
+        logger.info(f"VAE encode done: y shape = {y_device.shape}")
+    gc.collect()
 
     # ── Load DiT models with TP + SP sharding ──
     init_tp_group(tp_degree=TP_DEGREE)
     init_sp_group(tp_degree=TP_DEGREE)
     tp_rank = get_tp_rank()
 
-    if rank == 0:
+    # FAST_DIT=1: models/fast_dit.py -- both experts resident on device, every DiT unit
+    # torch.compile(fullgraph=True), TP all-reduces in-graph, batched CFG. Needs SP=1.
+    FAST_DIT = os.environ.get("FAST_DIT", "0") == "1"
+    if FAST_DIT:
+        assert SP_DEGREE == 1 and TP_DEGREE == world_size, "FAST_DIT needs SP_DEGREE=1, TP_DEGREE=world size"
+        from models.fast_dit import FastWanDiT
+        grid = (T_latent, lat_h // 2, lat_w // 2)
+        fast = {}
+        for name, sub, g in (("high", config.high_noise_checkpoint, config.sample_guide_scale[1]),
+                             ("low", config.low_noise_checkpoint, config.sample_guide_scale[0])):
+            if rank == 0:
+                logger.info(f"[FAST_DIT] loading {name}_noise_model (resident)...")
+            m = WanModel.from_pretrained(MODEL_PATH, subfolder=sub)
+            m.eval().requires_grad_(False)
+            shard_model_tp(m, tp_rank, TP_DEGREE)
+            m = m.to(torch.bfloat16).to(NEURON_DEVICE)
+            fast[name] = FastWanDiT(m, grid=grid, guide_scale=g, device=NEURON_DEVICE)
+            fast[name].set_context(ctx_tensor, ctx_null_tensor)
+        dist.barrier()
+        if rank == 0:
+            logger.info("[FAST_DIT] both experts resident, contexts set")
+
+    if rank == 0 and not FAST_DIT:
         logger.info(f"Loading high_noise_model (on device first — runs for t >= boundary)...")
-    high_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.high_noise_checkpoint)
-    high_noise_model.eval().requires_grad_(False)
-    shard_model_tp(high_noise_model, tp_rank, TP_DEGREE)
-    patch_model_for_sp(high_noise_model)
-    make_sp_forward(high_noise_model)
-    high_noise_model = high_noise_model.to(torch.bfloat16).to(NEURON_DEVICE)
+    if not FAST_DIT:
+        high_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.high_noise_checkpoint)
+        high_noise_model.eval().requires_grad_(False)
+        shard_model_tp(high_noise_model, tp_rank, TP_DEGREE)
+        patch_model_for_sp(high_noise_model)
+        make_sp_forward(high_noise_model)
+        high_noise_model = high_noise_model.to(torch.bfloat16).to(NEURON_DEVICE)
 
-    if rank == 0:
-        logger.info("Compiling high_noise_model...")
-    high_noise_model.patch_embedding = torch.compile(high_noise_model.patch_embedding, backend='neuron', dynamic=False)
-    high_noise_model.text_embedding = torch.compile(high_noise_model.text_embedding, backend='neuron', dynamic=False)
-    high_noise_model.head = torch.compile(high_noise_model.head, backend='neuron', dynamic=False)
-    for block in high_noise_model.blocks:
-        block.ffn = torch.compile(block.ffn, backend='neuron', dynamic=False)
+        if rank == 0:
+            logger.info("Compiling high_noise_model...")
+        high_noise_model.patch_embedding = torch.compile(high_noise_model.patch_embedding, backend='neuron', dynamic=False)
+        high_noise_model.text_embedding = torch.compile(high_noise_model.text_embedding, backend='neuron', dynamic=False)
+        high_noise_model.head = torch.compile(high_noise_model.head, backend='neuron', dynamic=False)
+        for block in high_noise_model.blocks:
+            block.ffn = torch.compile(block.ffn, backend='neuron', dynamic=False)
 
-    if rank == 0:
-        logger.info(f"Loading low_noise_model (stays on CPU until boundary)...")
-    low_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.low_noise_checkpoint)
-    low_noise_model.eval().requires_grad_(False)
-    shard_model_tp(low_noise_model, tp_rank, TP_DEGREE)
-    patch_model_for_sp(low_noise_model)
-    make_sp_forward(low_noise_model)
-    low_noise_model = low_noise_model.to(torch.bfloat16)
+        if rank == 0:
+            logger.info(f"Loading low_noise_model (stays on CPU until boundary)...")
+        low_noise_model = WanModel.from_pretrained(MODEL_PATH, subfolder=config.low_noise_checkpoint)
+        low_noise_model.eval().requires_grad_(False)
+        shard_model_tp(low_noise_model, tp_rank, TP_DEGREE)
+        patch_model_for_sp(low_noise_model)
+        make_sp_forward(low_noise_model)
+        low_noise_model = low_noise_model.to(torch.bfloat16)
 
-    dist.barrier()
-    if rank == 0:
-        logger.info("DiT ready (high_noise on device, low_noise on CPU)")
+        dist.barrier()
+        if rank == 0:
+            logger.info("DiT ready (high_noise on device, low_noise on CPU)")
 
     if rank == 0:
         logger.info("-" * 70)
@@ -278,8 +356,6 @@ def main():
     NUM_STEPS = int(os.environ.get("NUM_STEPS", "10"))
     NUM_RUNS = int(os.environ.get("NUM_RUNS", "1"))
 
-    arg_c = {'context': [ctx_tensor[0]], 'seq_len': seq_len, 'y': [y_device]}
-    arg_null = {'context': [ctx_null_tensor[0]], 'seq_len': seq_len, 'y': [y_device]}
 
     latent_orig = noise.clone()
     run_results = []
@@ -299,7 +375,11 @@ def main():
         sample_scheduler.set_timesteps(NUM_STEPS, device=torch.device("cpu"), shift=config.sample_shift)
         timesteps = sample_scheduler.timesteps
 
+        dist.barrier()
         run_start = time.time()
+        y_device = encode_image()
+        dist.barrier()
+        encode_time = time.time() - run_start
         denoise_start = time.time()
 
         for step_idx, t in enumerate(tqdm(timesteps, disable=(rank != 0), desc=run_label)):
@@ -313,7 +393,9 @@ def main():
                 needed = 'low'
                 guide_scale = config.sample_guide_scale[0]
 
-            if needed != current_on_device:
+            if FAST_DIT:
+                noise_pred = fast[needed](latent, y_device, t.item())
+            elif needed != current_on_device:
                 if rank == 0:
                     logger.info(f"  Step {step_idx}: swapping to {needed}_noise_model")
                 if current_on_device == 'high':
@@ -325,19 +407,19 @@ def main():
                 current_on_device = needed
                 gc.collect()
 
-            model = high_noise_model if current_on_device == 'high' else low_noise_model
+            if not FAST_DIT:
+                model = high_noise_model if current_on_device == 'high' else low_noise_model
 
-            # Batched CFG: cond+uncond in ONE B=2 forward (shared latent/t/y,
-            # differ only in context). ~halves denoise vs two sequential forwards.
-            out = model(
-                [latent, latent], t=timestep, seq_len=seq_len,
-                context=[ctx_tensor[0], ctx_null_tensor[0]],
-                y=[y_device, y_device])
-            noise_pred_cond = out[0]
-            noise_pred_uncond = out[1]
+                # Batched CFG: cond+uncond in ONE B=2 forward (shared latent/t/y,
+                # differ only in context). ~halves denoise vs two sequential forwards.
+                out = model(
+                    [latent, latent], t=timestep, seq_len=seq_len,
+                    context=[ctx_tensor[0], ctx_null_tensor[0]],
+                    y=[y_device, y_device])
+                noise_pred_cond = out[0]
+                noise_pred_uncond = out[1]
 
-
-            noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
+                noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
 
             temp_x0 = sample_scheduler.step(
                 noise_pred.cpu().unsqueeze(0), t,
@@ -349,12 +431,13 @@ def main():
         if rank == 0:
             logger.info(f"{run_label} denoising: {denoise_time:.1f}s ({denoise_time/NUM_STEPS:.1f}s/step)")
 
-        # ── Free DiT for VAE decode ──
-        if current_on_device == 'high':
-            high_noise_model = high_noise_model.to('cpu')
-        else:
-            low_noise_model = low_noise_model.to('cpu')
-        gc.collect()
+        # ── Free DiT for VAE decode (FAST_DIT keeps both experts resident) ──
+        if not FAST_DIT:
+            if current_on_device == 'high':
+                high_noise_model = high_noise_model.to('cpu')
+            else:
+                low_noise_model = low_noise_model.to('cpu')
+            gc.collect()
 
         # ── Decode with VAE (TP across all VAE ranks) ──
         vae_start = time.time()
@@ -362,7 +445,11 @@ def main():
             if rank == 0:
                 logger.info(f"{run_label} VAE decode (TP={VAE_TP_DEGREE})...")
             x0 = [latent.to(torch.bfloat16)]
-            videos = vae.decode(x0)
+            if VAE_IMPL == "static_tiled":
+                grid = tuple(int(v) for v in os.environ.get("VAE_TILE_GRID", "2x4").split("x"))
+                videos = vae.decode_tiled(x0, grid=grid, overlap=int(os.environ.get("VAE_TILE_OVERLAP", "4")))
+            else:
+                videos = vae.decode(x0)
             if rank == 0:
                 video = videos[0]
                 import imageio
@@ -380,9 +467,10 @@ def main():
         run_time = time.time() - run_start
 
         if rank == 0:
-            logger.info(f"═══ {run_label} DONE: denoise={denoise_time:.1f}s, vae={vae_time:.1f}s, total={run_time:.1f}s ═══")
+            logger.info(f"═══ {run_label} DONE: encode={encode_time:.2f}s, denoise={denoise_time:.1f}s, vae={vae_time:.1f}s, total={run_time:.1f}s ═══")
             run_results.append({
                 'run': run_idx + 1,
+                'encode': encode_time,
                 'denoise': denoise_time,
                 'vae': vae_time,
                 'total': run_time,
@@ -396,7 +484,7 @@ def main():
         logger.info(f"  TP={TP_DEGREE}, {config.num_heads//TP_DEGREE} heads/rank")
         logger.info(f"  {oh}x{ow}, {frame_num} frames, {NUM_STEPS} steps")
         for r in run_results:
-            logger.info(f"  Run {r['run']}: denoise={r['denoise']:.1f}s ({r['denoise']/NUM_STEPS:.1f}s/step), vae={r['vae']:.1f}s, total={r['total']:.1f}s")
+            logger.info(f"  Run {r['run']}: encode={r['encode']:.2f}s, denoise={r['denoise']:.1f}s ({r['denoise']/NUM_STEPS:.1f}s/step), vae={r['vae']:.1f}s, total={r['total']:.1f}s")
         logger.info("=" * 70)
 
     dist.destroy_process_group()

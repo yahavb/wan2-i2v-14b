@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wan2.2 I2V self-attention: legacy kernel vs attention_cte</title>
+<style>
+.viz-root {
+  color-scheme: light;
+  --surface-0: #f4f3f0;
+  --surface-1: #fcfcfb;
+  --border: #d9d8d3;
+  --grid: #e6e5e1;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #6b6a66;
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --idle: #e6e5e1;
+  --focus: #2a78d6;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .viz-root {
+    color-scheme: dark;
+    --surface-0: #121211;
+    --surface-1: #1a1a19;
+    --border: #383835;
+    --grid: #2b2b29;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted: #a3a29a;
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --idle: #2b2b29;
+    --focus: #86b6ef;
+  }
+}
+:root[data-theme="dark"] .viz-root {
+  color-scheme: dark;
+  --surface-0: #121211; --surface-1: #1a1a19; --border: #383835; --grid: #2b2b29;
+  --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #a3a29a;
+  --series-1: #3987e5; --series-2: #d95926; --idle: #2b2b29; --focus: #86b6ef;
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+.viz-root {
+  background: var(--surface-0); color: var(--text-primary);
+  font: 20px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+  min-height: 100vh;
+}
+main { max-width: 1100px; margin: 0 auto; padding: 24px 20px 80px; }
+h1 { font-size: 1.7rem; line-height: 1.25; margin: 0 0 8px; }
+h2 { font-size: 1.35rem; margin: 0 0 12px; }
+h3 { font-size: 1.1rem; margin: 18px 0 6px; }
+p, li { color: var(--text-primary); }
+.sub { color: var(--text-secondary); margin: 0 0 20px; }
+section.card {
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px;
+  padding: 20px 22px; margin: 18px 0;
+}
+.audio-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 4px 0 12px; }
+.audio-row audio { height: 40px; max-width: 100%; }
+button {
+  font: inherit; font-size: 1rem; padding: 10px 18px; border-radius: 8px; cursor: pointer;
+  border: 2px solid var(--text-primary); background: var(--surface-1); color: var(--text-primary);
+}
+button:focus-visible, audio:focus-visible, summary:focus-visible, a:focus-visible {
+  outline: 3px solid var(--focus); outline-offset: 3px;
+}
+.toolbar { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin: 12px 0 4px; }
+code { font: 0.9em ui-monospace, Menlo, monospace; background: var(--idle); padding: 1px 5px; border-radius: 4px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; }
+.tile { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+.tile .label { color: var(--text-secondary); font-size: 0.85rem; }
+.tile .pair { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; margin-top: 4px; }
+.tile .val { font-size: 1.3rem; font-weight: 650; font-variant-numeric: tabular-nums; }
+.tile .arrow { color: var(--text-muted); }
+.tile .who { font-size: 0.78rem; color: var(--text-muted); display: block; }
+.swatch { display: inline-block; width: 14px; height: 14px; border-radius: 3px; vertical-align: -2px; margin-right: 6px; }
+.legend { display: flex; gap: 22px; flex-wrap: wrap; color: var(--text-secondary); font-size: 0.95rem; margin: 6px 0 10px; }
+.chart-wrap { position: relative; }
+svg text { fill: var(--text-secondary); font-family: inherit; }
+.tooltip {
+  position: absolute; pointer-events: none; background: var(--surface-1); color: var(--text-primary);
+  border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 0.9rem;
+  box-shadow: 0 4px 14px rgba(0,0,0,.18); opacity: 0; transition: opacity .1s; white-space: nowrap;
+}
+table { border-collapse: collapse; width: 100%; font-size: 0.95rem; }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--grid); }
+th { color: var(--text-secondary); font-weight: 600; }
+td.num { font-variant-numeric: tabular-nums; }
+.note { color: var(--text-muted); font-size: 0.9rem; }
+.change { border-top: 1px solid var(--grid); padding-top: 12px; margin-top: 12px; }
+.change:first-of-type { border-top: 0; }
+.tag { font-weight: 650; }
+figure { margin: 12px 0; }
+figure img { width: 100%; border-radius: 8px; border: 1px solid var(--border); }
+figcaption { color: var(--text-secondary); font-size: 0.9rem; margin-top: 4px; }
+details > summary { cursor: pointer; font-weight: 600; padding: 6px 0; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+</style>
+</head>
+<body>
+<div class="viz-root">
+<main>
+  <h1>Wan2.2 I2V 14B self-attention: <code>wan_flash_self_attn</code> vs <code>attention_cte</code></h1>
+  <p class="sub">368&times;480, 21 frames, 10 steps, batched CFG, TP=4 SP=2, trn2 (LNC2). Branch <code>exp/staging-attn</code>. Profiles: Neuron Explorer, one captured execution of each kernel.</p>
+
+  <div class="toolbar" role="group" aria-label="Narration controls">
+    <button id="playAll" type="button">&#9654; Play all narration</button>
+    <button id="stopAll" type="button">&#9632; Stop</button>
+    <button id="theme" type="button" aria-pressed="false">Toggle dark / light</button>
+    <span id="nowPlaying" class="note" aria-live="polite"></span>
+  </div>
+
+  <section class="card" id="s1" aria-labelledby="h1s">
+    <h2 id="h1s">1. What this attention is</h2>
+    <div class="audio-row"><audio controls preload="none" src="audio/01-what.m4a" aria-label="Narration, section 1"></audio></div>
+    <p>Self-attention is the step inside each of the DiT's 40 transformer blocks where every video token (4,140 of them: 6 latent frames &times; 23 &times; 30 patches) looks at every other token and decides what to take from it. It runs 40 blocks &times; 10 denoising steps for both CFG halves, so it is the most expensive operation in denoising, and a faster attention kernel directly shortens the time to generate the video.</p>
+  </section>
+
+  <section class="card" id="s2" aria-labelledby="h2s">
+    <h2 id="h2s">2. The two kernels</h2>
+    <div class="audio-row"><audio controls preload="none" src="audio/02-kernels.m4a" aria-label="Narration, section 2"></audio></div>
+    <p>Both compute the same attention for the same tokens: each SP rank attends its 2,072 query tokens to all 4,144 key/value tokens, 10 heads of 128 dims, for each CFG half. They differ only in how that work is mapped onto the NeuronCore engines.</p>
+    <ul>
+      <li><span class="swatch" style="background:var(--series-1)"></span><strong>Legacy, <code>wan_flash_self_attn</code></strong> (<code>kernels/self_attention.py</code>): hand-written NKI flash attention. One call per CFG half, heads one after another, K/V padded 4,144 &rarr; 6,144 tokens, online softmax, P transposed with an identity matmul on the Tensor engine, every elementwise step on the Vector engine.</li>
+      <li><span class="swatch" style="background:var(--series-2)"></span><strong>cte, <code>attention_cte</code></strong> (nkilib in the image; what staging vllm-omni-neuron runs at CP=1): one call for both CFG halves (20 head instances), no padding, exp on the Scalar engine with max-subtraction and row-sum fused, P transposed by DMA, QK of one query group overlapped with PV of an earlier group.</li>
+    </ul>
+    <p>The math is the same; cte keeps more engines busy at once and wastes less work, so each head takes ~0.17&nbsp;ms instead of ~1.37&nbsp;ms.</p>
+
+    <h3>Schematic: one legacy head vs the same time in cte</h3>
+    <p class="note">Illustration, not measured data: it redraws the pattern seen in the Analysis view. Same time axis for both; filled = engine busy.</p>
+    <div class="chart-wrap"><svg id="schematic" role="img" aria-labelledby="schTitle schDesc" width="100%" viewBox="0 0 1000 420">
+      <title id="schTitle">Schematic engine timeline</title>
+      <desc id="schDesc">In the time legacy spends on one head, about 1.37 milliseconds, the Vector engine is busy throughout, the Tensor engine is partly busy, DMA and GpSimd fire in three short bursts, and Scalar is lightly used. In the same time cte finishes about eight heads, with DMA, Tensor, Vector, Scalar and GpSimd all active in every head's block.</desc>
+    </svg></div>
+  </section>
+
+  <section class="card" id="s3" aria-labelledby="h3s">
+    <h2 id="h3s">3. Results</h2>
+    <div class="audio-row"><audio controls preload="none" src="audio/03-results.m4a" aria-label="Narration, section 3"></audio></div>
+    <div class="tiles" id="tiles"></div>
+    <p class="note">Per-call numbers: Neuron Explorer Summary view. Denoise and total: median of 3 clean runs (no profiler), same node. Self-attention per video is an estimate: per-call time &times; calls (40 blocks &times; 10 steps &times; 2 calls legacy, &times; 1 call cte).</p>
+
+    <h3>Engine busy, per kernel call</h3>
+    <div class="legend" aria-hidden="true">
+      <span><span class="swatch" style="background:var(--series-1)"></span>legacy <code>wan_flash_self_attn</code></span>
+      <span><span class="swatch" style="background:var(--series-2)"></span>cte <code>attention_cte</code></span>
+    </div>
+    <div class="chart-wrap" id="engWrap">
+      <svg id="engines" role="img" aria-labelledby="engTitle engDesc" width="100%" viewBox="0 0 1000 470">
+        <title id="engTitle">Engine busy percent, legacy vs cte</title>
+        <desc id="engDesc">Approximate percentages read from the Neuron Explorer bar charts. Tensor useful: 10 vs 33. Tensor busy: 28 vs 43. Vector: 88 vs 61. Scalar: 19 vs 58. GpSimd: 5 vs 22. DMA queues: 1.5 vs 62.</desc>
+      </svg>
+      <div class="tooltip" id="tip" role="status"></div>
+    </div>
+    <p class="note">Approximate: read off the Summary view's "FLOPS Utilization by Engine" and "DMA Utilization" charts. cte Tensor also shows ~12% active-throttled, not included above.</p>
+    <details>
+      <summary>Table view of the engine chart</summary>
+      <table id="engTable"><thead><tr><th>Engine</th><th>legacy</th><th>cte</th></tr></thead><tbody></tbody></table>
+    </details>
+  </section>
+
+  <section class="card" id="s4" aria-labelledby="h4s">
+    <h2 id="h4s">4. Each change: where it shows, and where it is in the code</h2>
+    <p>Per-head structure: legacy Tensor/Vector rows repeat in equal ~1.35&nbsp;ms segments (10 heads &times; 1.37&nbsp;ms = 13.7&nbsp;ms), the head loop <code>for batch_id in nl.sequential_range(batch_size)</code> at <code>self_attention.py:65</code>. cte shows ~0.17&nbsp;ms blocks, ~10 per core across 1.67&nbsp;ms.</p>
+
+    <div class="change">
+      <h3>1. DMA engines: more activity</h3>
+      <div class="audio-row"><audio controls preload="none" src="audio/04-dma.m4a" aria-label="Narration, change 1, DMA"></audio></div>
+      <p><span class="tag">View:</span> DMA-E64&hellip;E92 rows, legacy mostly idle with short bursts, cte all 32 queues busy almost the whole time. Pending DMA Count: legacy low and flat, cte continuously non-zero.</p>
+      <p><span class="tag">Code:</span> legacy loads K, V, mask, Q in bursts at each K section inside two sequential loops (<code>self_attention.py:65, 81, 87-109</code>). cte transposes P with DMA (<code>attention_cte.py:3412, 3434</code>, <code>nisa.dma_transpose</code>) where legacy uses the Tensor engine (<code>self_attention.py:163</code>), and streams loads alongside compute.</p>
+    </div>
+    <div class="change">
+      <h3>2. Tensor engine: more useful work</h3>
+      <div class="audio-row"><audio controls preload="none" src="audio/05-tensor.m4a" aria-label="Narration, change 2, Tensor engine"></audio></div>
+      <p><span class="tag">View:</span> Tensor/TensorMatrix rows, ~1.35&nbsp;ms per head (legacy) vs ~0.17&nbsp;ms (cte); Estimated Instant MFU, legacy low.</p>
+      <p><span class="tag">Code:</span> a third of legacy's Tensor-engine work is the identity-matmul transpose (line 163), and K is padded 4,144 &rarr; 6,144; neither is attention math. cte has no identity transpose and no padding, and overlaps QK for query group i+2 with PV for group i (<code>_fused_qkmax_and_pv_impl</code>, <code>attention_cte.py:3487</code>).</p>
+    </div>
+    <div class="change">
+      <h3>3. Scalar engine: more activity</h3>
+      <div class="audio-row"><audio controls preload="none" src="audio/06-scalar.m4a" aria-label="Narration, change 3, Scalar engine"></audio></div>
+      <p><span class="tag">View:</span> Scalar rows, dense in every cte block.</p>
+      <p><span class="tag">Code:</span> cte computes exp on the Scalar engine with the max-subtraction and row-sum fused into one instruction (<code>nisa.activation(op=nl.exp, bias=running_max, reduce_op=add)</code>, <code>attention_cte.py:3380-3392</code>). Legacy does these as separate passes.</p>
+    </div>
+    <div class="change">
+      <h3>4. GpSimd: more activity</h3>
+      <div class="audio-row"><audio controls preload="none" src="audio/07-gpsimd.m4a" aria-label="Narration, change 4, GpSimd"></audio></div>
+      <p><span class="tag">View:</span> GpSimd rows, legacy sparse blips aligned with the DMA bursts, cte dense in every block.</p>
+      <p><span class="tag">Code:</span> one visible cause is cte initialising its max buffers on GpSimd (<code>nisa.memset(..., engine=nisa.gpsimd_engine)</code>, <code>attention_cte.py:3509</code>). The rest of its GpSimd work is not traced here.</p>
+    </div>
+    <div class="change">
+      <h3>5. Vector engine: less activity</h3>
+      <div class="audio-row"><audio controls preload="none" src="audio/08-vector.m4a" aria-label="Narration, change 5, Vector engine"></audio></div>
+      <p><span class="tag">View:</span> Vector rows, legacy solid across the whole window (~88%), cte interleaved with the other engines (~61%).</p>
+      <p><span class="tag">Code:</span> legacy runs every per-tile step on the Vector engine (<code>self_attention.py:117-176</code>): PSUM&rarr;SBUF copy, scale multiply, mask add, max, two f32&rarr;bf16 copies, and an SBUF add for the PV running sum. cte moved the exp and its sum to Scalar and the transpose to DMA.</p>
+    </div>
+    <div class="change">
+      <h3>6. HBM reads and writes: less</h3>
+      <div class="audio-row"><audio controls preload="none" src="audio/09-hbm.m4a" aria-label="Narration, change 6, HBM traffic"></audio></div>
+      <p><span class="tag">View:</span> HBM Throughput row and the Summary donut: read 82.69 &rarr; 50.59 MiB, write 10.63 &rarr; 10.12 MiB.</p>
+      <p><span class="tag">Arithmetic:</span> cte reads each input exactly once: 20 head instances &times; (2,072 Q + 4,144 K + 4,144 V tokens) &times; 128 &times; 2 bytes = 50.6 MiB; and writes the output once: 20 &times; 2,072 &times; 128 &times; 2 bytes = 10.12 MiB. Legacy reads more because K/V are padded to 6,144, Q is reloaded for every K section (line 109 is inside the section loop at line 81), and the mask is reloaded per section per head (line 102). Those do not fully add up to 82.69 MiB, and legacy's 10.63 MiB write is about twice its output; the remainder is not explained by the code.</p>
+    </div>
+    <p class="note">Not compared: cte shows a Throttling row (square wave), matching "Active Throttled" in its Summary. The legacy screenshot has no Throttling row.</p>
+  </section>
+
+  <section class="card" id="s5" aria-labelledby="h5s">
+    <h2 id="h5s">5. Neuron Explorer screenshots (evidence)</h2>
+    <details><summary>Summary view: legacy, then cte</summary>
+      <figure><img src="img/legacy-summary.png" alt="Legacy summary: total runtime 13.686 ms, FLOPS utilization 9.54 percent, HBM read 82.69 MiB, write 10.63 MiB, Vector engine about 88 percent active, DMA engines nearly idle."><figcaption>Legacy <code>wan_flash_self_attn</code>, Summary.</figcaption></figure>
+      <figure><img src="img/cte-summary.png" alt="cte summary: total runtime 1.6735 ms, FLOPS utilization 33.40 percent, HBM read 50.59 MiB, write 10.12 MiB, Tensor useful about 33 percent, Scalar about 58 percent, DMA engines about 60 to 65 percent busy."><figcaption>cte <code>attention_cte</code>, Summary (tab title reads "cre-attention").</figcaption></figure>
+    </details>
+    <details><summary>Analysis view, DMA queues: legacy, then cte</summary>
+      <figure><img src="img/legacy-dma-timeline.png" alt="Legacy device timeline, DMA queues E64 to E92 over about 11 ms: mostly idle with short repeated bursts; E67 and E83 carry a steady trickle of tiny transfers."><figcaption>Legacy, DMA rows.</figcaption></figure>
+      <figure><img src="img/cte-dma-timeline.png" alt="cte device timeline, DMA queues E64 to E92 over 1.67 ms: all queues busy nearly continuously."><figcaption>cte, DMA rows.</figcaption></figure>
+    </details>
+    <details><summary>Analysis view, engines: legacy, then cte</summary>
+      <figure><img src="img/legacy-engine-timeline.png" alt="Legacy device timeline, engines: Tensor and Vector rows repeat in equal segments of about 1.35 ms with short gaps; Vector solid; GpSimd sparse blips; pending DMA count low and flat."><figcaption>Legacy, engine rows.</figcaption></figure>
+      <figure><img src="img/cte-engine-timeline.png" alt="cte device timeline, engines: about ten blocks of about 0.17 ms per core, each with Tensor, Vector, Scalar and GpSimd active together; state buffer ramps per block; throttling square wave; pending DMA count continuously non-zero."><figcaption>cte, engine rows.</figcaption></figure>
+    </details>
+  </section>
+</main>
+</div>
+
+<script>
+const S1 = "var(--series-1)", S2 = "var(--series-2)", IDLE = "var(--idle)";
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, parent, text) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (text !== undefined) e.textContent = text;
+  if (parent) parent.appendChild(e);
+  return e;
+}
+
+/* ---- tiles ---- */
+const tiles = [
+  ["Runtime per call", "13.686 ms", "1.6735 ms"],
+  ["FLOPS utilization", "9.54%", "33.40%"],
+  ["Calls per block per step", "2", "1"],
+  ["HBM read per call", "82.69 MiB", "50.59 MiB"],
+  ["Self-attention per video (est.)", "~11 s", "~0.7 s"],
+  ["Denoise (median, 3 runs)", "35.5 s", "25.2 s"],
+  ["Total, end to end", "40.7 s", "30.6 s (−25%)"],
+];
+const T = document.getElementById("tiles");
+for (const [label, a, b] of tiles) {
+  const d = document.createElement("div");
+  d.className = "tile";
+  d.innerHTML = `<div class="label">${label}</div><div class="pair">
+    <span><span class="val">${a}</span><span class="who"><span class="swatch" style="background:${S1}"></span>legacy</span></span>
+    <span class="arrow" aria-hidden="true">&rarr;</span>
+    <span><span class="val">${b}</span><span class="who"><span class="swatch" style="background:${S2}"></span>cte</span></span></div>`;
+  d.setAttribute("aria-label", `${label}: legacy ${a}, cte ${b}`);
+  T.appendChild(d);
+}
+
+/* ---- engine chart: grouped horizontal bars ---- */
+const eng = [
+  ["Tensor, useful", 10, 33], ["Tensor, busy", 28, 43], ["Vector", 88, 61],
+  ["Scalar", 19, 58], ["GpSimd", 5, 22], ["DMA queues", 1.5, 62],
+];
+(function () {
+  const svg = document.getElementById("engines"), tip = document.getElementById("tip");
+  const wrap = document.getElementById("engWrap");
+  const L = 170, R = 940, top = 20, rowH = 70, barH = 22, gap = 2;
+  const x = v => L + (R - L) * v / 100;
+  for (const g of [0, 25, 50, 75, 100]) {
+    el("line", { x1: x(g), x2: x(g), y1: top - 6, y2: top + rowH * eng.length, stroke: "var(--grid)", "stroke-width": 1 }, svg);
+    el("text", { x: x(g), y: top + rowH * eng.length + 22, "text-anchor": "middle", "font-size": 16 }, svg, g + "%");
+  }
+  eng.forEach(([name, a, b], i) => {
+    const y0 = top + i * rowH + 8;
+    el("text", { x: L - 12, y: y0 + barH + 4, "text-anchor": "end", "font-size": 18, style: "fill:var(--text-primary)" }, svg, name);
+    [[a, S1, "legacy"], [b, S2, "cte"]].forEach(([v, c, who], j) => {
+      const y = y0 + j * (barH + gap);
+      const w = Math.max(x(v) - L, 3);
+      const p = el("path", { d: `M${L},${y} h${w - 4} a4,4 0 0 1 4,4 v${barH - 8} a4,4 0 0 1 -4,4 h${-(w - 4)} z`, fill: c }, svg);
+      el("text", { x: L + w + 8, y: y + barH - 5, "font-size": 16 }, svg, `~${v}%`);
+      const hit = el("rect", { x: L, y: y - 1, width: R - L, height: barH + 2, fill: "transparent", tabindex: 0,
+        "aria-label": `${name}, ${who}: about ${v} percent` }, svg);
+      const show = (evt) => {
+        tip.innerHTML = `<strong>${name}</strong><br><span class="swatch" style="background:${c}"></span>${who}: ~${v}%`;
+        const r = wrap.getBoundingClientRect(), br = hit.getBoundingClientRect();
+        const px = evt && evt.clientX ? evt.clientX - r.left + 14 : br.left - r.left + (x(v) - L) * br.width / (R - L) + 20;
+        tip.style.left = Math.min(px, r.width - 200) + "px";
+        tip.style.top = (br.top - r.top - 8) + "px";
+        tip.style.opacity = 1;
+        p.setAttribute("opacity", 0.85);
+      };
+      const hide = () => { tip.style.opacity = 0; p.setAttribute("opacity", 1); };
+      hit.addEventListener("mousemove", show); hit.addEventListener("focus", () => show());
+      hit.addEventListener("mouseleave", hide); hit.addEventListener("blur", hide);
+    });
+  });
+  const tb = document.querySelector("#engTable tbody");
+  for (const [n, a, b] of eng) tb.insertAdjacentHTML("beforeend", `<tr><td>${n}</td><td class="num">~${a}%</td><td class="num">~${b}%</td></tr>`);
+})();
+
+/* ---- schematic timeline ---- */
+(function () {
+  const svg = document.getElementById("schematic");
+  const rows = ["DMA", "Tensor", "Vector", "Scalar", "GpSimd"];
+  const L = 110, R = 980, rowH = 30, barH = 18;
+  function panel(y0, title, color, spans) {
+    el("text", { x: L, y: y0, "font-size": 18, style: "fill:var(--text-primary);font-weight:600" }, svg, title);
+    rows.forEach((r, i) => {
+      const y = y0 + 14 + i * rowH;
+      el("text", { x: L - 10, y: y + barH - 4, "text-anchor": "end", "font-size": 16 }, svg, r);
+      el("rect", { x: L, y, width: R - L, height: barH, rx: 4, fill: IDLE }, svg);
+      for (const [s, e] of spans[r]) el("rect", { x: L + (R - L) * s, y, width: Math.max((R - L) * (e - s) - 2, 2), height: barH, rx: 3, fill: color }, svg);
+    });
+  }
+  // legacy: one head (~1.37 ms) = 3 K sections; bursts at section starts
+  const sec = [0, 1 / 3, 2 / 3];
+  const legacy = {
+    DMA: sec.map(s => [s + 0.005, s + 0.04]),
+    Tensor: sec.flatMap(s => [[s + 0.05, s + 0.12], [s + 0.16, s + 0.22], [s + 0.26, s + 0.31]]),
+    Vector: [[0.0, 0.995]],
+    Scalar: sec.map(s => [s + 0.12, s + 0.18]),
+    GpSimd: sec.map(s => [s + 0.01, s + 0.025]),
+  };
+  // cte: ~8 heads in the same 1.37 ms, every engine active in each block
+  const blocks = Array.from({ length: 8 }, (_, k) => k / 8);
+  const w = 1 / 8;
+  const cte = {
+    DMA: blocks.map(b => [b + 0.003, b + w - 0.006]),
+    Tensor: blocks.flatMap(b => [[b + 0.01, b + 0.055], [b + 0.065, b + w - 0.012]]),
+    Vector: blocks.flatMap(b => [[b + 0.005, b + 0.035], [b + 0.05, b + 0.08], [b + 0.095, b + w - 0.01]]),
+    Scalar: blocks.flatMap(b => [[b + 0.015, b + 0.06], [b + 0.07, b + w - 0.008]]),
+    GpSimd: blocks.flatMap(b => [[b + 0.004, b + 0.02], [b + 0.06, b + 0.075]]),
+  };
+  panel(24, "legacy: 1 head ≈ 1.37 ms (3 K sections)", S1, legacy);
+  panel(222, "cte: same 1.37 ms ≈ 8 heads", S2, cte);
+  el("text", { x: R, y: 412, "text-anchor": "end", "font-size": 15 }, svg, "time →  (illustration, same scale for both panels)");
+})();
+
+/* ---- narration: play all in order ---- */
+const audios = [...document.querySelectorAll("audio")];
+const now = document.getElementById("nowPlaying");
+let chain = false;
+audios.forEach((a, i) => {
+  a.addEventListener("play", () => {
+    audios.forEach(o => { if (o !== a) o.pause(); });
+    now.textContent = "Playing: " + a.getAttribute("aria-label");
+  });
+  a.addEventListener("ended", () => {
+    if (chain && audios[i + 1]) { audios[i + 1].scrollIntoView({ block: "center", behavior: "smooth" }); audios[i + 1].play(); }
+    else { chain = false; now.textContent = ""; }
+  });
+});
+document.getElementById("playAll").onclick = () => { chain = true; audios[0].currentTime = 0; audios[0].scrollIntoView({ block: "center" }); audios[0].play(); };
+document.getElementById("stopAll").onclick = () => { chain = false; audios.forEach(a => a.pause()); now.textContent = "Stopped"; };
+document.getElementById("theme").onclick = (e) => {
+  const r = document.documentElement;
+  const dark = r.dataset.theme ? r.dataset.theme !== "dark" : !matchMedia("(prefers-color-scheme: dark)").matches;
+  r.dataset.theme = dark ? "dark" : "light";
+  e.currentTarget.setAttribute("aria-pressed", String(dark));
+};
+</script>
+</body>
+</html>

@@ -7,7 +7,7 @@ Online softmax correction is always computed (init r_max=-inf makes it safe).
 Call-site responsibilities:
     - Pad seq_q to multiple of 128
     - Build mask tensor: (128, seqlen_k) bf16, 0 for valid, -inf for invalid
-    - Pass num_sections = seqlen_k // 8192 as Python int
+    - Pass num_sections = seqlen_k // SECTION as Python int
     - Truncate output[:seq_q] after kernel returns
 
 API note: Uses nl.* (nki.language) return-style APIs exclusively.
@@ -26,12 +26,12 @@ def wan_flash_self_attn(q, k, v, identity, mask, softmax_scale=None,
 
     Args:
         q:        (bs, d, seq_q) bf16 — query, seq_q must be multiple of 128
-        k:        (bs, d, seq_k) bf16 — key, seq_k must be multiple of 8192
+        k:        (bs, d, seq_k) bf16 — key, seq_k must be multiple of SECTION
         v:        (bs, seq_k, d) bf16 — value
         identity: (128, 128) bf16     — identity matrix for transpose trick
         mask:     (128, seq_k) bf16   — 0 for valid positions, -inf for masked
         softmax_scale: float          — 1/sqrt(head_dim)
-        num_sections: int             — seqlen_k // 8192 (Python int)
+        num_sections: int             — seqlen_k // SECTION (Python int)
         use_dynamic_loop: ignored
 
     Returns:
@@ -43,10 +43,16 @@ def wan_flash_self_attn(q, k, v, identity, mask, softmax_scale=None,
     seqlen_k = k.shape[2]
     P = nl.tile_size.pmax  # 128
 
-    SECTION = 8192
-    tiles_512 = 16       # SECTION // 512
-    tiles_128 = 64       # SECTION // P
-    tiles_2048 = 4       # SECTION // 2048
+    # SECTION is the seqlen_k tiling granularity AND the caller's pad multiple.
+    # Smaller SECTION => less zero-pad waste (seq_len≈9048 pads to 10240 @2048 vs
+    # 16384 @8192: 12% vs 45%) and the real attention matmul runs over fewer keys.
+    # All inner-loop tile counts derive from it; the online softmax is section-size
+    # invariant and the mask handles the tail, so correctness is independent of it.
+    # Must be a multiple of 2048 (phase-2 exp chunk) and 512 (qk/mask tiling).
+    SECTION = 2048
+    tiles_512 = SECTION // 512
+    tiles_128 = SECTION // P
+    tiles_2048 = SECTION // 2048
     num_q_grps = seqlen_q // P
 
     # Output in HBM
@@ -74,7 +80,7 @@ def wan_flash_self_attn(q, k, v, identity, mask, softmax_scale=None,
         # ── Section loop (LoopVar — no Python list indexing!) ──
         for section_i in nl.sequential_range(num_sections):
 
-            # Load K section: [d, 8192]
+            # Load K section: [d, SECTION]
             k_sec = nl.ndarray((d, SECTION), dtype=k.dtype, buffer=nl.sbuf)
             for ti in range(tiles_512):
                 ks = section_i * SECTION + ti * 512
@@ -88,7 +94,7 @@ def wan_flash_self_attn(q, k, v, identity, mask, softmax_scale=None,
                 nisa.dma_copy(dst=v_sec[:, ti, :],
                               src=v[batch_id, nl.ds(vs, P), :])
 
-            # Load mask section: [128, 8192] bf16 → f32
+            # Load mask section: [128, SECTION] bf16 -> f32
             mask_sec = nl.ndarray((P, SECTION), dtype=nl.float32, buffer=nl.sbuf)
             for ti in range(tiles_512):
                 ms = section_i * SECTION + ti * 512

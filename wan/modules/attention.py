@@ -41,8 +41,77 @@ if USE_NKI_KERNELS:
     except Exception as e:
         print(f"[attention.py] NKI self_attention kernel: FAILED ({e})")
 
-# Self-attention kernel requires seqlen_k to be multiple of 8192
-SELF_ATTN_SEQLEN_MULTIPLE = 8192
+# ─── ATTN_IMPL: which attention core runs (self AND cross) ────────────────────
+#   legacy   : kernels/self_attention.py + kernels/cross_attention.py (identity-matmul
+#              P transpose, online softmax, K padded to 2048, [n,d,L] permutes)
+#   cte      : stock nkilib attention_cte (what staging vllm-omni-neuron runs at CP=1)
+#   constmax : staging's const-max kernel (kernels/nkilib/experimental/attention),
+#              K-stationary, no P transpose, fixed per-row max, PSUM accumulation,
+#              takes token-major [B, L, n, d] directly (no permute / pad / mask)
+# A requested non-legacy impl that fails to load is a HARD error, so a run can
+# never report a speedup for a kernel that did not actually run.
+ATTN_IMPL = os.environ.get("ATTN_IMPL", "legacy")
+# "fast": models/fast_dit.py owns attention (FAST_DIT=1); nothing to load here.
+assert ATTN_IMPL in ("legacy", "cte", "constmax", "fast"), f"unknown ATTN_IMPL={ATTN_IMPL}"
+_attn_core_kernel = None
+ATTN_CORE_LNC = None
+
+
+def _wrap_lnc(kernel):
+    """torch_neuronx wrap_nki, launched on all LNC cores when supported."""
+    from torch_neuronx.nki_hop import wrap_nki
+    wrapped = wrap_nki(kernel)
+    lnc = int(os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2"))
+    try:
+        return wrapped[lnc], lnc
+    except Exception:  # noqa: BLE001 -- this wrap_nki has no grid launch
+        return wrapped, 1
+
+
+if ATTN_IMPL == "cte":
+    import nki
+    import nki.language as nl
+    from nkilib.core.attention.attention_cte import attention_cte
+
+    @nki.jit
+    def _cte_kernel(q, k, v):
+        """[BN, Sq, D] x [BN, Sk, D] -> [BN, Sq, D]; q pre-scaled by the caller."""
+        return attention_cte(
+            q=q, k=k, v=v, scale=1.0, causal_mask=False,
+            tp_q=True, tp_k=True, tp_out=False, cache_softmax=False,
+            softmax_dtype=nl.float32, mm_out_dtype=nl.float32)
+
+    _attn_core_kernel, ATTN_CORE_LNC = _wrap_lnc(_cte_kernel)
+elif ATTN_IMPL == "constmax":
+    from kernels.nkilib.experimental.attention.ring_attention_const_max_fwd import (
+        ring_attention_const_max_fwd)
+    _attn_core_kernel, ATTN_CORE_LNC = _wrap_lnc(ring_attention_const_max_fwd)
+if ATTN_IMPL in ("cte", "constmax"):
+    print(f"[attention.py] ATTN_IMPL={ATTN_IMPL}: LOADED (lnc={ATTN_CORE_LNC})")
+
+
+def attn_core(q, k, v):
+    """Non-causal attention, q [B, Lq, n, d] vs k/v [B, Lk, n, d] -> [B, Lq, n, d].
+    Lq may differ from Lk (SP query shard vs gathered K/V; cross-attention)."""
+    q, k, v = (t.to(torch.bfloat16) for t in (q, k, v))
+    b, lq, n, d = q.shape
+    lk = k.shape[1]
+    scale = 1.0 / math.sqrt(d)
+    if ATTN_IMPL == "cte":
+        q3 = (q.permute(0, 2, 1, 3) * scale).reshape(b * n, lq, d).contiguous()
+        k3 = k.permute(0, 2, 1, 3).reshape(b * n, lk, d).contiguous()
+        v3 = v.permute(0, 2, 1, 3).reshape(b * n, lk, d).contiguous()
+        out = _attn_core_kernel(q3, k3, v3)                      # [BN, Lq, d]
+        return out.reshape(b, n, lq, d).transpose(1, 2)
+    out = _attn_core_kernel(q.contiguous(), k.contiguous(), v.contiguous(),
+                            num_workers=1, softmax_scale=scale)  # [B, n, Lq, d]
+    return out.transpose(1, 2)
+
+
+# Self-attention kernel requires seqlen_k to be a multiple of its SECTION tiling
+# granularity. MUST equal SECTION in kernels/self_attention.py. Dropped 8192->2048
+# to cut zero-pad waste (seq_len~9048 pads to 10240 not 16384: 12% vs 45%).
+SELF_ATTN_SEQLEN_MULTIPLE = 2048
 
 # Identity matrix buffer (created once, reused)
 _identity_matrix = None
@@ -151,6 +220,8 @@ def attention(
     """
     # Try NKI kernels first (Neuron device)
     if q.device.type == "neuron":
+        if ATTN_IMPL in ("cte", "constmax"):
+            return attn_core(q, k, v)
         if is_cross_attn and _NKI_CROSS_AVAILABLE:
             return _nki_cross_attention(q, k, v, dtype=dtype)
         elif not is_cross_attn and _NKI_SELF_AVAILABLE:

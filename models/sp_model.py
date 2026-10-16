@@ -6,10 +6,29 @@ modulations are sharded to match. The head gathers back to full.
 """
 
 import math
+import os
 import torch
 import torch.distributed as dist
 from models.parallel_state import get_sp_rank, get_sp_degree, get_sp_group
 from models.tp_utils import get_tp_rank, get_tp_world_size
+
+# One-time dedup'd shape logger — pins which copy/pad NEFF a trace corresponds to.
+# Gated by PAD_DEBUG=1 so it's silent in normal runs. Logs each distinct (tag,shape)
+# once, with byte size, so we can match a trace's "moved=NNN MB" to a source line.
+_PAD_DBG_SEEN = set()
+def _padlog(tag, t):
+    if os.environ.get("PAD_DEBUG", "0") != "1":
+        return
+    try:
+        key = (tag, tuple(t.shape), str(t.dtype))
+        if key in _PAD_DBG_SEEN:
+            return
+        _PAD_DBG_SEEN.add(key)
+        nbytes = t.element_size() * t.nelement()
+        print(f"[PAD_DEBUG] {tag}: shape={tuple(t.shape)} dtype={t.dtype} "
+              f"bytes={nbytes/1e6:.1f}MB", flush=True)
+    except Exception as e:
+        print(f"[PAD_DEBUG] {tag}: <err {e}>", flush=True)
 
 
 def make_sp_forward(model):
@@ -48,12 +67,20 @@ def make_sp_forward(model):
         # Round seq_len up to multiple of world_size for even sharding
         seq_len_padded = ((seq_len + world_size - 1) // world_size) * world_size
 
-        # Pad to seq_len_padded: [B, seq_len_padded, dim]
-        x = torch.cat([
-            torch.cat([u, u.new_zeros(1, seq_len_padded - u.size(1), u.size(2))],
-                      dim=1) for u in x
-        ])
+        # Pad to seq_len_padded: [B, seq_len_padded, dim]. Skip the pad entirely
+        # when each item is ALREADY seq_len_padded (common: seq_len divisible by
+        # world_size) — the old unconditional torch.cat ran a full 188MB copy that
+        # appended ZERO rows, surfacing as a 0-matmul pad NEFF. Only cat when a row
+        # actually needs adding.
+        if all(u.size(1) == seq_len_padded for u in x):
+            x = torch.cat([u for u in x], dim=0) if len(x) > 1 else x[0]
+        else:
+            x = torch.cat([
+                torch.cat([u, u.new_zeros(1, seq_len_padded - u.size(1), u.size(2))],
+                          dim=1) for u in x
+            ])
         L = seq_len_padded
+        _padlog("sp_model:seq_pad(line52)", x)
 
         # Time embedding (compute full, then shard)
         if t.dim() == 1:
@@ -100,11 +127,13 @@ def make_sp_forward(model):
         # L/sp each -> full L), NOT the world group. TP ranks hold identical data
         # so they gather the same result.
         B = x.shape[0]
-        x_full = torch.empty(B, L, model.dim, dtype=x.dtype, device=x.device)
-        x_flat = x.reshape(B * L_local, model.dim).contiguous()
-        x_full_flat = x_full.reshape(B * L, model.dim)
-        dist.all_gather_into_tensor(x_full_flat, x_flat, group=get_sp_group())
-        x = x_full_flat.reshape(B, L, model.dim)
+        # all_gather output = input with dim0*sp_degree: [sp*B, L_local, dim].
+        # Then [sp,B,...] -> [B,sp,...] -> [B, L, dim] so each batch item's shards
+        # concatenate correctly (avoids batch/seq-shard interleaving at B>1).
+        gathered = torch.empty(sp_degree * B, L_local, model.dim, dtype=x.dtype, device=x.device)
+        dist.all_gather_into_tensor(gathered, x.contiguous(), group=get_sp_group())
+        x = gathered.reshape(sp_degree, B, L_local, model.dim).permute(1, 0, 2, 3).reshape(B, L, model.dim)
+        _padlog("sp_model:head_gather(line128)", x)
 
         # Head (on full sequence)
         x = model.head(x, e)
