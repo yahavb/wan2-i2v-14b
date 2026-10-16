@@ -57,27 +57,33 @@ all-reduce, gated residual.
 The VAE (`models/vae_static21.py:40, 316-317`) and the text encoder
 (`models/fast_t5.py:28, 106-107`) use the same `COMPILE_KW`; this study varies only the DiT.
 
-## 3. Variants (switch: `FAST_SCOPE`, to be added)
+## 3. The ladder (switches: `FAST_SCOPE`, `FAST_ATTN_IMPL`, kernel flags; to be added)
 
-Each variant changes one thing: where the DiT graph boundaries fall. Kernels, math and
-inputs are identical. A denoise step runs 40 transformer blocks.
+One run per step, same spec, same node. Left to right, each step changes one thing.
+Steps 1-4: everything native PyTorch, only the compile scope and `fullgraph` change.
+Steps 5-7: on the best scope, kernels are added.
 
-| Variant | How it is compiled | `fullgraph` | Graphs per denoise step | The question it answers |
-|---|---|---|---|---|
-| `block` | each transformer block is one graph (today's code) | `True` | 40 | Baseline. |
-| `block_breaks` | same as `block`, plus `torch._dynamo.graph_break()` after self-attention and after cross-attention, so each block splits into 3 graphs | `False` (required: `True` rejects a graph break) | 120 | How much do graph breaks cost? |
-| `sublayer` | self-attention, cross-attention and FFN compiled as 3 separate units per block | `True` | 120 | Same boundaries as `block_breaks`, different flag: is the cost from the boundaries or from the flag? |
-| `model` | all 40 blocks compiled as one graph | `True` | 1 | Does removing the per-block boundaries help, and what does it cost in compile time? |
+| Step | Attention | Other kernels | Compile scope | `fullgraph` | Graphs per denoise step |
+|---|---|---|---|---|---|
+| 1 | native `F.scaled_dot_product_attention` | none | sub-layer pieces, by explicit `graph_break()` (3 per block) | `False` | 120 |
+| 2 | native SDPA | none | sub-layer pieces, each its own compiled unit | `True` | 120 |
+| 3 | native SDPA | none | one graph per transformer block | `True` | 40 |
+| 4 | native SDPA | none | all 40 blocks in one graph | `True` | 1 |
+| 5 | legacy NKI `wan_flash_self_attn` | none | block | `True` | 40 |
+| 6 | nkilib `attention_cte` | none | block | `True` | 40 |
+| 7 | nkilib `attention_cte` | `output_projection_cte` + fused adaln | block | `True` | 40 |
 
-How to read the comparison:
+What each step shows:
 
-- `block` vs `block_breaks`: same code, 3x the graphs. The difference is the cost of graph
-  breaks.
-- `block_breaks` vs `sublayer`: same 120 graphs. If their times match, the boundaries set the
-  cost, not `fullgraph`. `fullgraph=True` only decides whether an unplanned break is an error
-  (`True`) or is allowed silently (`False`).
-- `block` vs `model`: 40 graphs vs 1. Shows whether fewer boundaries still pay off once the
-  graphs are already large.
+- 1 -> 2: same 120 boundaries, `fullgraph` False vs True. The flag does not change the
+  graphs; it decides whether an unplanned break is an error (`True`) or silent (`False`).
+- 2 -> 3: 120 -> 40 graphs per step. The cost of boundaries: launches, host gaps, and
+  intermediates written to HBM and read back.
+- 3 -> 4: 40 -> 1. Whether fewer boundaries still pay once graphs are large, and the price
+  in compile time.
+- 3 -> 5 -> 6: same scope, native attention vs our hand-written NKI kernel vs nkilib
+  `attention_cte`.
+- 6 -> 7: the remaining staging kernels on top (step 7 is today's best, 7.2 s total).
 
 ### Trade-offs per variant (expected; the runs will confirm or correct)
 
@@ -162,16 +168,22 @@ Step time ≈ total NEFF time + total gap time; breaks raise both.
 
 ## 5. Results (to fill in after the runs)
 
-| Variant | Graphs per block (dynamo) | Graph-break reasons | NEFFs | Warm-up compile | Block / piece NEFF time | Denoise | s/step | Total | Exec/step (trace) | Busy fraction | Median gap |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| `block` | | | | | | | | | | | |
-| `block_breaks` | | | | | | | | | | | |
-| `sublayer` | | | | | | | | | | | |
-| `model` | | | | | | | | | | | |
+| Step | Graphs/step (dynamo) | Break reasons | Warm-up compile | Graph NEFF time | Denoise | s/step | Total | Exec/step (trace) | Busy fraction | Median gap |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | | | | | | | | | | |
+| 2 | | | | | | | | | | |
+| 3 | | | | | | | | | | |
+| 4 | | | | | | | | | | |
+| 5 | | | | | | | | | | |
+| 6 | | | | | | | | | | |
+| 7 | | | | | | | | | | |
 
 ## 6. System traces (Neuron Explorer screenshots, to add)
 
-- `block`: _pending_
-- `block_breaks`: _pending_
-- `sublayer`: _pending_
-- `model`: _pending_
+- Step 1: _pending_
+- Step 2: _pending_
+- Step 3: _pending_
+- Step 4: _pending_
+- Step 5: _pending_
+- Step 6: _pending_
+- Step 7: _pending_
