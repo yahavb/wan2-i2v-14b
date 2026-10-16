@@ -59,12 +59,25 @@ The VAE (`models/vae_static21.py:40, 316-317`) and the text encoder
 
 ## 3. Variants (switch: `FAST_SCOPE`, to be added)
 
-| Variant | Scope | `fullgraph` | Graphs per block | What it shows |
+Each variant changes one thing: where the DiT graph boundaries fall. Kernels, math and
+inputs are identical. A denoise step runs 40 transformer blocks.
+
+| Variant | How it is compiled | `fullgraph` | Graphs per denoise step | The question it answers |
 |---|---|---|---|---|
-| `block` (current best) | one graph per transformer block | `True` | 1 | baseline |
-| `block_breaks` | same region; `torch._dynamo.graph_break()` after self-attn, cross-attn and FFN | `False` (`True` refuses to compile) | 3–4 | cost of graph breaks |
-| `sublayer` | the same pieces compiled as separate units on purpose | `True` | 3–4 | boundaries, not the flag, set the cost |
-| `model` | all 40 blocks in one graph (staging style) | `True` | 1 per step | the other direction: fewer launches, longer compile |
+| `block` | each transformer block is one graph (today's code) | `True` | 40 | Baseline. |
+| `block_breaks` | same as `block`, plus `torch._dynamo.graph_break()` after self-attention and after cross-attention, so each block splits into 3 graphs | `False` (required: `True` rejects a graph break) | 120 | How much do graph breaks cost? |
+| `sublayer` | self-attention, cross-attention and FFN compiled as 3 separate units per block | `True` | 120 | Same boundaries as `block_breaks`, different flag: is the cost from the boundaries or from the flag? |
+| `model` | all 40 blocks compiled as one graph | `True` | 1 | Does removing the per-block boundaries help, and what does it cost in compile time? |
+
+How to read the comparison:
+
+- `block` vs `block_breaks`: same code, 3x the graphs. The difference is the cost of graph
+  breaks.
+- `block_breaks` vs `sublayer`: same 120 graphs. If their times match, the boundaries set the
+  cost, not `fullgraph`. `fullgraph=True` only decides whether an unplanned break is an error
+  (`True`) or is allowed silently (`False`).
+- `block` vs `model`: 40 graphs vs 1. Shows whether fewer boundaries still pay off once the
+  graphs are already large.
 
 ### Trade-offs per variant (expected; the runs will confirm or correct)
 
@@ -80,7 +93,7 @@ The VAE (`models/vae_static21.py:40, 316-317`) and the text encoder
 - Gains: tolerant: code that cannot be traced (logging, data-dependent Python, a library
   call dynamo does not support) just splits the graph instead of failing; easy to bring up
   a new model.
-- Costs: 3–4 launches per block (120–160 per step), each with a host gap and dynamo guard
+- Costs: 3 launches per block (120 per step), each with a host gap and dynamo guard
   checks; no fusion across a break; intermediates written to HBM and read back at every
   break; more NEFFs to compile and load. Silent: a new break added by a code change goes
   unnoticed unless you check the dynamo counters.
@@ -105,7 +118,7 @@ The VAE (`models/vae_static21.py:40, 316-317`) and the text encoder
 
 | | `block` | `block_breaks` | `sublayer` | `model` |
 |---|---|---|---|---|
-| Launches per step | ~40 | ~120–160 | ~120–160 | 1 |
+| Launches per step | ~40 | ~120 | ~120 | 1 |
 | Fusion | within block | within piece | within piece | across blocks |
 | HBM round trips at boundaries | per block | per piece | per piece | none between blocks |
 | Compile time | moderate | moderate (more NEFFs) | moderate (more NEFFs) | longest |
@@ -119,7 +132,9 @@ Planned code difference (shown side by side once implemented):
 # block_breaks: same compiled region, fullgraph=False, explicit breaks inside forward()
 y = self_attention(...)
 torch._dynamo.graph_break()        # graph 1 ends here
-...
+y = cross_attention(...)
+torch._dynamo.graph_break()        # graph 2 ends here
+y = ffn(...)                       # graph 3
 torch.compile(_FastBlock(b), backend="neuron", dynamic=False, fullgraph=False)
 
 # sublayer: each piece is its own fullgraph unit
@@ -133,7 +148,7 @@ self.ffn = [torch.compile(_FFNPart(b), **COMPILE_KW) for b in model.blocks]
 | Variant | Executions per step | Execution length | Gaps between executions |
 |---|---|---|---|
 | `block` | ~40 (+ a few tiny: time, patch, head) | ~13.6 ms each | short: host launch only; all-reduces inside each execution |
-| `block_breaks` / `sublayer` | ~120–160 | shorter pieces | one gap before each piece (host back in Python, dynamo guard checks, next launch); extra DMA at piece boundaries (intermediates to and from HBM); pieces sum to more than one block |
+| `block_breaks` / `sublayer` | ~120 | shorter pieces | one gap before each piece (host back in Python, dynamo guard checks, next launch); extra DMA at piece boundaries (intermediates to and from HBM); pieces sum to more than one block |
 | `model` | 1 | ~550 ms | almost none |
 
 `block_breaks` and `sublayer` should look nearly identical: same boundaries.
