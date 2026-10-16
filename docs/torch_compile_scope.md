@@ -87,6 +87,8 @@ What each step shows:
 
 ### Trade-offs per variant (expected; the runs will confirm or correct)
 
+Scope variants by ladder step: `block_breaks` = step 1, `sublayer` = step 2, `block` = step 3, `model` = step 4.
+
 **`block` — one graph per block, `fullgraph=True`**
 - Gains: one launch per block; full fusion inside the block; all-reduces scheduled next to
   their matmuls; one NEFF reused by all 40 blocks, so compile is moderate (minutes).
