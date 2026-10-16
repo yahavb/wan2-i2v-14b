@@ -161,6 +161,39 @@ Conclusion: one graph per block is the sweet spot. Past that, the gains come fro
 kernels inside the graph: native SDPA 8.4 s, our hand-written NKI attention 16.9 s,
 nkilib `attention_cte` 6.3 s, plus o_proj and adaln kernels 5.8 s (denoise, same scope).
 
+## Talking points
+
+1. Before the ladder (separate run, `exp/staging-attn`, stage `cte`): with only
+   `patch_embedding`, `text_embedding`, `head` and each block's `ffn` compiled and the rest
+   of the block outside `torch.compile`, total was 30.6 s. Compiling each whole block with
+   the same `attention_cte` kernel brought it to 8.3 s (4x).
+2. `fullgraph=True` is a guarantee, not a speedup: steps 1 and 2 have the same 120
+   boundaries per step and the same 0.88 s per step. With `True`, an unplanned graph break
+   fails the compile instead of silently splitting the graph; dynamo's counter shows step
+   1's 2 user-inserted breaks.
+3. Fewer graph boundaries cut host work: 120 -> 40 launches per step (step 1 -> 3) saves
+   0.04 s per step (-5%). Each launch ends with a handoff (back to Python, guard checks,
+   next launch) while the device idles.
+4. Fewer boundaries also cut host-to-device traffic. In the trace,
+   `NC:0/host_to_device/transfer_bandwidth` shows several pulses per denoise step in step 1
+   (plus a continuous stream of small copies in `host_to_device_transfers`), one compact
+   block per step in step 3, and a single pulse per step in step 4 (the per-step input).
+   Each pulse is data copied from the CPU to the device; fewer is better. Its measured
+   share is small (steps 1-4 differ by 0.04 s per step), but it is visible evidence of the
+   overhead graph breaks add.
+5. Bigger scope costs compile and load time: warm-up denoise (includes compiling)
+   36 s -> 45 s -> 117 s for steps 2 -> 3 -> 4, and the single whole-model NEFF takes about
+   1.3 s to load at process start. Step 4 is no faster than step 3 (0.85 vs 0.84 s/step).
+6. Compile once, reuse 40 times: the 40 blocks share one compiled graph (dynamo counts 10
+   distinct graphs for the whole run, not 40+). That reuse makes one graph per block the
+   sweet spot.
+7. Once compiled, the kernel matters more than the scope: at block scope, our hand-written
+   NKI attention 16.9 s, native SDPA 8.4 s, nkilib `attention_cte` 6.3 s, plus o_proj and
+   adaln kernels 5.8 s (denoise). Scope moved denoise by 5%; the kernel by up to 2.7x.
+8. Next lever: collectives are 38% of the block's time even inside one graph (three
+   all-reduces of 85 MB across 8 ranks on 2 chips per block); TP4 x CFG2 would halve them
+   and keep them on one chip.
+
 ## 1. Why torch.compile matters here (measured)
 
 | Path | What runs | Denoise | Total |
