@@ -13,11 +13,11 @@ RoPE (rotary position embedding) tells attention where each token sits. Attentio
 itself only compares contents; it has no idea which video token is in which frame, row or
 column. RoPE rotates pairs of query/key channels by an angle that depends on the token's
 (frame, row, column) position, so the attention score between two tokens depends on how
-far apart they are. For video it is 3-D: one set of frequencies per axis. Without it the
-model could not tell neighbouring pixels from distant ones.
+far apart they are. Without it the model could not tell neighbouring pixels from distant
+ones.
 
-The original Wan code (`wan/modules/model.py`, `rope_apply`) is written for eager GPU
-execution:
+The original Wan2.2 code applies RoPE like this (`wan/modules/model.py`, function
+`rope_apply`, called for the queries and for the keys in every self-attention):
 
 ```python
 for i, (f, h, w) in enumerate(grid_sizes.tolist()):          # tensor values -> Python ints
@@ -26,35 +26,33 @@ for i, (f, h, w) in enumerate(grid_sizes.tolist()):          # tensor values -> 
     x_i = torch.view_as_real(x_i * freqs_i).flatten(2)       # complex multiply
 ```
 
-Why it cannot be compiled as part of one graph on Neuron:
-- `grid_sizes.tolist()` turns tensor values into Python numbers in the middle of the
-  forward pass; the compiler needs the whole computation as a graph of tensor ops, so it
-  has to stop the graph there.
-- `torch.view_as_complex`, complex multiply and float64: complex numbers and float64 are
-  not supported on Neuron at all.
-- The angle grid is rebuilt on every call.
+Three things in it stop `torch.compile` from capturing the attention as one graph on
+Neuron:
+- `grid_sizes.tolist()` reads tensor values into Python numbers in the middle of the
+  forward pass. A graph can only contain tensor operations, so the graph has to end there.
+- `torch.view_as_complex`, the complex multiply and `float64`: Neuron does not support
+  complex numbers or float64.
+- The angle table is rebuilt from scratch on every call.
 
-Our first Neuron version (`wan/modules/rope_neuron.py`, `rope_apply_neuron`) removed the
-complex math, but still calls `grid_sizes.tolist()`, builds the cos/sin grids on the CPU
-and copies them to the device (`.to(device)`) on every call, twice per block.
-
-A second example of the same kind: the old TP all-reduce (`models/tp_utils.py:96`) is
-decorated `@torch.compiler.disable` "to force a graph break", so every all-reduce ran
-outside the compiled graph.
+The same kind of problem appears in the original tensor-parallel all-reduce
+(`models/tp_utils.py:96`): it is marked `@torch.compiler.disable`, which tells dynamo to
+end the graph before it and start a new one after it, so every all-reduce runs outside
+the compiled graph.
 
 ### 2. Why `fullgraph=False` exists
 
-`torch.compile(..., fullgraph=False)` handles code like this automatically: dynamo
-compiles everything it can and splits the graph at each line it cannot capture. That lets
+`torch.compile(..., fullgraph=False)` handles code like RoPE's `.tolist()` automatically:
+dynamo compiles everything it can and splits the graph at each line it cannot capture. That lets
 people compile a model without rewriting it. The price: one compiled graph per piece,
 with Python running between the pieces.
 
 ### 3. What that costs: step 1
 
-Step 1 reproduces the cost cleanly. Each transformer block is split into 3 graphs with two
-explicit `torch._dynamo.graph_break()` calls, compiled with `fullgraph=False` (in the
-ladder RoPE itself is already fixed, so the breaks are placed on purpose at the
-sub-layer boundaries, and the measurement isolates the cost of the breaks):
+Step 1 of the ladder measures this cost on purpose. Everything else is already fixed (RoPE
+and the all-reduce are inside the graph, see section 4), and we add back two graph breaks
+per transformer block, at the end of self-attention and at the end of cross-attention.
+Each block becomes 3 graphs, compiled with `fullgraph=False` (`FAST_SCOPE=block_breaks`,
+`models/fast_dit.py`, `_FastBlock.forward`):
 
 ```python
 x = self.self_part(x, e, cos, sin)
@@ -64,14 +62,35 @@ torch._dynamo.graph_break()          # graph 2 ends
 return self.ffn_part(x, e)           # graph 3
 ```
 
-In the system trace (one denoise step = 120 launches):
-- `neuron_rt`: many short `kbl_exec_wait` bars, one per launch. After each one comes a
-  fixed-cost handoff: the host returns to Python, dynamo checks its guards, and the next
-  launch is set up, while the device sits idle.
-- `neuron_hw`: `nc_exec_running` is chopped into many short pieces with extra scattered
-  work between them.
-- `host_to_device_transfers`: a continuous stream through the whole denoise.
-- Measured: 0.88 s per step.
+40 blocks x 3 graphs = 120 graph launches per denoise step. Measured: 0.88 s per step,
+denoise 8.8 s, total 9.6 s.
+
+**Zoomed out: the whole process (358 s).** The inference is the dense band near the end
+(about 312-322 s); everything before it is start-up and model loading.
+
+![Step 1, whole process: start-up, model loading, and the inference band near the end](img/compile_scope/step1_whole_process.png)
+
+**Zoomed in: the inference (12.2 s window, the 10 denoise steps between about 316 and
+324 s).** The rows that show the cost:
+- `neuron_rt/worker:N`: many short launches per step, scattered; each launch is a
+  `kbl_exec_wait` (the host waiting for the device) followed by a handoff (the host goes
+  back to Python, dynamo checks its guards, the next launch is set up) while the device
+  idles.
+- `neuron_hw/worker:N/NC0:…`: the device work is broken up, with extra scattered work in a
+  second lane.
+
+![Step 1, inference window, engine rows: scattered launches per step](img/compile_scope/step1_inference_engines.png)
+
+- `worker:N/device_to_host_transfers`: one green tick per denoise step (the latent copied
+  to the CPU for the scheduler); 10 ticks, about 0.88 s apart.
+- `worker:N/host_to_device_transfers`: a continuous dense stream through the whole denoise.
+- `NC:0/host_to_device/transfer_bandwidth`: several pulses per step.
+
+![Step 1, inference window, transfer rows: continuous host-to-device traffic](img/compile_scope/step1_inference_transfers.png)
+
+_To add (retake): one denoise step (between the 5th and 6th green tick) and the first
+60 ms of that step, same rows, plus the details panel of one bar on
+`neuron_hw/worker:0/NC0:4`._
 
 ### 4. The fix: `fullgraph=True`, which means changing the code
 
@@ -109,6 +128,10 @@ dynamic=False, fullgraph=True)`; `torch.compile(_FastBlock(b), **COMPILE_KW)`):
 - All 40 blocks are identical, so they share one compiled graph: compile once, run 400
   times per video.
 
+![Step 3, inference window, engine rows: one clean group of launches per step, device lane solid](img/compile_scope/step3_inference_engines.png)
+
+![Step 3, inference window, transfer rows: one host-to-device block per step](img/compile_scope/step3_inference_transfers.png)
+
 ### 6. One more step: the whole model as one graph (step 4)
 
 Move the 40-block loop into one module and compile it once; dynamo unrolls the loop at
@@ -129,6 +152,10 @@ self.whole = torch.compile(_FastModel(fbs), **COMPILE_KW)
   were already small.
 - Costs: warm-up (which includes compiling) 45 s -> 117 s, and the single large NEFF
   takes about 1.3 s to load at process start.
+
+![Step 4, inference window, engine rows: one kbl_exec_wait and one nc_exec_running per step; the long nrt_load at the start](img/compile_scope/step4_inference_engines.png)
+
+![Step 4, inference window, transfer rows: one small host-to-device burst per step](img/compile_scope/step4_inference_transfers.png)
 
 Conclusion: one graph per block is the sweet spot. Past that, the gains come from the
 kernels inside the graph: native SDPA 8.4 s, our hand-written NKI attention 16.9 s,
