@@ -3,3 +3,4 @@
 *.tar.gz
 dit_pairs*/
 __pycache__/
+systrace*/
