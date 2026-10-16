@@ -225,11 +225,15 @@ spec:
                   case "$IMPL" in *+vaetile*) export VAE_IMPL=static_tiled ;; esac
                   export T5_IMPL=eager
                   case "$IMPL" in *+t5*) export T5_IMPL=fast ;; esac
-                  echo "  FAST_ATTN_IMPL=$FAST_ATTN_IMPL FAST_MLP=$FAST_MLP FAST_OPROJ=$FAST_OPROJ FAST_ADALN=$FAST_ADALN VAE_IMPL=$VAE_IMPL T5_IMPL=$T5_IMPL" ;;
+                  export FAST_SCOPE=block
+                  case "$IMPL" in *+scope_breaks*) export FAST_SCOPE=block_breaks ;; esac
+                  case "$IMPL" in *+scope_sub*) export FAST_SCOPE=sublayer ;; esac
+                  case "$IMPL" in *+scope_model*) export FAST_SCOPE=model ;; esac
+                  echo "  FAST_ATTN_IMPL=$FAST_ATTN_IMPL FAST_MLP=$FAST_MLP FAST_OPROJ=$FAST_OPROJ FAST_ADALN=$FAST_ADALN VAE_IMPL=$VAE_IMPL T5_IMPL=$T5_IMPL FAST_SCOPE=$FAST_SCOPE" ;;
                 esac
-                rm -rf $NEFF_DIRS; mkdir -p $NEFF_DIRS
+                mkdir -p $NEFF_DIRS
                 touch "/tmp/stage_start_$IMPL"; sleep 1
-                echo "████ STAGE ATTN_IMPL=$IMPL (cache emptied: $NEFF_DIRS) ████"
+                echo "████ STAGE ATTN_IMPL=$IMPL ████"
 
                 echo "=== [1/3 $IMPL] WARMUP (compile into this stage's cache; NOT timed) ==="
                 PAD_DEBUG=1 run_wan "$LOCAL_RESULTS/warmup_$IMPL.txt" 1 | grep -iE "ATTN_IMPL|kernel: |Compiling|total=|FAILED|Error|Traceback|\[SP\]|SP degree|TP degree|World size" || echo "(warmup output captured)"
@@ -254,6 +258,19 @@ spec:
                   && echo "clean video saved: wan2_i2v_output_clean_$IMPL.mp4" || echo "NO VIDEO FROM CLEAN RUN"
                 rm -f /tmp/wan2_i2v_output.mp4
                 result_line "$IMPL" | tee -a "$LOCAL_RESULTS/results.txt"
+                CS=$(grep -ohE "\[compile\] .*" "$LOCAL_RESULTS/warmup_$IMPL.txt" 2>/dev/null | tail -1) || true
+                echo "COMPILE [$IMPL] ${CS:-n/a}" | tee -a "$LOCAL_RESULTS/compile_stats.txt"
+                if [ "${SYSTRACE:-0}" = "1" ]; then
+                  echo "=== [2b $IMPL] SYSTEM TRACE (Neuron Profiler 2.0, 1 run) ==="
+                  ST="$LOCAL_RESULTS/systrace_$IMPL"; rm -rf "$ST"; mkdir -p "$ST"
+                  NEURON_RT_INSPECT_ENABLE=1 NEURON_RT_INSPECT_SYSTEM_PROFILE=1 \
+                  NEURON_RT_INSPECT_DEVICE_PROFILE=0 NEURON_RT_INSPECT_OUTPUT_DIR="$ST" \
+                    run_wan "$LOCAL_RESULTS/systrace_run_$IMPL.txt" 1 | grep -iE "total=|FAILED" || echo "(systrace run captured)"
+                  echo "  trace_info.pb: $(find "$ST" -name trace_info.pb | wc -l)  ntrace.pb: $(find "$ST" -name ntrace.pb | wc -l)"
+                  tar -czf "$LOCAL_RESULTS/systrace_$IMPL.tar.gz" -C "$LOCAL_RESULTS" "systrace_$IMPL" 2>/dev/null \
+                    && echo "  systrace_$IMPL.tar.gz: $(du -h "$LOCAL_RESULTS/systrace_$IMPL.tar.gz" | cut -f1)" || echo "  systrace tar failed"
+                  rm -rf "$ST"
+                fi
                 LAST_IMPL="$IMPL"
               done
               T_CLEAN=$(median_total_s "$LOCAL_RESULTS/clean_$LAST_IMPL.txt")
@@ -297,6 +314,7 @@ spec:
               for IMPL in $ATTN_IMPLS; do
                 echo "  kubectl cp default/$HOSTNAME:/tmp/results/dit_pairs_$IMPL.tar.gz ./dit_pairs_$IMPL.tar.gz"
                 echo "  kubectl cp default/$HOSTNAME:/tmp/results/wan2_i2v_output_clean_$IMPL.mp4 ./wan2_i2v_output_clean_$IMPL.mp4"
+                echo "  kubectl cp default/$HOSTNAME:/tmp/results/systrace_$IMPL.tar.gz ./systrace_$IMPL.tar.gz"
               done
               echo "  kubectl cp default/$HOSTNAME:$ARCHIVE ./$(basename "$ARCHIVE")"
               find "$LOCAL_RESULTS" -maxdepth 2 -type f 2>/dev/null | sed 's/^/    /' | head -40
@@ -314,6 +332,7 @@ spec:
 
               echo "════════ ATTENTION PROGRESSION (same spec, same node) ════════"
               cat "$LOCAL_RESULTS"/attn_kernel_*.txt 2>/dev/null || true
+              cat "$LOCAL_RESULTS/compile_stats.txt" 2>/dev/null || true
               for IMPL in $ATTN_IMPLS; do result_line "$IMPL"; done
               sleep 864000
           resources:
@@ -352,7 +371,9 @@ spec:
             - name: USE_NKI_KERNELS
               value: "1"
             - name: ATTN_IMPLS
-              value: "fast_cte+oproj+adaln+vaetile+t5"
+              value: "fast_sdpa+scope_breaks+vaetile+t5 fast_sdpa+scope_sub+vaetile+t5 fast_sdpa+vaetile+t5 fast_sdpa+scope_model+vaetile+t5 fast_legacy+vaetile+t5 fast_cte+vaetile+t5 fast_cte+oproj+adaln+vaetile+t5"
+            - name: SYSTRACE
+              value: "1"
             - name: FAST_DIT
               value: "1"
             - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE

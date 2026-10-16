@@ -430,6 +430,8 @@ def main():
         denoise_time = time.time() - denoise_start
         if rank == 0:
             logger.info(f"{run_label} denoising: {denoise_time:.1f}s ({denoise_time/NUM_STEPS:.1f}s/step)")
+            if FAST_DIT:
+                logger.info(f"[compile] {FastWanDiT.compile_stats()}")
 
         # ── Free DiT for VAE decode (FAST_DIT keeps both experts resident) ──
         if not FAST_DIT:

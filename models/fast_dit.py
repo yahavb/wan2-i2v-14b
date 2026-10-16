@@ -46,27 +46,91 @@ LNC = int(os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2"))
 FAST_MLP = os.environ.get("FAST_MLP", "0") == "1"
 FAST_OPROJ = os.environ.get("FAST_OPROJ", "0") == "1"
 FAST_ADALN = os.environ.get("FAST_ADALN", "0") == "1"
+# Compile scope (torch.compile scope study, docs/torch_compile_scope.md):
+#   block        one graph per transformer block, fullgraph=True (default)
+#   block_breaks same region, torch._dynamo.graph_break() after self-attn and cross-attn,
+#                fullgraph=False -> 3 graphs per block
+#   sublayer     self-attn / cross-attn / FFN compiled as 3 separate fullgraph=True units
+#   model        all 40 blocks in one fullgraph=True graph
+FAST_SCOPE = os.environ.get("FAST_SCOPE", "block")
 COMPILE_KW = dict(backend="neuron", dynamic=False, fullgraph=True)
 
 
 # ─── attention_cte kernel (staging cp_attention._wan_attention_kernel, tp_out=False) ───
 
-def _wrap(kernel, op_name):
-    """Launch an @nki.jit kernel from inside a fullgraph graph, on all LNC cores."""
+def _wrap(kernel, op_name, grid=True):
+    """Launch an @nki.jit kernel from inside a fullgraph graph, on all LNC cores
+    (grid=False: single-program launch, for kernels that do not shard across cores)."""
     if FAST_KERNEL_WRAP == "op":
         from torch_neuronx import nki_op
 
         @nki_op(op_name)
         def _op(*args: torch.Tensor) -> torch.Tensor:
-            return kernel[LNC](*args)
+            return kernel[LNC](*args) if grid else kernel(*args)
 
         return _op
     from torch_neuronx.nki_hop import wrap_nki
     w = wrap_nki(kernel)
+    if not grid:
+        return w
     try:
         return w[LNC]
     except Exception:  # noqa: BLE001 -- no grid launch on this wrap_nki
         return w
+
+
+# ─── legacy NKI attention (kernels/self_attention.py, kernels/cross_attention.py) ───
+# Same kernels the eager path ran (FAST_ATTN_IMPL=legacy), called in-graph: per CFG item,
+# [n, d, L] layout, Q padded to 128, K/V padded to 2048 with a -inf mask, P transposed by
+# an identity matmul. Single-program launch, as in the eager path.
+
+_legacy = {}
+
+
+def _init_legacy(L, Lc, device):
+    import math as _m
+    import nki
+    from kernels.self_attention import wan_flash_self_attn
+    from kernels.cross_attention import wan_cross_attn
+    d = 128
+    lk = -(-L // 2048) * 2048
+    mask = torch.zeros(128, lk, dtype=torch.bfloat16)
+    mask[:, L:] = float("-inf")
+    scale, nsec = 1.0 / _m.sqrt(d), lk // 2048
+
+    @nki.jit
+    def _self(q, k, v, identity, mask):
+        return wan_flash_self_attn(q, k, v, identity, mask, softmax_scale=scale, num_sections=nsec)
+
+    @nki.jit
+    def _cross(q, k, v, identity):
+        return wan_cross_attn(q, k, v, identity, softmax_scale=scale)
+
+    _legacy.update(self=_wrap(_self, "wan14b::legacy_self", grid=False),
+                   cross=_wrap(_cross, "wan14b::legacy_cross", grid=False),
+                   identity=torch.eye(128, dtype=torch.bfloat16).to(device),
+                   mask=mask.to(device), L=L, lk=lk)
+    logger.info(f"[fast_dit] legacy NKI attention: L={L} K padded to {lk}, single-program")
+
+
+def _legacy_attn(q, k, v, cross):
+    """q [B, Lq, n, d], k/v [B, Lk, n, d] -> [B, Lq, n, d], one kernel call per CFG item."""
+    B, Lq, n, d = q.shape
+    lq = -(-Lq // 128) * 128
+    outs = []
+    for bi in range(B):
+        qn = F.pad(q[bi].permute(1, 2, 0), (0, lq - Lq))                     # [n, d, Lq_pad]
+        kn = k[bi].permute(1, 2, 0)                                           # [n, d, Lk]
+        vn = v[bi].permute(1, 0, 2)                                           # [n, Lk, d]
+        if cross:
+            o = _legacy["cross"](qn.contiguous(), kn.contiguous(), vn.contiguous(), _legacy["identity"])
+        else:
+            pad = _legacy["lk"] - k.shape[1]
+            kn, vn = F.pad(kn, (0, pad)), F.pad(vn, (0, 0, 0, pad))
+            o = _legacy["self"](qn.contiguous(), kn.contiguous(), vn.contiguous(),
+                                _legacy["identity"], _legacy["mask"])
+        outs.append(o[:Lq].unsqueeze(0))                                     # [1, Lq, n, d]
+    return torch.cat(outs, dim=0)
 
 
 _cte_calls = {}
@@ -218,6 +282,8 @@ def _get_constmax():
 
 def _self_attn(q, k, v):
     """q/k/v [B, L, n, d] token-major -> [B, L, n, d]."""
+    if FAST_ATTN_IMPL == "legacy":
+        return _legacy_attn(q, k, v, cross=False)
     if FAST_ATTN_IMPL == "constmax":
         return _get_constmax()(q.contiguous(), k.contiguous(), v.contiguous()).transpose(1, 2)  # [B, n, L, d] -> [B, L, n, d]
     return _attn(q, k, v)
@@ -244,6 +310,8 @@ def _attn(q, k, v):
     """q [B, Lq, n, d], k/v [B, Lk, n, d] -> [B, Lq, n, d]."""
     B, Lq, n, d = q.shape
     Lk = k.shape[1]
+    if FAST_ATTN_IMPL == "legacy":
+        return _legacy_attn(q, k, v, cross=True)
     if FAST_ATTN_IMPL == "sdpa":
         return F.scaled_dot_product_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2)
@@ -301,12 +369,50 @@ class _FastBlock(nn.Module):
         super().__init__()
         self.block = block
 
+    def _e(self, e):
+        return [t.squeeze(2) for t in (self.block.modulation.unsqueeze(0) + e).chunk(6, dim=2)]  # [1, 1, C]
+
+    # Sub-layers of the unfused (no adaln / o_proj / mlp kernel) block. The scope variants
+    # put graph boundaries between them; the math is identical in every scope.
+    def self_part(self, x, e0, cos, sin):
+        blk, e = self.block, self._e(e0)
+        sa = blk.self_attn
+        B, L, _ = x.shape
+        n, d = sa.num_heads, sa.head_dim
+        h = blk.norm1(x).to(torch.bfloat16) * (1 + e[1]) + e[0]
+        q, k = _tp_rms_qk(F.linear(h, sa.q.weight, sa.q.bias),
+                          F.linear(h, sa.k.weight, sa.k.bias), sa.norm_q, sa.norm_k)
+        v = F.linear(h, sa.v.weight, sa.v.bias).view(B, L, n, d)
+        q, k = _rope(q.view(B, L, n, d), cos, sin), _rope(k.view(B, L, n, d), cos, sin)
+        return x + _row_linear(sa.o, _self_attn(q, k, v).reshape(B, L, n * d)) * e[2]
+
+    def cross_part(self, x, ck, cv):
+        blk = self.block
+        ca = blk.cross_attn
+        B, L, _ = x.shape
+        n, d = ca.num_heads, ca.head_dim
+        q = _tp_rms(F.linear(blk.norm3(x), ca.q.weight, ca.q.bias), ca.norm_q).view(B, L, n, d)
+        return x + _row_linear(ca.o, _attn(q, ck, cv).reshape(B, L, n * d))
+
+    def ffn_part(self, x, e0):
+        blk, e = self.block, self._e(e0)
+        h = blk.norm2(x).to(torch.bfloat16) * (1 + e[4]) + e[3]
+        return x + _row_linear(blk.ffn[2], blk.ffn[1](F.linear(h, blk.ffn[0].weight, blk.ffn[0].bias))) * e[5]
+
     def forward(self, x, e, cos, sin, ck, cv):
+        if not (FAST_ADALN or FAST_OPROJ or FAST_MLP):
+            x = self.self_part(x, e, cos, sin)
+            if FAST_SCOPE == "block_breaks":
+                torch._dynamo.graph_break()          # graph 1 ends: self-attention
+            x = self.cross_part(x, ck, cv)
+            if FAST_SCOPE == "block_breaks":
+                torch._dynamo.graph_break()          # graph 2 ends: cross-attention
+            return self.ffn_part(x, e)                # graph 3: FFN
         blk = self.block
         sa, ca = blk.self_attn, blk.cross_attn
         B, L, _ = x.shape
         n, d = sa.num_heads, sa.head_dim
-        e = [t.squeeze(2) for t in (blk.modulation.unsqueeze(0) + e).chunk(6, dim=2)]  # [1, 1, C]
+        e = self._e(e)
 
         C = x.shape[-1]
         if FAST_ADALN:
@@ -350,6 +456,30 @@ class _FastBlock(nn.Module):
         else:
             y = _row_linear(blk.ffn[2], blk.ffn[1](F.linear(h, blk.ffn[0].weight, blk.ffn[0].bias)))
         return x + y * e[5]
+
+
+class _Part(nn.Module):
+    """One sub-layer of a block as its own compiled unit (FAST_SCOPE=sublayer)."""
+
+    def __init__(self, fast_block, which):
+        super().__init__()
+        self.fb, self.which = fast_block, which
+
+    def forward(self, *args):
+        return getattr(self.fb, self.which)(*args)
+
+
+class _FastModel(nn.Module):
+    """All blocks in one graph (FAST_SCOPE=model); kv = (ck0, cv0, ck1, cv1, ...)."""
+
+    def __init__(self, fast_blocks):
+        super().__init__()
+        self.blocks = nn.ModuleList(fast_blocks)
+
+    def forward(self, x, e, cos, sin, *kv):
+        for i, b in enumerate(self.blocks):
+            x = b(x, e, cos, sin, kv[2 * i], kv[2 * i + 1])
+        return x
 
 
 class _FastCrossKV(nn.Module):
@@ -487,13 +617,29 @@ class FastWanDiT:
         self.time = torch.compile(_FastTime(model), **COMPILE_KW)
         self.patch = torch.compile(_FastPatch(model.patch_embedding), **COMPILE_KW)
         self.text = torch.compile(_FastText(model.text_embedding), **COMPILE_KW)
-        self.blocks = [torch.compile(_FastBlock(b), **COMPILE_KW) for b in model.blocks]
+        assert FAST_SCOPE in ("block", "block_breaks", "sublayer", "model"), FAST_SCOPE
+        if FAST_SCOPE in ("block_breaks", "sublayer"):
+            assert not (FAST_ADALN or FAST_OPROJ or FAST_MLP), "split scopes run the unfused block"
+        if FAST_ATTN_IMPL == "legacy":
+            _init_legacy(math.prod(self.grid), model.text_len, device)
+        fbs = [_FastBlock(b) for b in model.blocks]
+        self.blocks = self.parts = self.whole = None
+        if FAST_SCOPE == "block":
+            self.blocks = [torch.compile(fb, **COMPILE_KW) for fb in fbs]
+        elif FAST_SCOPE == "block_breaks":
+            self.blocks = [torch.compile(fb, **{**COMPILE_KW, "fullgraph": False}) for fb in fbs]
+        elif FAST_SCOPE == "sublayer":
+            self.parts = [tuple(torch.compile(_Part(fb, w), **COMPILE_KW)
+                                for w in ("self_part", "cross_part", "ffn_part")) for fb in fbs]
+        else:
+            self.whole = torch.compile(_FastModel(fbs), **COMPILE_KW)
+        self.n_blocks = len(fbs)
         self.cross_kv = [torch.compile(_FastCrossKV(b), **COMPILE_KW) for b in model.blocks]
         self.head = torch.compile(
             _FastHead(model.head, self.grid, model.patch_size, model.out_dim, guide_scale), **COMPILE_KW)
         self.context = None
         logger.info(f"[fast_dit] grid={self.grid} L={math.prod(self.grid)} attn={FAST_ATTN_IMPL} "
-                    f"fullgraph=True blocks={len(self.blocks)} cfg_batch=2 guide={guide_scale}")
+                    f"scope={FAST_SCOPE} blocks={self.n_blocks} cfg_batch=2 guide={guide_scale}")
 
     def set_context(self, ctx_cond, ctx_null):
         context = self.text(torch.cat([ctx_cond, ctx_null], dim=0).to(torch.bfloat16))
@@ -504,9 +650,24 @@ class FastWanDiT:
         s = sinusoidal_embedding_1d(self.model.freq_dim, torch.tensor([float(t)], dtype=torch.float64))
         e, e0 = self.time(s.to(torch.bfloat16).view(1, 1, -1).to(self.device))
         x = self.patch(latent.to(torch.bfloat16), y.to(torch.bfloat16))
-        for blk, (ck, cv) in zip(self.blocks, self.context):
-            x = blk(x, e0, self.cos, self.sin, ck, cv)
+        if self.whole is not None:
+            x = self.whole(x, e0, self.cos, self.sin, *[t for kv in self.context for t in kv])
+        elif self.parts is not None:
+            for (sp, cp, fp), (ck, cv) in zip(self.parts, self.context):
+                x = fp(cp(sp(x, e0, self.cos, self.sin), ck, cv), e0)
+        else:
+            for blk, (ck, cv) in zip(self.blocks, self.context):
+                x = blk(x, e0, self.cos, self.sin, ck, cv)
         return self.head(x, e)
+
+    @staticmethod
+    def compile_stats():
+        """Dynamo's own counters (cumulative per process): graphs compiled, graph breaks."""
+        from torch._dynamo.utils import counters
+        breaks = dict(counters.get("graph_break", {}))
+        return (f"scope={FAST_SCOPE} attn={FAST_ATTN_IMPL} "
+                f"unique_graphs={counters['stats'].get('unique_graphs', 0)} "
+                f"graph_breaks={sum(breaks.values())} reasons={list(breaks)[:4]}")
 
     @staticmethod
     def log_graph_breaks():
