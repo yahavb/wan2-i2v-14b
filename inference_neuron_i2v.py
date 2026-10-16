@@ -227,7 +227,11 @@ def main():
     # VAE_IMPL=static: models/vae_static21.py -- fullgraph encode/decode on rank 0, whole
     # frame, no channel TP (in-graph nkilib conv3d + attention_cte); y is broadcast.
     VAE_IMPL = os.environ.get("VAE_IMPL", "tp")
-    VAE_TP_DEGREE = 1 if VAE_IMPL == "static" else int(os.environ.get("VAE_TP_DEGREE", "8"))
+    # VAE_IMPL=static_tiled: same graphs on EVERY rank; decode is spatial patch-parallel
+    # (one fixed-size latent tile per rank, all-gathered and cross-faded on rank 0);
+    # encode runs whole-frame on every rank (identical y, no broadcast).
+    VAE_TP_DEGREE = (1 if VAE_IMPL == "static" else world_size if VAE_IMPL == "static_tiled"
+                     else int(os.environ.get("VAE_TP_DEGREE", "8")))
     VAE_TP_RANKS = list(range(VAE_TP_DEGREE))
 
     # Load VAE on all VAE TP ranks, shard decoder
@@ -242,7 +246,7 @@ def main():
         vae.std = vae.std.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
         vae.scale = [vae.mean, 1.0 / vae.std]
 
-        if VAE_IMPL == "static":
+        if VAE_IMPL in ("static", "static_tiled"):
             from models.vae_static21 import StaticWanVAE
             vae = StaticWanVAE(vae)
             logger.info("VAE_IMPL=static: fullgraph encode/decode on rank 0")
@@ -441,7 +445,11 @@ def main():
             if rank == 0:
                 logger.info(f"{run_label} VAE decode (TP={VAE_TP_DEGREE})...")
             x0 = [latent.to(torch.bfloat16)]
-            videos = vae.decode(x0)
+            if VAE_IMPL == "static_tiled":
+                grid = tuple(int(v) for v in os.environ.get("VAE_TILE_GRID", "2x4").split("x"))
+                videos = vae.decode_tiled(x0, grid=grid, overlap=int(os.environ.get("VAE_TILE_OVERLAP", "4")))
+            else:
+                videos = vae.decode(x0)
             if rank == 0:
                 video = videos[0]
                 import imageio

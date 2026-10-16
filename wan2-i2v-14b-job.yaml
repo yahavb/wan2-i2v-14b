@@ -79,7 +79,7 @@ spec:
                   /tmp/wan2-i2v-14b/inference_neuron_i2v.py 2>&1 | tee "$OUT"
               }
               median_key() {
-                { grep "DONE:" "$1" 2>/dev/null | grep -oE "$2=[0-9.]+s" | grep -oE "[0-9.]+" || true; } | sort -n | \
+                { grep "DONE:" "$1" 2>/dev/null | tail -n +2 | grep -oE "$2=[0-9.]+s" | grep -oE "[0-9.]+" || true; } | sort -n | \
                   awk '{a[NR]=$1} END{ if(NR==0){print "N/A"} else if(NR%2){print a[(NR+1)/2]} else {printf "%.2f", (a[NR/2]+a[NR/2+1])/2} }'
               }
               median_total_s() {
@@ -222,6 +222,7 @@ spec:
                   case "$IMPL" in *+adaln*) export FAST_ADALN=1 ;; esac
                   export VAE_IMPL=tp
                   case "$IMPL" in *+vae*) export VAE_IMPL=static ;; esac
+                  case "$IMPL" in *+vaetile*) export VAE_IMPL=static_tiled ;; esac
                   export T5_IMPL=eager
                   case "$IMPL" in *+t5*) export T5_IMPL=fast ;; esac
                   echo "  FAST_ATTN_IMPL=$FAST_ATTN_IMPL FAST_MLP=$FAST_MLP FAST_OPROJ=$FAST_OPROJ FAST_ADALN=$FAST_ADALN VAE_IMPL=$VAE_IMPL T5_IMPL=$T5_IMPL" ;;
@@ -238,9 +239,17 @@ spec:
                 capture_dit_pairs "$IMPL"
                 python3 scripts/neuron/attn_kernel_report.py "$LOCAL_RESULTS/dit_pairs_$IMPL" "$IMPL" \
                   2>&1 | tee "$LOCAL_RESULTS/attn_kernel_$IMPL.txt" || true
+                echo "=== [1c $IMPL] DiT BLOCK PROFILE (summary-text of the heaviest captured NEFF) ==="
+                B1=$(ls -d "$LOCAL_RESULTS/dit_pairs_$IMPL"/01_* 2>/dev/null | head -1) || true
+                if [ -n "$B1" ] && [ -s "$B1/summary.txt" ]; then
+                  grep -E '^\s*(total_time|total_active_time|[a-z_]*engine_active_time(_percent)?|[a-z_]*engine_instruction_count|dma_active_time|cc_op_time|cc_op_count|hbm_read_bytes|hbm_write_bytes|mfu_estimated_percent|mbu_estimated_percent|hardware_flops|[a-z_]*dynamic_dma_packet_(percent|count)|static_dma_packet_count|dma_transfer_total_bytes|dma_transfer_average_bytes|psum_write_bytes|psum_read_sbuf_write_bytes|spill[a-z_]*|[a-z_]*semaphore[a-z_]*|[a-z_]*wait[a-z_]*|transpose_flops|matmul_instruction_count)\s' "$B1/summary.txt" \
+                    | sed "s/^/  [blk $IMPL] /" | tee "$LOCAL_RESULTS/block_profile_$IMPL.txt" || true
+                else
+                  echo "  (no block summary)"
+                fi
 
                 echo "=== [2/3 $IMPL] CLEAN RUN (NO profiler) — median total = REAL LATENCY ==="
-                run_wan "$LOCAL_RESULTS/clean_$IMPL.txt" 3 | grep -iE "denoise=|vae=|total=|FAILED" || echo "CLEAN RUN FAILED"
+                run_wan "$LOCAL_RESULTS/clean_$IMPL.txt" 4 | grep -iE "denoise=|vae=|total=|FAILED" || echo "CLEAN RUN FAILED"
                 cp /tmp/wan2_i2v_output.mp4 "$LOCAL_RESULTS/wan2_i2v_output_clean_$IMPL.mp4" 2>/dev/null \
                   && echo "clean video saved: wan2_i2v_output_clean_$IMPL.mp4" || echo "NO VIDEO FROM CLEAN RUN"
                 rm -f /tmp/wan2_i2v_output.mp4
@@ -343,7 +352,7 @@ spec:
             - name: USE_NKI_KERNELS
               value: "1"
             - name: ATTN_IMPLS
-              value: "fast_cte+oproj+adaln+vae fast_cte+oproj+adaln+vae+t5"
+              value: "fast_cte+oproj+adaln+vae+t5 fast_cte+oproj+adaln+vaetile+t5"
             - name: FAST_DIT
               value: "1"
             - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE

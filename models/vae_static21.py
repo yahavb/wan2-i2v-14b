@@ -350,3 +350,73 @@ class StaticWanVAE:
             mu = (mu - mean.view(1, m.z_dim, 1, 1, 1)) * inv_std.view(1, m.z_dim, 1, 1, 1)
             out.append(mu.float().squeeze(0))
         return out
+
+
+# ─── spatial patch-parallel decode (all ranks, fixed-size overlapping tiles) ──────────
+
+def _starts(n, t, k):
+    """k tile starts of size t covering [0, n): evenly spread, last tile flush with the edge."""
+    if k == 1:
+        return [0]
+    return [round(i * (n - t) / (k - 1)) for i in range(k)]
+
+
+def _tile_layout(H, W, grid, overlap):
+    """Latent tile size/starts for a (rows, cols) grid with >= overlap rows/cols shared."""
+    rows, cols = grid
+    th = -(-(H + overlap * (rows - 1)) // rows)
+    tw = -(-(W + overlap * (cols - 1)) // cols)
+    return th, tw, [(y, x) for y in _starts(H, th, rows) for x in _starts(W, tw, cols)]
+
+
+def _ramp(n, lo, hi, ov):
+    """1-D blend weight over n pixels: linear ramps of length ov on the sides that overlap."""
+    w = torch.ones(n)
+    if ov > 0:
+        r = (torch.arange(ov, dtype=torch.float32) + 0.5) / ov
+        if lo:
+            w[:ov] = r
+        if hi:
+            w[-ov:] = r.flip(0)
+    return w
+
+
+def _blend(g, starts, th, tw, H, W, overlap):
+    """g [n_tiles, C, T, 8th, 8tw] -> [C, T, 8H, 8W], linear cross-fade on interior overlaps."""
+    C, Tf, ph, pw = g.shape[1:]
+    acc = torch.zeros(C, Tf, 8 * H, 8 * W)
+    wsum = torch.zeros(1, 1, 8 * H, 8 * W)
+    for i, (ys, xs) in enumerate(starts):
+        py, px = 8 * ys, 8 * xs
+        wy = _ramp(ph, ys > 0, ys + th < H, 8 * overlap)
+        wx = _ramp(pw, xs > 0, xs + tw < W, 8 * overlap)
+        w = (wy[:, None] * wx[None, :]).view(1, 1, ph, pw)
+        acc[:, :, py:py + ph, px:px + pw] += g[i] * w
+        wsum[:, :, py:py + ph, px:px + pw] += w
+    return acc / wsum
+
+
+def decode_tiled(self, zs, grid=(2, 4), overlap=4):
+    """Every rank decodes one tile; tiles are all-gathered and blended on rank 0.
+    Returns the decode() list on rank 0, None elsewhere. World size must equal rows*cols."""
+    import torch.distributed as dist
+    rank, world = dist.get_rank(), dist.get_world_size()
+    assert world == grid[0] * grid[1], f"grid {grid} needs {grid[0] * grid[1]} ranks, have {world}"
+    out = []
+    for u in zs:
+        _, T, H, W = u.shape
+        th, tw, starts = _tile_layout(H, W, grid, overlap)
+        y0, x0 = starts[rank]
+        tile = self.decode([u[:, :, y0:y0 + th, x0:x0 + tw].contiguous()])[0]      # [3, Tf, 8th, 8tw] fp32
+        tile = tile.to(torch.bfloat16).contiguous()
+        gathered = torch.empty((world,) + tuple(tile.shape), dtype=tile.dtype, device=tile.device)
+        dist.all_gather_into_tensor(gathered, tile)
+        if rank != 0:
+            out.append(None)
+            continue
+        acc = _blend(gathered.float().cpu(), starts, th, tw, H, W, overlap)
+        out.append(acc.clamp_(-1, 1))
+    return out if rank == 0 else None
+
+
+StaticWanVAE.decode_tiled = decode_tiled
