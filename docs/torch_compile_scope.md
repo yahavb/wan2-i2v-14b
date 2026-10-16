@@ -66,6 +66,53 @@ The VAE (`models/vae_static21.py:40, 316-317`) and the text encoder
 | `sublayer` | the same pieces compiled as separate units on purpose | `True` | 3–4 | boundaries, not the flag, set the cost |
 | `model` | all 40 blocks in one graph (staging style) | `True` | 1 per step | the other direction: fewer launches, longer compile |
 
+### Trade-offs per variant (expected; the runs will confirm or correct)
+
+**`block` — one graph per block, `fullgraph=True`**
+- Gains: one launch per block; full fusion inside the block; all-reduces scheduled next to
+  their matmuls; one NEFF reused by all 40 blocks, so compile is moderate (minutes).
+- Costs: 40 launches per step plus a host gap before each; no fusion across block
+  boundaries; every op in the block must be traceable (no Python-side branches, prints,
+  imports, `.item()`), or compilation fails.
+- Best for: production latency with a compile time you can live with.
+
+**`block_breaks` — same region, `fullgraph=False`, explicit `graph_break()`s**
+- Gains: tolerant: code that cannot be traced (logging, data-dependent Python, a library
+  call dynamo does not support) just splits the graph instead of failing; easy to bring up
+  a new model.
+- Costs: 3–4 launches per block (120–160 per step), each with a host gap and dynamo guard
+  checks; no fusion across a break; intermediates written to HBM and read back at every
+  break; more NEFFs to compile and load. Silent: a new break added by a code change goes
+  unnoticed unless you check the dynamo counters.
+- Best for: bring-up and debugging, not latency.
+
+**`sublayer` — the same pieces as separate `fullgraph=True` units**
+- Gains: the same pieces as `block_breaks`, but every boundary is deliberate and visible
+  in the code; nothing breaks silently; each piece is profiled on its own (one NEFF per
+  sub-layer), which makes per-sub-layer attribution easy.
+- Costs: the same launches, gaps and HBM round trips as `block_breaks`.
+- Best for: profiling and per-sub-layer tuning; shows that the boundaries, not the flag,
+  set the cost.
+
+**`model` — all 40 blocks in one graph, `fullgraph=True`**
+- Gains: one launch per step, no gaps between blocks; the compiler can overlap the end of
+  one block with the start of the next.
+- Costs: a much bigger graph: the 40 blocks are inlined, so compile time grows a lot
+  (possibly tens of minutes) and the NEFF is larger to load; one failure anywhere fails the
+  whole model; a profile is one huge NEFF, harder to read. The per-block launch gaps it
+  removes are already small in `block`, so the gain is likely small.
+- Best for: squeezing the last per-step overhead once compile time is acceptable.
+
+| | `block` | `block_breaks` | `sublayer` | `model` |
+|---|---|---|---|---|
+| Launches per step | ~40 | ~120–160 | ~120–160 | 1 |
+| Fusion | within block | within piece | within piece | across blocks |
+| HBM round trips at boundaries | per block | per piece | per piece | none between blocks |
+| Compile time | moderate | moderate (more NEFFs) | moderate (more NEFFs) | longest |
+| Fails loudly on untraceable code | yes | no (splits silently) | yes | yes |
+| Profile granularity | per block | per piece | per piece | whole model |
+| Expected latency | best or near-best | worst | ~same as `block_breaks` | ~`block`, maybe slightly better |
+
 Planned code difference (shown side by side once implemented):
 
 ```python
