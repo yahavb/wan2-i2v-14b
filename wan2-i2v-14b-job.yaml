@@ -352,7 +352,7 @@ spec:
             - name: USE_NKI_KERNELS
               value: "1"
             - name: ATTN_IMPLS
-              value: "fast_cte+oproj+adaln+vae+t5 fast_cte+oproj+adaln+vaetile+t5"
+              value: "fast_cte+oproj+adaln+vaetile+t5"
             - name: FAST_DIT
               value: "1"
             - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE

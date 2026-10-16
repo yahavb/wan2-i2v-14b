@@ -1,2 +1,5 @@
+.DS_Store
+*.mp4
+*.tar.gz
+dit_pairs*/
 __pycache__/
-*.pyc

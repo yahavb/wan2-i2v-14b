@@ -19,7 +19,8 @@ in the same job. Videos were checked by eye (the accuracy gate).
 | fast_cte + oproj | `444c754` | 6.1 s | 0.61 | 0.71 s | 1.3 s | n/a | 8.1 s | — |
 | fast_cte + oproj + adaln | `444c754` | 5.8 s | 0.58 | 0.72 s | 1.4 s | n/a | **7.9 s** | "a bit funky" (old VAE) |
 | + fullgraph VAE (`VAE_IMPL=static`) | `4e7b97f` | 5.8 s | 0.58 | 0.41 s | 0.9 s | 0.611 s | **7.2 s** | good |
-| + fullgraph UMT5 (`T5_IMPL=fast`) | `5d71c2d` | 5.8 s | 0.58 | 0.41 s | 0.9 s | 0.035 s | **7.2 s** | good (default) |
+| + fullgraph UMT5 (`T5_IMPL=fast`) | `5d71c2d` | 5.8 s | 0.58 | 0.41 s | 0.9 s | 0.035 s | **7.2 s** | good |
+| + 8-rank tiled VAE decode (`VAE_IMPL=static_tiled`, 2x4, overlap 4) | `5b4ee20` | 5.8 s | 0.58 | 0.41 s | 0.5 s | 0.035 s | **6.7 s** | good (default) |
 
 Total = VAE encode + denoise + VAE decode + mp4 write. Text encode is measured separately
 (second, warm encode of both prompts) and is not in the total.
@@ -33,6 +34,26 @@ Total = VAE encode + denoise + VAE decode + mp4 write. Text encode is measured s
 | + mlp (nkilib `mlp`) | 16.28 ms | 28.1% | +1.32 ms (compiler matmuls win at I=1728) |
 | + oproj (nkilib `output_projection_cte`) | 14.33 ms | 31.8% | −0.67 ms |
 | + oproj + adaln (staging fused adaln) | 13.62 ms | 33.5% | −0.71 ms more |
+
+### Block profile (`fast_cte+oproj+adaln`, one block NEFF, `5b4ee20`)
+
+| Counter | Value | Share of the 13.77 ms block |
+|---|---|---|
+| Collectives (15 ops) | 5.17 ms | 38% |
+| DMA active | 10.90 ms | 79% |
+| Tensor engine active | 7.42 ms | 54% |
+| Vector engine active | 8.48 ms | 62% |
+| Scalar engine active | 4.14 ms | 30% |
+| GpSimd active | 1.11 ms | 8% |
+| SBUF spill save / reload | 0.59 / 1.35 GB | — |
+| HBM read / write | 2.05 / 1.03 GB | — |
+| Transpose FLOPs | 93.5 of 811 GFLOP | 11.5% |
+| MFU / MBU | 33.2% / 31.2% | — |
+
+Engines overlap, so shares do not add up to 100%. Largest lever: the three per-block
+all-reduces of a [2, 4140, 5120] bf16 tensor (85 MB) across 8 ranks on 2 chips
+(self-attn O-proj, cross-attn O-proj, FFN down). Candidate fix: TP4 x CFG2 (one CFG half
+per chip, all-reduces half the size and intra-chip).
 
 ## Attention kernel alone (eager DiT, per call)
 
@@ -51,7 +72,10 @@ Explained in `docs/attention/` (write-up, narrated page, screenshots).
   `VAE_IMPL=tp`.
 - Dead ends at this shape: staging const-max self-attention, nkilib `mlp`.
 - Costs: VAE warm-up compile ~271 s; the first VAE call in a fresh process ~52 s even with
-  a warm cache (the job now drops that run from the median).
+  a warm cache, and the second can still be slow (2.4-2.9 s seen). The job runs 4 clean
+  runs and takes the median of the last 3.
+- Tiled VAE decode (8 ranks, fixed 25x18 latent tiles, cross-faded overlaps) shows no
+  seams by eye.
 
 ## Components and where they live
 
@@ -61,10 +85,10 @@ Explained in `docs/attention/` (write-up, narrated page, screenshots).
 | Attention | nkilib `attention_cte` (self + cross) | `FAST_ATTN_IMPL=cte` |
 | O-proj | nkilib `output_projection_cte` | `FAST_OPROJ=1` |
 | AdaLN | staging `adaln_quant` (vendored, `kernels/nkilib/experimental/norm/`) | `FAST_ADALN=1` |
-| VAE | `models/vae_static21.py` (static cache, nkilib conv3d + attention_cte in-graph) | `VAE_IMPL=static` |
+| VAE | `models/vae_static21.py` (static cache, nkilib conv3d + attention_cte in-graph; decode tiled over 8 ranks) | `VAE_IMPL=static_tiled` |
 | Text encoder | `models/fast_t5.py` (UMT5 TP8, fullgraph per block) | `T5_IMPL=fast` |
 
-## Pending
+## Next
 
-- `VAE_IMPL=static_tiled` (decode split across 8 ranks) — commit `5b4ee20`, not run yet.
-- DiT block profile counters (`[blk …]` lines in the job log) — same run.
+- torch.compile scope ladder: `docs/torch_compile_scope.md` (branch `exp/compile-scope`).
+- TP4 x CFG2 to cut the cross-chip all-reduce cost.
