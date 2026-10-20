@@ -82,6 +82,14 @@ spec:
               echo "SERVER EXITED"; exit 1
           ports:
             - containerPort: 8000
+          # The HTTP server starts only after download + compile + warmup. Allow up to
+          # 4 h (30 s x 480); liveness and readiness start only after this succeeds.
+          startupProbe:
+            httpGet:
+              path: /readiness
+              port: 8000
+            periodSeconds: 30
+            failureThreshold: 480
           readinessProbe:
             httpGet:
               path: /readiness
@@ -91,7 +99,6 @@ spec:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 7200
             periodSeconds: 60
             timeoutSeconds: 30
             failureThreshold: 10
