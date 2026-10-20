@@ -121,7 +121,7 @@ spec:
             - name: NEURON_CC_FLAGS
               value: "--model-type=transformer"
             - name: BRANCH
-              value: "serve"
+              value: "main"
             - name: NPROC
               value: "8"
             - name: ATTN_IMPL

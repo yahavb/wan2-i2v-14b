@@ -42,7 +42,7 @@ spec:
               exec python -u /app/gradio_app.py
           env:
             - name: BRANCH
-              value: "serve"
+              value: "main"
             - name: WAN_URL
               value: "http://wan2-i2v-14b.default.svc.cluster.local:8000"
             - name: GITHUB_TOKEN
