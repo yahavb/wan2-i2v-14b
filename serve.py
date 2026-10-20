@@ -16,8 +16,18 @@ count and seed can change per request without recompiling.
     POST /generate  {"prompt": str, "image": base64 str (optional), "negative_prompt": str,
                      "seed": int, "steps": int}
         -> {"video": base64 mp4, "frames", "fps", "height", "width", "seconds", "timings"}
-    GET  /health
-    GET  /readiness
+    GET  /health       200 while every rank has proven itself recently (see below), else 503
+    GET  /readiness    200 once warm and healthy
+    POST /debug/fail   {"rank": int, "mode": "hang" | "wrong"}  -- only with FAULT_INJECTION=1
+
+Device health: a request runs collectives on every rank, so a finished request
+proves all chips are alive. When the server has been idle for HEARTBEAT_S with no
+such proof, the main loop runs a heartbeat instead: one tiny op + all-reduce on
+every rank, checked to sum to the world size. It runs in the same loop as
+requests, never alongside one, and only when the queue is empty. /health fails
+if the last proof is older than HEARTBEAT_S + HEALTH_GRACE_S while idle, if a
+request has run longer than MAX_REQUEST_S, or if a heartbeat returned a wrong sum.
+A dead chip shows up as a collective that never returns, so the timestamp goes stale.
 """
 import base64
 import gc
@@ -57,7 +67,10 @@ MAX_STEPS = int(os.environ.get("MAX_STEPS", "50"))
 FPS = int(os.environ.get("FPS", "16"))
 VAE_TILE_GRID = tuple(int(v) for v in os.environ.get("VAE_TILE_GRID", "2x4").split("x"))
 VAE_TILE_OVERLAP = int(os.environ.get("VAE_TILE_OVERLAP", "4"))
-IDLE_S = 60
+HEARTBEAT_S = int(os.environ.get("HEARTBEAT_S", "60"))
+HEALTH_GRACE_S = int(os.environ.get("HEALTH_GRACE_S", "60"))
+MAX_REQUEST_S = int(os.environ.get("MAX_REQUEST_S", "900"))
+FAULT_INJECTION = os.environ.get("FAULT_INJECTION", "0") == "1"
 DEFAULT_PROMPT = (
     "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. "
     "The fluffy-furred feline gazes directly at the camera with a relaxed expression. "
@@ -130,7 +143,7 @@ def run_server(jobs, state):
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             png = buf.getvalue()
-        job = Job({"prompt": req.prompt, "negative_prompt": req.negative_prompt,
+        job = Job({"type": "generate", "prompt": req.prompt, "negative_prompt": req.negative_prompt,
                    "seed": req.seed, "steps": req.steps, "png": png})
         jobs.put(job)
         job.done.wait()
@@ -138,16 +151,56 @@ def run_server(jobs, state):
             raise HTTPException(status_code=500, detail=job.error)
         return job.result
 
+    def device_health():
+        """(healthy, detail) from the main loop's proof-of-life bookkeeping."""
+        now = time.time()
+        age = round(now - state["last_ok"], 1)
+        if state["device_error"]:
+            return False, {"reason": state["device_error"], "last_ok_age_s": age}
+        busy = state["busy_since"]
+        if busy is not None:
+            running = round(now - busy, 1)
+            if running > MAX_REQUEST_S:
+                return False, {"reason": f"request running {running} s > {MAX_REQUEST_S} s",
+                               "last_ok_age_s": age}
+            return True, {"busy_s": running, "last_ok_age_s": age}
+        if age > HEARTBEAT_S + HEALTH_GRACE_S:
+            return False, {"reason": f"no proof of life for {age} s", "last_ok_age_s": age}
+        return True, {"last_ok_age_s": age}
+
     @app.get("/health")
     def health():
-        return {"status": "healthy"}
+        if not state["ready"]:
+            return {"status": "starting"}      # startupProbe gates liveness until ready
+        ok, detail = device_health()
+        if not ok:
+            logger.info(f"/health 503: {detail}")
+            raise HTTPException(status_code=503, detail=detail)
+        return {"status": "healthy", **detail}
 
     @app.get("/readiness")
     def readiness():
         if not state["ready"]:
             raise HTTPException(status_code=503, detail="warming up")
+        ok, detail = device_health()
+        if not ok:
+            raise HTTPException(status_code=503, detail=detail)
         return {"status": "ready", "height": OUT_H, "width": OUT_W, "frames": FRAME_NUM,
-                "default_steps": NUM_STEPS}
+                "default_steps": NUM_STEPS, **detail}
+
+    class FailRequest(BaseModel):
+        rank: int
+        mode: str = "hang"
+
+    @app.post("/debug/fail")
+    def debug_fail(req: FailRequest):
+        if not FAULT_INJECTION:
+            raise HTTPException(status_code=404, detail="FAULT_INJECTION is off")
+        if req.mode not in ("hang", "wrong") or not 0 <= req.rank < dist.get_world_size():
+            raise HTTPException(status_code=400, detail="mode must be hang|wrong, rank in world")
+        jobs.put(Job({"type": "fail", "rank": req.rank, "mode": req.mode}))
+        logger.info(f"fault injection queued: rank {req.rank} {req.mode}")
+        return {"queued": True, "rank": req.rank, "mode": req.mode}
 
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
 
@@ -223,8 +276,25 @@ def main():
         logger.info(f"ready to compile: {OUT_H}x{OUT_W} {F}f latent=[{z_dim}, {T_latent}, {lat_h}, {lat_w}] "
                     f"world={world_size}")
 
+    fault = {"mode": None}
+
+    def maybe_hang():
+        if fault["mode"] == "hang":
+            logger.info(f"FAULT INJECTION: rank {rank} hangs (simulated dead chip)")
+            while True:
+                time.sleep(3600)
+
+    def heartbeat():
+        """Tiny op + all-reduce on every rank; True if the sum equals the world size."""
+        maybe_hang()
+        x = torch.ones(1, dtype=torch.float32, device=NEURON_DEVICE)
+        x = x * (0.0 if fault["mode"] == "wrong" else 1.0)
+        dist.all_reduce(x)
+        return round(x.item()) == world_size
+
     def generate(prompt, negative_prompt, seed, steps, img):
         """One video on every rank; rank 0 returns (mp4 bytes, timings)."""
+        maybe_hang()
         t0 = time.time()
         ctx = t5.encode([prompt, negative_prompt or config.sample_neg_prompt])
         for fast in experts.values():
@@ -273,7 +343,9 @@ def main():
         if rank == 0:
             logger.info(f"warmup {i + 1}/2: {timings}")
 
-    jobs, state = queue.Queue(), {"ready": False}
+    assert heartbeat(), "warmup heartbeat: wrong all-reduce sum"
+    jobs = queue.Queue()
+    state = {"ready": False, "last_ok": time.time(), "busy_since": None, "device_error": None}
     if rank == 0:
         threading.Thread(target=run_server, args=(jobs, state), daemon=True).start()
     state["ready"] = True
@@ -283,19 +355,41 @@ def main():
     while True:
         job = None
         if rank == 0:
+            # Wait for work until HEARTBEAT_S has passed without proof of life.
+            wait = max(0.0, HEARTBEAT_S - (time.time() - state["last_ok"]))
             try:
-                job = jobs.get(timeout=IDLE_S)
+                job = jobs.get(timeout=wait) if wait > 0 else jobs.get_nowait()
             except queue.Empty:
                 pass
-        msg = [job.req if job is not None else None]
+        msg = [job.req if job is not None else {"type": "heartbeat"}]
         dist.broadcast_object_list(msg, src=0)
         req = msg[0]
-        if req is None:
+
+        if req["type"] == "heartbeat":
+            ok = heartbeat()
+            if rank == 0:
+                if ok:
+                    state["last_ok"] = time.time()
+                else:
+                    state["device_error"] = f"heartbeat all-reduce sum != {world_size}"
+                    logger.info(f"HEARTBEAT FAILED: {state['device_error']}")
             continue
+
+        if req["type"] == "fail":
+            if rank == req["rank"]:
+                fault["mode"] = req["mode"]
+            if rank == 0:
+                job.result = {"queued": True}
+                job.done.set()
+            continue
+
+        if rank == 0:
+            state["busy_since"] = time.time()
         try:
             img = Image.open(io.BytesIO(req["png"])).convert("RGB") if req["png"] else default_image()
             mp4, timings = generate(req["prompt"], req["negative_prompt"], req["seed"], req["steps"], img)
             if rank == 0:
+                state["last_ok"] = time.time()
                 logger.info(f"request seed={req['seed']} steps={req['steps']} {timings} "
                             f"prompt={req['prompt'][:80]!r}")
                 job.result = {"video": base64.b64encode(mp4).decode("ascii"), "frames": F, "fps": FPS,
@@ -307,8 +401,8 @@ def main():
                 job.error = str(e)
         finally:
             if rank == 0:
+                state["busy_since"] = None
                 job.done.set()
-
 
 if __name__ == "__main__":
     main()

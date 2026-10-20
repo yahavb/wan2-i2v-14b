@@ -99,9 +99,9 @@ spec:
             httpGet:
               path: /health
               port: 8000
-            periodSeconds: 60
-            timeoutSeconds: 30
-            failureThreshold: 10
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
           resources:
             claims:
               - name: neurons
@@ -129,6 +129,15 @@ spec:
               value: "--model-type=transformer"
             - name: BRANCH
               value: "main"
+            # Device heartbeat (see serve.py docstring) and /debug/fail for testing it.
+            - name: HEARTBEAT_S
+              value: "60"
+            - name: HEALTH_GRACE_S
+              value: "60"
+            - name: MAX_REQUEST_S
+              value: "900"
+            - name: FAULT_INJECTION
+              value: "1"
             - name: NPROC
               value: "8"
             - name: ATTN_IMPL
