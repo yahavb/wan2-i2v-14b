@@ -16,6 +16,22 @@ DEFAULT_PROMPT = (
     "Blurred beach scenery forms the background featuring crystal-clear waters, "
     "distant green hills, and a blue sky dotted with white clouds."
 )
+# The server's fallback start image (MODEL_PATH/examples/i2v_input.JPG), shown so it is visible.
+DEFAULT_IMAGE_URL = "https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B/resolve/main/examples/i2v_input.JPG"
+
+
+def default_image():
+    path = os.path.join(tempfile.gettempdir(), "wan_default_i2v_input.jpg")
+    if not os.path.exists(path):
+        try:
+            r = requests.get(DEFAULT_IMAGE_URL, timeout=30)
+            r.raise_for_status()
+            with open(path, "wb") as f:
+                f.write(r.content)
+        except requests.RequestException as e:
+            print(f"default image download failed: {e}")
+            return None
+    return path
 
 
 def server_info():
@@ -49,11 +65,12 @@ def generate(image, prompt, negative_prompt, seed, steps):
 
 
 with gr.Blocks(title="Wan2.2-I2V-A14B on AWS Trainium") as demo:
-    gr.Markdown("# Wan2.2 image-to-video on AWS Trainium\nUpload a start image (or leave empty for "
-                "the default cat), write a prompt, press **Generate**.")
+    gr.Markdown("# Wan2.2 image-to-video on AWS Trainium\nThe video starts from the image below. "
+                "Replace it with your own, write a prompt, press **Generate**.")
     with gr.Row():
         with gr.Column():
-            image = gr.Image(label="Start image", type="filepath", height=300)
+            image = gr.Image(value=default_image(), label="Start image (default: model example)",
+                             type="filepath", height=300)
             prompt = gr.Textbox(label="Prompt", value=DEFAULT_PROMPT, lines=4)
             negative = gr.Textbox(label="Negative prompt (empty = model default)", lines=2)
             with gr.Row():
