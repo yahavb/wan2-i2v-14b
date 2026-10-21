@@ -171,20 +171,25 @@ def run_server(jobs, state):
     @app.get("/health")
     def health():
         if not state["ready"]:
+            logger.info("probe /health: starting (200)")
             return {"status": "starting"}      # startupProbe gates liveness until ready
         ok, detail = device_health()
         if not ok:
-            logger.info(f"/health 503: {detail}")
+            logger.info(f"probe /health: UNHEALTHY (503) {detail}")
             raise HTTPException(status_code=503, detail=detail)
+        logger.info(f"probe /health: healthy (200) {detail}")
         return {"status": "healthy", **detail}
 
     @app.get("/readiness")
     def readiness():
         if not state["ready"]:
+            logger.info("probe /readiness: warming up (503)")
             raise HTTPException(status_code=503, detail="warming up")
         ok, detail = device_health()
         if not ok:
+            logger.info(f"probe /readiness: NOT READY (503) {detail}")
             raise HTTPException(status_code=503, detail=detail)
+        logger.info(f"probe /readiness: ready (200) {detail}")
         return {"status": "ready", "height": OUT_H, "width": OUT_W, "frames": FRAME_NUM,
                 "default_steps": NUM_STEPS, **detail}
 
@@ -370,6 +375,7 @@ def main():
             if rank == 0:
                 if ok:
                     state["last_ok"] = time.time()
+                    logger.info(f"heartbeat ok: all-reduce sum = {world_size}")
                 else:
                     state["device_error"] = f"heartbeat all-reduce sum != {world_size}"
                     logger.info(f"HEARTBEAT FAILED: {state['device_error']}")

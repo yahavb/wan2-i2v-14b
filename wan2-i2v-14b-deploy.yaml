@@ -73,7 +73,8 @@ spec:
               done
               echo "████ ENDPOINT READY: http://wan2-i2v-14b.default.svc.cluster.local:8000 ████"
               if [ ! -f "$CACHE_TAR" ]; then
-                tar -czf /tmp/neff_cache.tar.gz /var/tmp/neuron-compile-cache /tmp/neff_cache 2>/dev/null \
+                DIRS=$(for d in /var/tmp/neuron-compile-cache /tmp/neff_cache; do [ -d "$d" ] && echo "$d"; done)
+                tar -czf /tmp/neff_cache.tar.gz $DIRS \
                   && cp /tmp/neff_cache.tar.gz "$CACHE_TAR" && echo "NEFF cache saved to $CACHE_TAR" \
                   || echo "NEFF cache save skipped"
                 rm -f /tmp/neff_cache.tar.gz
