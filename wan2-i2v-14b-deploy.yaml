@@ -16,7 +16,7 @@ metadata:
   name: wan2-i2v-14b-serve
   namespace: default
 spec:
-  replicas: 1
+  replicas: 8
   strategy:
     type: Recreate
   selector:
@@ -31,7 +31,7 @@ spec:
         node-type: trn2
       resourceClaims:
         - name: neurons
-          resourceClaimTemplateName: m-lnc2
+          resourceClaimTemplateName: m-lnc2-any
       containers:
         - name: inference
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
