@@ -34,7 +34,7 @@ spec:
           resourceClaimTemplateName: m-lnc2-any
       containers:
         - name: inference
-          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04
           imagePullPolicy: Always
           command:
             - /bin/bash
@@ -57,7 +57,9 @@ spec:
 
               # NEFF cache: restore from the PVC (tar.gz only), save it once after the first warmup.
               ARCHIVE_DIR=/var/mdl/wan2_2_i2v; mkdir -p "$ARCHIVE_DIR" || true
-              CACHE_TAR="$ARCHIVE_DIR/neff_cache_serve_${OUT_H}x${OUT_W}_${FRAME_NUM}f.tar.gz"
+              # Keyed by compiler version: NEFFs from another SDK would only miss, and never be replaced.
+              CC_VER=$(python3 -c "import neuronxcc; print(neuronxcc.__version__)" 2>/dev/null || echo unknown)
+              CACHE_TAR="$ARCHIVE_DIR/neff_cache_serve_${OUT_H}x${OUT_W}_${FRAME_NUM}f_cc${CC_VER}.tar.gz"
               if [ -f "$CACHE_TAR" ]; then
                 cp "$CACHE_TAR" /tmp/neff_cache.tar.gz && tar -xzf /tmp/neff_cache.tar.gz -C / \
                   && echo "NEFF cache restored from $CACHE_TAR" || echo "NEFF cache restore failed"
