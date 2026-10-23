@@ -31,7 +31,7 @@ spec:
         node-type: trn2
       resourceClaims:
         - name: neurons
-          resourceClaimTemplateName: m-lnc2-any
+          resourceClaimTemplateName: m-lnc2
       containers:
         - name: inference
           image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04

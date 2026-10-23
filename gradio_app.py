@@ -122,8 +122,8 @@ def generate(image, prompt, negative_prompt, seed, steps, vlm_prompt):
 
 embedder()     # download + load the CPU embedding model before the first request
 
-with gr.Blocks(title="Wan2.2-I2V-A14B on AWS Trainium") as demo:
-    gr.Markdown("# Wan2.2 image-to-video on AWS Trainium\nThe video starts from the image below. "
+with gr.Blocks(title="Wan2.2 image-to-video and Muse-Glimmer-30B on AWS Trainium") as demo:
+    gr.Markdown("# Wan2.2 image-to-video and Muse-Glimmer-30B on AWS Trainium\nThe video starts from the image below. "
                 "Replace it with your own, write a prompt, press **Generate**. Muse-Glimmer-30B then "
                 "describes the video, and the score shows how close that description is to your prompt.")
     with gr.Row():
