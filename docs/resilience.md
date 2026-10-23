@@ -80,6 +80,28 @@ curl -X POST http://wan2-i2v-14b:8000/debug/fail \
 Ranks 0 to 3 are expected to be chip 0 and ranks 4 to 7 chip 1. Check with
 `neuron-ls` in the pod.
 
+### How this maps to Neuron Observer
+
+Neuron Observer watches each chip's hardware and reports these faults (list from
+the `NeuronDRADriverTests` constants, not the Observer source):
+
+1. Uncorrectable ECC in HBM or SRAM.
+2. Unreachable: a register read returns `0xdeadbeef` (also a whole-node variant).
+3. Link errors: host, intra-server, inter-server, EFA, switch.
+4. On-chip AXI fabric errors.
+5. Firmware service API or service processor errors.
+
+The two modes here are software fakes, so Observer would see neither:
+
+1. `hang` matches Observer's `unreachable` by symptom: the rank stops answering
+   and the other ranks wait in the all-reduce.
+2. `wrong` (a silently wrong result) has no match in Observer's list.
+
+The layers complement each other. Observer names the hardware cause, and the DRA
+driver taints the device so the pod moves off it. The heartbeat catches the
+symptom, including stalls with no hardware cause, and restarts the container on
+the same chips.
+
 Killing a worker process (`kill -9`) tests a different path: torchrun tears down
 the group, the container exits and Kubernetes restarts it. No probe is involved.
 
