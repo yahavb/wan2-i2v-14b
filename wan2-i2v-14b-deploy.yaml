@@ -52,19 +52,34 @@ spec:
               export WAN_DIR=/tmp/wan2-i2v-14b
               export MODEL_PATH=/tmp/Wan2.2-I2V-A14B
 
+              # Node cache (hostPath, shared by every pod of this model on the node): the model
+              # weights and the compiled NEFFs survive container restarts, so recovery skips the
+              # 118 GB download and the compile. One pod at a time writes (flock); a ".complete"
+              # marker / atomic mv means a half-written entry is never used.
+              NODE_CACHE=/node-cache; mkdir -p "$NODE_CACHE"
+              uv pip install --python "$(command -v python3)" huggingface_hub
+              ln -sfn "$NODE_CACHE/Wan2.2-I2V-A14B" "$MODEL_PATH"
+              flock "$NODE_CACHE/model.lock" bash -c '
+                [ -f "$1/Wan2.2-I2V-A14B/.complete" ] && { echo "model: on node cache"; exit 0; }
+                echo "model: downloading to node cache (resumes a partial download)"
+                python3 -c "from huggingface_hub import snapshot_download as d; d(\"Wan-AI/Wan2.2-I2V-A14B\", local_dir=\"$1/Wan2.2-I2V-A14B\")"
+                touch "$1/Wan2.2-I2V-A14B/.complete"' _ "$NODE_CACHE"
+
               bash scripts/prepare.sh 2>&1 | tail -5 || { echo "PREPARE FAILED"; exit 1; }
               uv pip install --python "$(command -v python3)" fastapi uvicorn
 
-              # NEFF cache: restore from the PVC (tar.gz only), save it once after the first warmup.
+              # NEFF cache: node cache first, then the PVC (tar.gz only); saved to both after warmup.
+              # Keyed by compiler version and model code: a key that only misses would never be replaced.
               ARCHIVE_DIR=/var/mdl/wan2_2_i2v; mkdir -p "$ARCHIVE_DIR" || true
-              # Keyed by compiler version: NEFFs from another SDK would only miss, and never be replaced.
               CC_VER=$(python3 -c "import neuronxcc; print(neuronxcc.__version__)" 2>/dev/null || echo unknown)
-              CACHE_TAR="$ARCHIVE_DIR/neff_cache_serve_${OUT_H}x${OUT_W}_${FRAME_NUM}f_cc${CC_VER}.tar.gz"
-              if [ -f "$CACHE_TAR" ]; then
-                cp "$CACHE_TAR" /tmp/neff_cache.tar.gz && tar -xzf /tmp/neff_cache.tar.gz -C / \
-                  && echo "NEFF cache restored from $CACHE_TAR" || echo "NEFF cache restore failed"
-                rm -f /tmp/neff_cache.tar.gz
-              fi
+              CODE_VER=$(git log -1 --format=%h -- serve.py models wan kernels)
+              CACHE_NAME="neff_cache_serve_${OUT_H}x${OUT_W}_${FRAME_NUM}f_cc${CC_VER}_${CODE_VER}.tar.gz"
+              NODE_TAR="$NODE_CACHE/$CACHE_NAME"; CACHE_TAR="$ARCHIVE_DIR/$CACHE_NAME"
+              for SRC in "$NODE_TAR" "$CACHE_TAR"; do
+                [ -f "$SRC" ] || continue
+                if tar -xzf "$SRC" -C /; then echo "NEFF cache restored from $SRC"; break; fi
+                echo "NEFF cache restore from $SRC failed"
+              done
 
               torchrun --nproc_per_node="$NPROC" --master_port=29500 serve.py 2>&1 | tee /tmp/serve.log &
               SERVER=$!
@@ -74,11 +89,14 @@ spec:
                 sleep 30
               done
               echo "████ ENDPOINT READY: http://wan2-i2v-14b.default.svc.cluster.local:8000 ████"
-              if [ ! -f "$CACHE_TAR" ]; then
+              if [ ! -f "$NODE_TAR" ] || [ ! -f "$CACHE_TAR" ]; then
                 DIRS=$(for d in /var/tmp/neuron-compile-cache /tmp/neff_cache; do [ -d "$d" ] && echo "$d"; done; true)
-                tar -czf /tmp/neff_cache.tar.gz $DIRS \
-                  && cp /tmp/neff_cache.tar.gz "$CACHE_TAR" && echo "NEFF cache saved to $CACHE_TAR" \
-                  || echo "NEFF cache save skipped"
+                if tar -czf /tmp/neff_cache.tar.gz $DIRS; then
+                  flock "$NODE_CACHE/neff.lock" bash -c '[ -f "$2" ] || { cp "$1" "$2.tmp.$$" && mv "$2.tmp.$$" "$2"; }' \
+                    _ /tmp/neff_cache.tar.gz "$NODE_TAR" && echo "NEFF cache on node: $NODE_TAR"
+                  [ -f "$CACHE_TAR" ] || { cp /tmp/neff_cache.tar.gz "$CACHE_TAR" && echo "NEFF cache saved to $CACHE_TAR"; } \
+                    || echo "NEFF cache PVC save skipped"
+                fi
                 rm -f /tmp/neff_cache.tar.gz
               fi
               wait $SERVER || true
@@ -119,6 +137,8 @@ spec:
               mountPath: /dev/shm
             - name: 621547421844-ap-southeast-4-pvc
               mountPath: /var/mdl
+            - name: node-cache
+              mountPath: /node-cache
           env:
             - name: PYTHONUNBUFFERED
               value: "1"
@@ -185,3 +205,8 @@ spec:
         - name: 621547421844-ap-southeast-4-pvc
           persistentVolumeClaim:
             claimName: 621547421844-ap-southeast-4-pvc
+        # Model weights + compiled NEFFs, kept on the node across restarts (see the script).
+        - name: node-cache
+          hostPath:
+            path: /opt/wan2-i2v-14b
+            type: DirectoryOrCreate
