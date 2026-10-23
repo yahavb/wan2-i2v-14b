@@ -39,12 +39,22 @@ spec:
               DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git >/dev/null
               git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-i2v-14b.git /app
               pip install -q --root-user-action=ignore --disable-pip-version-check gradio requests
+              # CPU-only torch for the similarity embedding model (no CUDA wheels).
+              pip install -q --root-user-action=ignore --disable-pip-version-check \
+                torch --index-url https://download.pytorch.org/whl/cpu
+              pip install -q --root-user-action=ignore --disable-pip-version-check sentence-transformers
               exec python -u /app/gradio_app.py
           env:
             - name: BRANCH
               value: "main"
             - name: WAN_URL
               value: "http://wan2-i2v-14b.default.svc.cluster.local:8000"
+            - name: VLM_URL
+              value: "http://muse-glimmer-30b-vllm.default.svc.cluster.local:8000/v1"
+            - name: VLM_MODEL
+              value: "meta-models/Muse-Glimmer-30B"
+            - name: EMBED_MODEL
+              value: "sentence-transformers/all-MiniLM-L6-v2"
             - name: GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
