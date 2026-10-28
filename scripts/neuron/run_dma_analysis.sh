@@ -73,6 +73,8 @@ for neff in "${NEFFS[@]}"; do
   if [ ! -f "$ntff" ]; then echo "  no NTFF, skip"; continue; fi
   if ingest "$neff" "$ntff" "$out"; then
     python3 "$HERE/pq_dma_report.py" "$out" "$h"
+    echo "--- engine overlap $h ---"
+    python3 "$HERE/../engine_overlap.py" "$out" --top 12 --json-out "$out/engine_overlap.json" || echo "  engine_overlap failed"
   else
     echo "  ingest produced no parquet (timeout/too big) — skip"
   fi
