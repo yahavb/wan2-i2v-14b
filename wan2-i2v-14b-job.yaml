@@ -12,7 +12,7 @@ spec:
     spec:
       restartPolicy: Never
       nodeSelector:
-        node-type: trn2
+        node-type: trn3-dev1
       resourceClaims:
         - name: neurons
           resourceClaimTemplateName: m-lnc2
@@ -383,7 +383,7 @@ spec:
             - name: FRAME_NUM
               value: "21"
             - name: INSTANCE_TYPE
-              value: "trn2.48xlarge"
+              value: "trn3-dev1.48xlarge"
             - name: LNC_CONFIG
               value: "LNC2"
             - name: NUM_NEURON_DEVICES
