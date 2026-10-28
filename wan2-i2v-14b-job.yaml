@@ -286,6 +286,23 @@ spec:
               echo "  rank subdirs       : $(find "$RUN_DIR" -maxdepth 1 -type d -name 'i-*' 2>/dev/null | wc -l)"
               echo "  .ntff / .neff      : $(find "$RUN_DIR" -name '*.ntff' 2>/dev/null | wc -l) / $(find "$RUN_DIR" -name '*.neff' 2>/dev/null | wc -l)"
 
+              echo "=== [3c] SYSTEM-TRACE TIMELINE (busy / idle / gaps / top graphs, last run) ==="
+              uv pip install --python "$(command -v python3)" duckdb >/dev/null 2>&1 || echo "  duckdb install failed"
+              TR_SRC=$(find "$RUN_DIR" -maxdepth 2 -type d -name '*_pid_*' 2>/dev/null | sort | head -1)
+              if [ -n "$TR_SRC" ]; then
+                echo "  trace dir: $TR_SRC"
+                timeout 1800 bash scripts/neuron_trace_to_parquet.sh "$TR_SRC" /tmp/systrace_pq 2>&1 | tail -3 || true
+                PQ=$(find /tmp/systrace_pq -name SystemProfileEvents.parquet | head -1)
+                if [ -n "$PQ" ]; then
+                  python3 scripts/trace_report.py --neuron-parquet "$PQ" --anchor most-frequent --per-run 400 \
+                    --top 20 --json-out "$LOCAL_RESULTS/trace_report.json" 2>&1 | tee "$LOCAL_RESULTS/trace_report.txt" || echo "  trace_report failed"
+                else
+                  echo "  no SystemProfileEvents.parquet; converter log:"; tail -10 /tmp/systrace_pq.log 2>/dev/null || true
+                fi
+              else
+                echo "  no *_pid_* trace dir under $RUN_DIR:"; find "$RUN_DIR" -maxdepth 2 | head -10
+              fi
+
               echo "=== [4] per-NEFF engine breakdown + dominant-NEFF metrics ($PROF_CLI) ==="
               run_explorer
 
@@ -371,7 +388,7 @@ spec:
             - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
               value: "134217728"
             - name: DEEP_PROFILE
-              value: "0"
+              value: "1"
             - name: OUT_H
               value: "368"
             - name: OUT_W
