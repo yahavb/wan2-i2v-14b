@@ -269,14 +269,14 @@ spec:
                 result_line "$IMPL" | tee -a "$LOCAL_RESULTS/results.txt"
                 LAST_IMPL="$IMPL"
               done
-              T_CLEAN=$(median_total_s "$LOCAL_RESULTS/clean_$LAST_IMPL.txt")
+              T_CLEAN=$(median_key "$LOCAL_RESULTS/clean_$LAST_IMPL.txt" total)
 
               T_PROF=N/A
               if [ "${DEEP_PROFILE:-1}" = "1" ]; then
               echo "████ DEEP PROFILE on ATTN_IMPL=$LAST_IMPL ████"
               echo "=== [3/3] PROFILED RUN (NEURON_RT_INSPECT_ENABLE=1 — overhead delta) ==="
               NEURON_RT_INSPECT_ENABLE=1 run_wan "$LOCAL_RESULTS/profiled.txt" 3 | grep -iE "denoise=|vae=|total=|FAILED" || echo "PROFILED RUN FAILED"
-              T_PROF=$(median_total_s "$LOCAL_RESULTS/profiled.txt")
+              T_PROF=$(median_key "$LOCAL_RESULTS/profiled.txt" total)
 
               echo "=== [3b] SYSTEM-TRACE BUNDLE (Neuron Profiler 2.0 -> trace_info.pb, uploadable) ==="
               NEURON_RT_INSPECT_ENABLE=1 NEURON_RT_INSPECT_SYSTEM_PROFILE=1 \
