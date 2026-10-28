@@ -475,6 +475,14 @@ def main():
                 'vae': vae_time,
                 'total': run_time,
             })
+            # WAN_DUMP_DIR: raw uint8 frames [F,H,W,3] + final latent for the accuracy gate.
+            # Written after the timers stop, so it never changes a timing.
+            dump_dir = os.environ.get("WAN_DUMP_DIR")
+            if dump_dir:
+                os.makedirs(dump_dir, exist_ok=True)
+                torch.save({"frames": video_np.contiguous(), "latent": latent.cpu().float()},
+                           os.path.join(dump_dir, "output.pt"))
+                logger.info(f"Dumped frames {tuple(video_np.shape)} + latent to {dump_dir}/output.pt")
 
     if rank == 0 and run_results:
         logger.info("")

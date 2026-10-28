@@ -27,7 +27,7 @@ spec:
               set -euo pipefail
 
               cd /tmp
-              BRANCH=main
+              BRANCH=latency_loop
               git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-i2v-14b.git wan2-i2v-14b
               cd wan2-i2v-14b
 
@@ -249,7 +249,20 @@ spec:
                 fi
 
                 echo "=== [2/3 $IMPL] CLEAN RUN (NO profiler) — median total = REAL LATENCY ==="
-                run_wan "$LOCAL_RESULTS/clean_$IMPL.txt" 4 | grep -iE "denoise=|vae=|total=|FAILED" || echo "CLEAN RUN FAILED"
+                WAN_DUMP_DIR="$LOCAL_RESULTS/dump_$IMPL" run_wan "$LOCAL_RESULTS/clean_$IMPL.txt" 4 | grep -iE "denoise=|vae=|total=|FAILED" || echo "CLEAN RUN FAILED"
+                GATE_REF="$ARCHIVE_DIR/gate_ref/output.pt"
+                if [ -s "$LOCAL_RESULTS/dump_$IMPL/output.pt" ]; then
+                  if [ ! -s "$GATE_REF" ]; then
+                    mkdir -p "$ARCHIVE_DIR/gate_ref" && cp "$LOCAL_RESULTS/dump_$IMPL/output.pt" "$GATE_REF" \
+                      && echo "GATE: no reference yet; saved this run as $GATE_REF (commit $GIT_SHA)" \
+                      && echo "$GIT_SHA $IMPL" > "$ARCHIVE_DIR/gate_ref/provenance.txt"
+                  fi
+                  echo "GATE [$IMPL] vs $(cat "$ARCHIVE_DIR/gate_ref/provenance.txt" 2>/dev/null):"
+                  python3 scripts/compare_outputs.py "$LOCAL_RESULTS/dump_$IMPL/output.pt" "$GATE_REF" --slice-axis 0 \
+                    2>&1 | tee "$LOCAL_RESULTS/gate_$IMPL.txt" || echo "GATE [$IMPL] rc=$?"
+                else
+                  echo "GATE [$IMPL]: NO DUMP"
+                fi
                 cp /tmp/wan2_i2v_output.mp4 "$LOCAL_RESULTS/wan2_i2v_output_clean_$IMPL.mp4" 2>/dev/null \
                   && echo "clean video saved: wan2_i2v_output_clean_$IMPL.mp4" || echo "NO VIDEO FROM CLEAN RUN"
                 rm -f /tmp/wan2_i2v_output.mp4
