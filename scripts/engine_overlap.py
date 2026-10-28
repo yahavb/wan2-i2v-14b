@@ -14,7 +14,9 @@ Input: the Instruction table written by `neuron-explorer view --output-format pa
 the columns it used and the table's columns when it cannot find one.
 Prints for the window from the first instruction start to the last end:
   - per engine: busy (union of its instructions), share of the window, time it is the ONLY
-    busy engine (serial), and instruction time summed
+    busy engine (serial), and instruction time summed (can exceed busy: instructions of one
+    engine overlap in the trace). Per-line times split each time slice among the instructions
+    active on that engine, so they add up to the engine busy and serial times.
   - all-engine idle, time with exactly 1 / 2 / 3+ engines busy
   - pairwise overlap (time both are busy) for the busiest engines
   - top source lines per engine by instruction time, and top source lines by SERIAL time
@@ -71,13 +73,23 @@ def main():
         return 2
     end_expr = f"{c_start} + {c_dur}" if c_dur else c_end
     src_expr = ("COALESCE(" + ", ".join(f"NULLIF(CAST({c} AS VARCHAR), '')" for c in srcs) + ", '')") if srcs else "''"
-    label = " | ".join(f"CAST({c} AS VARCHAR)" for c in (c_op, c_hlo) if c) or "''"
+    op_expr = f"COALESCE(CAST({c_op} AS VARCHAR), '')" if c_op else "''"
+    hlo_expr = f"COALESCE(CAST({c_hlo} AS VARCHAR), '')" if c_hlo else "''"
     print(f"columns used: start={c_start} end={'start+' + c_dur if c_dur else c_end} engine={c_eng} "
           f"source={srcs or 'none'} label={c_op}/{c_hlo}")
     rows = con.execute(
         f"SELECT CAST({c_eng} AS VARCHAR), CAST({c_start} AS BIGINT), CAST({end_expr} AS BIGINT), "
-        f"{src_expr}, {label} FROM read_parquet('{path}') WHERE {c_start} IS NOT NULL ORDER BY 2").fetchall()
-    rows = [r for r in rows if r[2] is not None and r[2] > r[1]]
+        f"{src_expr}, {op_expr}, {hlo_expr} FROM read_parquet('{path}') WHERE {c_start} IS NOT NULL ORDER BY 2").fetchall()
+    # key = "source line  opcode"; keep one HLO op name per key as an example
+    hlo_of = {}
+    rows2 = []
+    for e, s, t, src, op, hlo in rows:
+        if t is None or t <= s:
+            continue
+        key = f"{src or '(no source)'}  {op}"
+        hlo_of.setdefault(key, hlo.split("=")[0].strip()[:40] if hlo else "")
+        rows2.append((e, s, t, key, src))
+    rows = rows2
     if not rows:
         print("no instructions with a positive duration")
         return 2
@@ -86,58 +98,54 @@ def main():
     engines = sorted({r[0] for r in rows})
     idx = {e: i for i, e in enumerate(engines)}
 
-    # sweep line over instruction starts/ends: per-engine active counts
+    # Sweep line over instruction starts/ends. Instructions of one engine can overlap in the
+    # trace (queued or pipelined), so each time slice is split evenly among the instructions
+    # active on that engine: per-line busy time then adds up to the engine's busy time, and
+    # per-line serial time to the engine's serial time.
     ev = []
-    for e, s, t, _, _ in rows:
-        ev.append((s, 1, idx[e]))
-        ev.append((t, -1, idx[e]))
+    for rid, (e, s, t, _, _) in enumerate(rows):
+        ev.append((s, 1, rid))
+        ev.append((t, -1, rid))
     ev.sort(key=lambda x: (x[0], x[1]))
-    cnt = [0] * len(engines)
+    eng_of = [idx[r[0]] for r in rows]
+    active = [set() for _ in engines]
     busy = [0] * len(engines)
     alone = [0] * len(engines)
     pair = collections.Counter()
     nbusy = collections.Counter()
-    segs = []  # (start, end, active engine set) for serial attribution
+    by_src = collections.defaultdict(collections.Counter)  # engine -> key -> busy share
+    serial_src = collections.Counter()                      # (engine, key) -> serial share
     prev = t0
-    for t, d, i in ev:
+    for t, d, rid in ev:
         if t > prev:
-            act = [k for k in range(len(engines)) if cnt[k] > 0]
+            act = [k for k in range(len(engines)) if active[k]]
             dt = t - prev
             nbusy[min(len(act), 3)] += dt
             for k in act:
                 busy[k] += dt
+                share = dt / len(active[k])
+                for r in active[k]:
+                    by_src[engines[k]][rows[r][3]] += share
+                if len(act) == 1:
+                    for r in active[k]:
+                        serial_src[(engines[k], rows[r][3])] += share
             if len(act) == 1:
                 alone[act[0]] += dt
-                segs.append((prev, t, act[0]))
             for x in range(len(act)):
                 for y in range(x + 1, len(act)):
                     pair[(act[x], act[y])] += dt
             prev = t
-        cnt[i] += d
+        if d > 0:
+            active[eng_of[rid]].add(rid)
+        else:
+            active[eng_of[rid]].discard(rid)
 
     summed = collections.Counter()
-    by_src = collections.defaultdict(collections.Counter)
-    for e, s, t, src, _ in rows:
+    nosrc = collections.Counter()
+    for e, s, t, key, src in rows:
         summed[e] += t - s
-        by_src[e][src or "(no source)"] += t - s
-
-    # serial time per (engine, source): overlap of each instruction with the single-engine segments
-    serial_src = collections.Counter()
-    seg_by_eng = collections.defaultdict(list)
-    for s, t, k in segs:
-        seg_by_eng[engines[k]].append((s, t))
-    import bisect
-    for e, lst in seg_by_eng.items():
-        starts = [s for s, _ in lst]
-        for ee, s, t, src, _ in rows:
-            if ee != e:
-                continue
-            j = max(bisect.bisect_right(starts, s) - 1, 0)
-            while j < len(lst) and lst[j][0] < t:
-                lo, hi = max(s, lst[j][0]), min(t, lst[j][1])
-                if hi > lo:
-                    serial_src[(e, src or "(no source)")] += hi - lo
-                j += 1
+    for e, keys in by_src.items():
+        nosrc[e] = sum(v for k, v in keys.items() if k.startswith("(no source)"))
 
     order = sorted(range(len(engines)), key=lambda k: -busy[k])
     print(f"\nwindow {fmt(window)}  ({len(rows)} instructions, {len(engines)} engines/queues)")
@@ -159,15 +167,14 @@ def main():
                 print(f"  {engines[p][:20]:20} + {engines[q][:20]:20} {fmt(v)}  "
                       f"({100 * v / max(min(busy[p], busy[q]), 1):4.0f}% of the smaller)")
     print(f"\ntop source lines by SERIAL time (no other engine busy) -- re-partition / overlap targets:")
-    for (e, src), v in serial_src.most_common(a.top):
-        print(f"  {fmt(v)}  {e[:14]:14} {src[-90:]}")
+    for (e, key), v in serial_src.most_common(a.top):
+        print(f"  {fmt(v)}  {e[:10]:10} {key[-80:]}  {hlo_of.get(key, '')}")
     for k in order[:4]:
         e = engines[k]
-        tot = summed[e] or 1
-        nosrc = by_src[e].get("(no source)", 0)
-        print(f"\n{e}: top source lines by instruction time ({100 * nosrc / tot:.0f}% has no source location)")
-        for src, v in by_src[e].most_common(a.top):
-            print(f"  {fmt(v)}  {100 * v / tot:5.1f}%  {src[-90:]}")
+        tot = busy[k] or 1
+        print(f"\n{e}: top source lines by busy time ({100 * nosrc[e] / tot:.0f}% has no source location)")
+        for key, v in by_src[e].most_common(a.top):
+            print(f"  {fmt(v)}  {100 * v / tot:5.1f}%  {key[-80:]}  {hlo_of.get(key, '')}")
     if a.json_out:
         json.dump({"window_ns": window, "idle_ns": idle,
                    "engines": {engines[k]: {"busy_ns": busy[k], "alone_ns": alone[k], "sum_ns": summed[engines[k]]}
