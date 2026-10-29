@@ -65,6 +65,10 @@ FAST_CROSSQ_NKI = os.environ.get("FAST_CROSSQ_NKI", "0") == "1"
 # kernel (LayerNorm gamma = 1 + e4, beta = e3), replacing the adaln res kernel + up matmul.
 # The residual x + y becomes a plain torch add.
 FAST_FFNUP_NKI = os.environ.get("FAST_FFNUP_NKI", "0") == "1"
+# FAST_XRES_KERNEL=1 (with FAST_CROSSQ_NKI + FAST_ADALN): the gated residual x + gate * y before
+# the cross-attention runs in the adaln res_gate kernel (vector engine) instead of a torch add,
+# which the compiler lowers with tensor-engine transposes; its normalized output is unused.
+FAST_XRES_KERNEL = os.environ.get("FAST_XRES_KERNEL", "0") == "1"
 COMPILE_KW = dict(backend="neuron", dynamic=False, fullgraph=True)
 
 
@@ -382,7 +386,12 @@ class _FastBlock(nn.Module):
             y = _row_linear(sa.o, _self_attn(q, k, v).reshape(B, L, n * d))
         if FAST_CROSSQ_NKI:  # x = x + gate*y (torch) ; q = norm3(x) @ Wq + b (one kernel)
             n3 = blk.norm3
-            x = x + (y.reshape(B, L, C) * e[2]).to(x.dtype)
+            if FAST_XRES_KERNEL and FAST_ADALN:
+                x, _ = res_gate(y.reshape(B * L, C), _row(n3.weight, C, x.dtype), _row(n3.bias, C, x.dtype),
+                                x.reshape(B * L, C), _row(e[2], C, torch.float32))
+                x = x.view(B, L, C)
+            else:
+                x = x + (y.reshape(B, L, C) * e[2]).to(x.dtype)
             q = _get_qkv()(x, ca.q_wt, ca.q_b2, n3.w_row.to(x.dtype), n3.b_row.to(x.dtype))
             q = _tp_rms(q.view(B, L, -1), ca.norm_q).view(B, L, n, d)
         else:
