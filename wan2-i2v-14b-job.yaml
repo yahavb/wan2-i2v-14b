@@ -273,8 +273,14 @@ spec:
                       && echo "$GIT_SHA $IMPL" > "$ARCHIVE_DIR/gate_ref/provenance.txt"
                   fi
                   echo "GATE [$IMPL] vs $(cat "$ARCHIVE_DIR/gate_ref/provenance.txt" 2>/dev/null):"
-                  python3 scripts/compare_outputs.py "$LOCAL_RESULTS/dump_$IMPL/output.pt" "$GATE_REF" --slice-axis 0 \
-                    2>&1 | tee "$LOCAL_RESULTS/gate_$IMPL.txt" || echo "GATE [$IMPL] rc=$?"
+                  # --exact: identical to the reference or FAIL. A non-identical output is not a
+                  # verdict on quality: run MODE=validate (step-0 vs fp32 CPU DiT, VAE vs fp32 decode).
+                  if python3 scripts/compare_outputs.py "$LOCAL_RESULTS/dump_$IMPL/output.pt" "$GATE_REF" --slice-axis 0 --exact \
+                      2>&1 | tee "$LOCAL_RESULTS/gate_$IMPL.txt" | grep -v "^GATE:"; [ "${PIPESTATUS[0]}" = 0 ]; then
+                    echo "GATE [$IMPL]: EXACT (byte-identical to the reference)"
+                  else
+                    echo "GATE [$IMPL]: CHANGED (not identical) -- accuracy unknown until MODE=validate LOOP_FLAGS=... passes"
+                  fi
                 else
                   echo "GATE [$IMPL]: NO DUMP"
                 fi
