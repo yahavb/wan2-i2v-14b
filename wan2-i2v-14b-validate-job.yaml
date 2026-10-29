@@ -1,0 +1,451 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wan2-i2v-14b-validate
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: wan2-i2v-14b-validate
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+      resourceClaims:
+        - name: neurons
+          resourceClaimTemplateName: m-lnc2
+      containers:
+        - name: inference
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: Always
+          command:
+            - /bin/bash
+            - "-ec"
+            - |
+              set -euo pipefail
+
+              cd /tmp
+              BRANCH=latency_loop
+              git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-i2v-14b.git wan2-i2v-14b
+              cd wan2-i2v-14b
+
+              LOCAL_RESULTS=/tmp/results; mkdir -p "$LOCAL_RESULTS"
+
+              RUN_TS=$(date +%Y%m%d_%H%M%S)
+              RUN_DIR=$LOCAL_RESULTS/systrace; mkdir -p "$RUN_DIR"
+              ARCHIVE_DIR=/var/mdl/wan2_2_i2v; mkdir -p "$ARCHIVE_DIR" || echo "WARN: no $ARCHIVE_DIR (PVC?)"
+
+              GIT_SHA=$(git rev-parse HEAD)
+              GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+              echo "┌────────────── PROVENANCE ──────────────"
+              echo "│ branch : $GIT_BRANCH (requested: $BRANCH)"
+              echo "│ commit : $GIT_SHA"
+              echo "│ subject: $(git log -1 --pretty=%s)"
+              echo "└─────────────────────────────────────────"
+              { echo "branch=$GIT_BRANCH commit=$GIT_SHA"; } > "$LOCAL_RESULTS/provenance.txt"
+
+              NEFF_DIRS="/var/tmp/neuron-compile-cache /tmp/neff_cache"
+              NEFF_CACHE=/var/tmp/neuron-compile-cache
+              export NEURON_COMPILE_CACHE_URL=$NEFF_CACHE
+              export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
+              export NEURON_FRAMEWORK_DEBUG=1
+              export TORCH_NEURONX_DEBUG_DIR=/tmp/neff_debug
+              export TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS=1
+              mkdir -p /tmp/neff_debug
+
+              REFERENCE_LINE="(none — clean median is the baseline)"
+
+              PROF_CLI=$(command -v neuron-explorer || ls /opt/aws/neuron/bin/neuron-explorer 2>/dev/null || command -v neuron-profile || echo neuron-profile)
+              echo "PROFILER CLI: $PROF_CLI"
+
+              bash scripts/prepare.sh 2>&1 | tee "$LOCAL_RESULTS/prepare.txt" | tail -5 || { echo "PREPARE FAILED"; exit 1; }
+
+              NKI_STATUS=$(python3 -c 'import wan.modules.attention as a; print("self="+str(a._NKI_SELF_AVAILABLE), "cross="+str(a._NKI_CROSS_AVAILABLE), "SEQLEN_MULT="+str(a.SELF_ATTN_SEQLEN_MULTIPLE))' 2>&1 | tr '\n' ' ')
+              echo "PROVENANCE NKI: $NKI_STATUS"
+              echo "nki=$NKI_STATUS" >> "$LOCAL_RESULTS/provenance.txt"
+              NKILIB_STATUS=$(python3 -c 'import nkilib.core.attention.attention_cte as m; print("nkilib attention_cte: OK", m.__file__)' 2>&1 | tail -1)
+              echo "PROVENANCE $NKILIB_STATUS"
+              echo "ATTN_IMPLS=$ATTN_IMPLS  $NKILIB_STATUS" >> "$LOCAL_RESULTS/provenance.txt"
+
+              export WAN_DIR=/tmp/wan2-i2v-14b
+              export MODEL_PATH=/tmp/Wan2.2-I2V-A14B
+              WORLD_SIZE=$(( ${TP_DEGREE:-4} * ${SP_DEGREE:-2} ))
+
+              if [ "${MODE:-bench}" = validate ]; then   # accuracy suite only (scripts/validate/)
+                echo "════════ VALIDATE: LOOP_FLAGS=${LOOP_FLAGS:-FAST_QKV=1} ════════"
+                THREADS=22 bash scripts/validate/validate_job.sh 2>&1 | tee "$LOCAL_RESULTS/validate.txt"
+                cp /tmp/validate.tar.gz "$ARCHIVE_DIR/validate_$RUN_TS.tar.gz" 2>/dev/null || true
+                echo "███ VALIDATE COMPLETE ($GIT_BRANCH @ ${GIT_SHA:0:12}); pod idles for kubectl cp"
+                sleep 864000
+              fi
+
+              run_wan() {
+                local OUT="$1" RUNS="$2"
+                NUM_RUNS="$RUNS" torchrun --nproc_per_node="$WORLD_SIZE" --master_port=29500 \
+                  /tmp/wan2-i2v-14b/inference_neuron_i2v.py 2>&1 | tee "$OUT"
+              }
+              median_key() {
+                { grep "DONE:" "$1" 2>/dev/null | tail -n +2 | grep -oE "$2=[0-9.]+s" | grep -oE "[0-9.]+" || true; } | sort -n | \
+                  awk '{a[NR]=$1} END{ if(NR==0){print "N/A"} else if(NR%2){print a[(NR+1)/2]} else {printf "%.2f", (a[NR/2]+a[NR/2+1])/2} }'
+              }
+              median_total_s() {
+                grep -oE "total=[0-9.]+s" "$1" | grep -oE "[0-9.]+" | sort -n | \
+                  awk '{a[NR]=$1} END{ if(NR==0){print "N/A"} else if(NR%2){print a[(NR+1)/2]} else {printf "%.1f", (a[NR/2]+a[NR/2+1])/2} }'
+              }
+
+              neff_hotspots() {
+                local NEFF="$1" NTFF="$2" HOTS="$3"
+                [ -n "$NEFF" ] && [ -f "$NTFF" ] || { echo "no NEFF/NTFF — skip detail"; return; }
+                echo "═══ dominant NEFF detail (summary-text) ═══" | tee "$HOTS"
+                timeout 180 "$PROF_CLI" view -n "$NEFF" -s "$NTFF" \
+                  --output-format summary-text 2>/dev/null | tee -a "$HOTS" || echo "  view failed"
+                echo "  (name the hot op from: gpsimd_engine_active_time_percent,"
+                echo "   software_dynamic_dma_packet_percent + _count, hardware_dynamic_dma_packet_percent,"
+                echo "   dma_transfer_average_bytes, matmul_instruction_count, transpose_flops)"
+              }
+
+              run_explorer() {
+                local POUT=/tmp/perneff_prof; rm -rf "$POUT"; mkdir -p "$POUT"
+                mapfile -t NEFFS < <(find $NEFF_DIRS -name "*.neff" 2>/dev/null | sort -u)
+                local TOTAL=${#NEFFS[@]}
+                echo "NEFFs found: $TOTAL"
+                echo "(step [4] captures+views each NEFF — this is the SLOW part, ~minutes; progress every 25)"
+                local OK=0 i=0
+                for neff in "${NEFFS[@]}"; do
+                  i=$((i+1))
+                  local hash; hash=$(basename "$neff" .neff)
+                  local ntff="$POUT/${hash}.ntff" json="$POUT/${hash}.json"
+                  NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 180 \
+                    "$PROF_CLI" capture --single-io -n "$neff" -s "$ntff" >/dev/null 2>&1 || continue
+                  [ -f "$ntff" ] || continue
+                  timeout 120 "$PROF_CLI" view -n "$neff" -s "$ntff" --output-format summary-json > "$json" 2>/dev/null || true
+                  [ -s "$json" ] && OK=$((OK+1))
+                  if [ $((i % 25)) -eq 0 ]; then echo "  [4] progress: $i/$TOTAL NEFFs (OK=$OK)"; fi
+                done
+                echo "captured+viewed OK: $OK / $TOTAL"
+                python3 scripts/neuron/profile_all_neffs.py "$POUT" 2>&1 | tee "$LOCAL_RESULTS/perneff_breakdown.txt" || echo "aggregation failed"
+                local BIGHASH BIGNEFF
+                BIGHASH=$(python3 scripts/neuron/pick_neffs.py "$POUT" "$NEFF_CACHE" | head -1)
+                BIGNEFF=$(find $NEFF_DIRS -name "${BIGHASH}.neff" 2>/dev/null | head -1)
+                neff_hotspots "$BIGNEFF" "$POUT/${BIGHASH}.ntff" "$LOCAL_RESULTS/hotspots_${BIGHASH}.txt"
+
+                local PAIRS="$LOCAL_RESULTS/ntff_pairs"; mkdir -p "$PAIRS"
+                local kept=0
+                while read -r h; do
+                  [ -n "$h" ] || continue
+                  local nf; nf=$(find $NEFF_DIRS -name "${h}.neff" 2>/dev/null | head -1)
+                  if [ -n "$nf" ] && [ -f "$POUT/${h}.ntff" ]; then
+                    cp "$nf" "$PAIRS/${h}.neff" && cp "$POUT/${h}.ntff" "$PAIRS/${h}.ntff" && kept=$((kept+1))
+                  fi
+                done < <(python3 scripts/neuron/top_neffs.py "$POUT" 5 2>/dev/null)
+                echo "preserved $kept heavy NEFF+NTFF pairs in $PAIRS (for SQL/parquet query)"
+              }
+
+              capture_dit_pairs() {
+                local TAG="$1" OUT="$LOCAL_RESULTS/dit_pairs_$1"; rm -rf "$OUT"; mkdir -p "$OUT"
+                local SEQ=$(( ((FRAME_NUM - 1) / 4 + 1) * (OUT_H / 16) * (OUT_W / 16) ))
+                find / -xdev -name '*.neff' -newer "/tmp/stage_start_$TAG" -not -path "$LOCAL_RESULTS/*" \
+                  -not -path '/proc/*' 2>/dev/null > "$OUT/stage_neffs.txt" || true
+                echo "  NEFFs written since stage start: $(wc -l < "$OUT/stage_neffs.txt")"
+                sed 's|/[^/]*$||' "$OUT/stage_neffs.txt" | awk -F/ 'NF>4{NF=4} {print}' OFS=/ | sort | uniq -c | sort -rn | head -5
+                local SDIR="/tmp/stage_neffs_$TAG"; rm -rf "$SDIR"; mkdir -p "$SDIR"
+                local i=0 f
+                while read -r f; do i=$((i+1)); ln -sf "$f" "$SDIR/${i}_$(basename "$f")"; done < "$OUT/stage_neffs.txt"
+                local PICK=(scripts/neuron/pick_dit_neffs.py "$SDIR" --seq "$SEQ")
+                python3 "${PICK[@]}" 2>&1 | tee "$OUT/dit_neff_identify.txt" || true
+                local n=0 other=0 role ws neff
+                while IFS=$'\t' read -r role ws neff; do
+                  [ -s "$neff" ] || continue
+                  case "$role" in
+                    attn_kernel|attn_path|collective) ;;
+                    *) other=$((other+1)); [ "$other" -le "${DIT_MAX_PAIRS:-6}" ] || continue ;;
+                  esac
+                  n=$((n+1))
+                  local h d; h=$(basename "$neff" .neff)
+                  d="$OUT/$(printf '%02d' "$n")_${role}_${h}"; mkdir -p "$d"
+                  cp "$neff" "$d/$h.neff" || continue
+                  [ "$ws" = "0" ] && ws=$WORLD_SIZE
+                  local extra=(); [ "$ws" -gt 1 ] && extra=(-r "$ws" -i 0)
+                  echo "  [$n] $role ws=$ws $h — capturing"
+                  ( cd "$d" && timeout "${DIT_CAP_TIMEOUT:-1800}" "$PROF_CLI" capture \
+                      -n "$h.neff" -s "$h.ntff" ${extra[@]+"${extra[@]}"} --num-exec=1 --enable-dge-notifs \
+                  ) > "$d/capture.log" 2>&1 || echo "      capture rc=$?"
+                  if [ ! -s "$d/$h.ntff" ]; then
+                    local f; f=$(ls -S "$d/$h"*rank_0*.ntff "$d/$h"*.ntff 2>/dev/null | head -1) || true
+                    [ -n "$f" ] && [ -s "$f" ] && mv "$f" "$d/$h.ntff" || true
+                  fi
+                  rm -f "$d/$h"*rank_*.ntff 2>/dev/null || true
+                  if [ -s "$d/$h.ntff" ]; then
+                    timeout 900 "$PROF_CLI" view -n "$d/$h.neff" -s "$d/$h.ntff" \
+                      --output-format summary-json > "$d/summary.json" 2>/dev/null || true
+                    { [ -s "$d/summary.json" ] && python3 scripts/neuron/check_trace_nonempty.py \
+                        "$d/summary.json" "$h"; } || echo "      (no summary json)"
+                    timeout 900 "$PROF_CLI" view -n "$d/$h.neff" -s "$d/$h.ntff" \
+                      --output-format summary-text > "$d/summary.txt" 2>/dev/null || true
+                    echo "      ntff $(du -h "$d/$h.ntff" | cut -f1)  -> $d"
+                  else
+                    echo "      !! no ntff produced. capture.log tail:"; tail -8 "$d/capture.log" || true
+                  fi
+                done < <(python3 "${PICK[@]}" --print-paths 2>/dev/null || true)
+                echo "  DiT pairs with ntff: $(find "$OUT" -name '*.ntff' | wc -l) / $n"
+                mkdir -p "$OUT/code"; cp wan/modules/attention.py models/sp_attention.py "$OUT/code/" || true
+                case "$TAG" in
+                  legacy)   cp kernels/self_attention.py kernels/cross_attention.py "$OUT/code/" || true ;;
+                  cte)      cp "$(python3 -c 'import nkilib.core.attention.attention_cte as m; print(m.__file__)')" "$OUT/code/" || true ;;
+                  constmax) cp kernels/nkilib/experimental/attention/{attention_const_max,ring_attention_const_max_fwd}.py "$OUT/code/" || true ;;
+                  fast*)    cp models/fast_dit.py "$OUT/code/" || true
+                            [ "$TAG" = fast_constmax ] && cp kernels/nkilib/experimental/attention/{attention_const_max,ring_attention_const_max_fwd}.py "$OUT/code/" || true
+                            cp "$(python3 -c 'import nkilib.core.attention.attention_cte as m; print(m.__file__)')" "$OUT/code/" || true ;;
+                esac
+                tar -czf "$LOCAL_RESULTS/dit_pairs_$TAG.tar.gz" -C "$LOCAL_RESULTS" "dit_pairs_$TAG" 2>/dev/null \
+                  && echo "  dit_pairs_$TAG.tar.gz: $(du -h "$LOCAL_RESULTS/dit_pairs_$TAG.tar.gz" | cut -f1)" || echo "  dit_pairs tar failed"
+                cp "$LOCAL_RESULTS/dit_pairs_$TAG.tar.gz" "$ARCHIVE_DIR/dit_pairs_${TAG}_$RUN_TS.tar.gz" 2>/dev/null \
+                  && echo "  archived -> $ARCHIVE_DIR/dit_pairs_${TAG}_$RUN_TS.tar.gz" || echo "  PVC copy skipped"
+              }
+
+              echo "════════════ NEURON 3-RUN BENCHMARK (Wan2.2-I2V-A14B) ════════════"
+              echo "  reference: $REFERENCE_LINE"
+              echo "  TP=${TP_DEGREE} SP=${SP_DEGREE} world=${WORLD_SIZE} frames=${FRAME_NUM} steps=${NUM_STEPS} size=${OUT_H}x${OUT_W} batched-CFG"
+              echo "=================================================================="
+
+              result_line() {
+                local C="$LOCAL_RESULTS/clean_$1.txt" ENC DEN DEC TOT SPS
+                ENC=$(median_key "$C" encode); DEN=$(median_key "$C" denoise)
+                DEC=$(median_key "$C" vae);    TOT=$(median_key "$C" total)
+                SPS=$(awk -v d="$DEN" -v n="$NUM_STEPS" 'BEGIN{ if(d=="N/A"){print "N/A"} else printf "%.2f", d/n }')
+                local TXT; TXT=$(grep -ohE "text_encode=[0-9.]+s" "$C" 2>/dev/null | tail -1 | cut -d= -f2) || true
+                echo "RESULT [$1] ${OUT_H}x${OUT_W} ${FRAME_NUM}f ${NUM_STEPS}steps: denoise=${DEN}s  s/step=${SPS}  vae_encode=${ENC}s  vae_decode+output=${DEC}s  total=${TOT}s  text_encode=${TXT:-N/A}"
+              }
+
+              LAST_IMPL=""
+              for IMPL in $ATTN_IMPLS; do
+                export ATTN_IMPL="$IMPL"
+                case "$IMPL" in fast_*)
+                  F="${IMPL#fast_}"; export ATTN_IMPL=fast FAST_ATTN_IMPL="${F%%+*}"
+                  export FAST_MLP=0 FAST_OPROJ=0 FAST_ADALN=0 FAST_QKV=0 FAST_QKV_CHUNKS=1 FAST_QKV_NKI=0
+                  case "$IMPL" in *+qkv|*+qkv+*) export FAST_QKV=1 ;; esac
+                  case "$IMPL" in *+qkvc*) export FAST_QKV_CHUNKS=${QKV_CHUNKS:-4} ;; esac
+                  case "$IMPL" in *+qkvnki*) export FAST_QKV_NKI=1 ;; esac
+                  case "$IMPL" in *+mlp*) export FAST_MLP=1 ;; esac
+                  case "$IMPL" in *+oproj*) export FAST_OPROJ=1 ;; esac
+                  case "$IMPL" in *+adaln*) export FAST_ADALN=1 ;; esac
+                  export VAE_IMPL=tp
+                  case "$IMPL" in *+vae*) export VAE_IMPL=static ;; esac
+                  case "$IMPL" in *+vaetile*) export VAE_IMPL=static_tiled ;; esac
+                  export T5_IMPL=eager
+                  case "$IMPL" in *+t5*) export T5_IMPL=fast ;; esac
+                  echo "  FAST_ATTN_IMPL=$FAST_ATTN_IMPL FAST_MLP=$FAST_MLP FAST_OPROJ=$FAST_OPROJ FAST_ADALN=$FAST_ADALN FAST_QKV=$FAST_QKV FAST_QKV_CHUNKS=$FAST_QKV_CHUNKS FAST_QKV_NKI=$FAST_QKV_NKI VAE_IMPL=$VAE_IMPL T5_IMPL=$T5_IMPL" ;;
+                esac
+                rm -rf $NEFF_DIRS; mkdir -p $NEFF_DIRS
+                touch "/tmp/stage_start_$IMPL"; sleep 1
+                echo "████ STAGE ATTN_IMPL=$IMPL (cache emptied: $NEFF_DIRS) ████"
+
+                echo "=== [1/3 $IMPL] WARMUP (compile into this stage's cache; NOT timed) ==="
+                PAD_DEBUG=1 run_wan "$LOCAL_RESULTS/warmup_$IMPL.txt" 1 | grep -iE "ATTN_IMPL|kernel: |Compiling|total=|FAILED|Error|Traceback|\[SP\]|SP degree|TP degree|World size" || echo "(warmup output captured)"
+                echo "NEFFs in cache after warmup: $(find $NEFF_DIRS -name '*.neff' 2>/dev/null | wc -l)"
+
+                echo "=== [1b $IMPL] DiT NEFF+NTFF PAIRS ==="
+                capture_dit_pairs "$IMPL"
+                python3 scripts/neuron/attn_kernel_report.py "$LOCAL_RESULTS/dit_pairs_$IMPL" "$IMPL" \
+                  2>&1 | tee "$LOCAL_RESULTS/attn_kernel_$IMPL.txt" || true
+                echo "=== [1c $IMPL] DiT BLOCK PROFILE (summary-text of the heaviest captured NEFF) ==="
+                B1=$(ls -d "$LOCAL_RESULTS/dit_pairs_$IMPL"/01_* 2>/dev/null | head -1) || true
+                if [ -n "$B1" ] && [ -s "$B1/summary.txt" ]; then
+                  grep -E '^\s*(total_time|total_active_time|[a-z_]*engine_active_time(_percent)?|[a-z_]*engine_instruction_count|dma_active_time|cc_op_time|cc_op_count|hbm_read_bytes|hbm_write_bytes|mfu_estimated_percent|mbu_estimated_percent|hardware_flops|[a-z_]*dynamic_dma_packet_(percent|count)|static_dma_packet_count|dma_transfer_total_bytes|dma_transfer_average_bytes|psum_write_bytes|psum_read_sbuf_write_bytes|spill[a-z_]*|[a-z_]*semaphore[a-z_]*|[a-z_]*wait[a-z_]*|transpose_flops|matmul_instruction_count)\s' "$B1/summary.txt" \
+                    | sed "s/^/  [blk $IMPL] /" | tee "$LOCAL_RESULTS/block_profile_$IMPL.txt" || true
+                else
+                  echo "  (no block summary)"
+                fi
+
+                echo "=== [1d $IMPL] DiT BLOCK ENGINE OVERLAP (instruction table of the block NEFF) ==="
+                BLK=/tmp/blk_$IMPL; rm -rf "$BLK"; mkdir -p "$BLK"
+                for f in "$B1"/*.neff "$B1"/*.ntff; do [ -s "$f" ] && ln -sf "$f" "$BLK/$(basename "$f")"; done
+                timeout 2400 bash scripts/neuron/run_dma_analysis.sh "$BLK" 2>&1 \
+                  | sed -n '/--- engine overlap/,$p' | tee "$LOCAL_RESULTS/engine_overlap_$IMPL.txt" | head -60 || true
+                echo "=== [2/3 $IMPL] CLEAN RUN (NO profiler) — median total = REAL LATENCY ==="
+                WAN_DUMP_DIR="$LOCAL_RESULTS/dump_$IMPL" run_wan "$LOCAL_RESULTS/clean_$IMPL.txt" 4 | grep -iE "denoise=|vae=|total=|FAILED" || echo "CLEAN RUN FAILED"
+                GATE_REF="$ARCHIVE_DIR/gate_ref/output.pt"
+                if [ -s "$LOCAL_RESULTS/dump_$IMPL/output.pt" ]; then
+                  if [ ! -s "$GATE_REF" ]; then
+                    mkdir -p "$ARCHIVE_DIR/gate_ref" && cp "$LOCAL_RESULTS/dump_$IMPL/output.pt" "$GATE_REF" \
+                      && echo "GATE: no reference yet; saved this run as $GATE_REF (commit $GIT_SHA)" \
+                      && echo "$GIT_SHA $IMPL" > "$ARCHIVE_DIR/gate_ref/provenance.txt"
+                  fi
+                  echo "GATE [$IMPL] vs $(cat "$ARCHIVE_DIR/gate_ref/provenance.txt" 2>/dev/null):"
+                  # --exact: identical to the reference or FAIL. A non-identical output is not a
+                  # verdict on quality: run MODE=validate (step-0 vs fp32 CPU DiT, VAE vs fp32 decode).
+                  if python3 scripts/compare_outputs.py "$LOCAL_RESULTS/dump_$IMPL/output.pt" "$GATE_REF" --slice-axis 0 --exact \
+                      2>&1 | tee "$LOCAL_RESULTS/gate_$IMPL.txt" | grep -v "^GATE:"; [ "${PIPESTATUS[0]}" = 0 ]; then
+                    echo "GATE [$IMPL]: EXACT (byte-identical to the reference)"
+                  else
+                    echo "GATE [$IMPL]: CHANGED (not identical) -- accuracy unknown until MODE=validate LOOP_FLAGS=... passes"
+                  fi
+                else
+                  echo "GATE [$IMPL]: NO DUMP"
+                fi
+                cp /tmp/wan2_i2v_output.mp4 "$LOCAL_RESULTS/wan2_i2v_output_clean_$IMPL.mp4" 2>/dev/null \
+                  && echo "clean video saved: wan2_i2v_output_clean_$IMPL.mp4" || echo "NO VIDEO FROM CLEAN RUN"
+                rm -f /tmp/wan2_i2v_output.mp4
+                result_line "$IMPL" | tee -a "$LOCAL_RESULTS/results.txt"
+                LAST_IMPL="$IMPL"
+              done
+              T_CLEAN=$(median_key "$LOCAL_RESULTS/clean_$LAST_IMPL.txt" total)
+
+              T_PROF=N/A
+              if [ "${DEEP_PROFILE:-1}" = "1" ]; then
+              echo "████ DEEP PROFILE on ATTN_IMPL=$LAST_IMPL ████"
+              echo "=== [3/3] PROFILED RUN (NEURON_RT_INSPECT_ENABLE=1 — overhead delta) ==="
+              NEURON_RT_INSPECT_ENABLE=1 run_wan "$LOCAL_RESULTS/profiled.txt" 3 | grep -iE "denoise=|vae=|total=|FAILED" || echo "PROFILED RUN FAILED"
+              T_PROF=$(median_key "$LOCAL_RESULTS/profiled.txt" total)
+
+              echo "=== [3b] SYSTEM-TRACE BUNDLE (Neuron Profiler 2.0 -> trace_info.pb, uploadable) ==="
+              NEURON_RT_INSPECT_ENABLE=1 NEURON_RT_INSPECT_SYSTEM_PROFILE=1 \
+              NEURON_RT_INSPECT_DEVICE_PROFILE=1 NEURON_RT_INSPECT_OUTPUT_DIR="$RUN_DIR" \
+                run_wan "$LOCAL_RESULTS/systrace_run.txt" 3 | grep -iE "total=|FAILED" || echo "(systrace run captured)"
+              echo "  trace_info.pb count: $(find "$RUN_DIR" -name 'trace_info.pb' 2>/dev/null | wc -l)"
+              echo "  rank subdirs       : $(find "$RUN_DIR" -maxdepth 1 -type d -name 'i-*' 2>/dev/null | wc -l)"
+              echo "  .ntff / .neff      : $(find "$RUN_DIR" -name '*.ntff' 2>/dev/null | wc -l) / $(find "$RUN_DIR" -name '*.neff' 2>/dev/null | wc -l)"
+
+              echo "=== [3c] SYSTEM-TRACE TIMELINE (busy / idle / gaps / top graphs, last run) ==="
+              uv pip install --python "$(command -v python3)" duckdb >/dev/null 2>&1 || echo "  duckdb install failed"
+              mapfile -t TR_DIRS < <(find "$RUN_DIR" -maxdepth 2 -type d -name '*_pid_*' 2>/dev/null | sort)
+              echo "  system-trace rank dirs: ${#TR_DIRS[@]} (run 3 of 3 in one process = warm)"
+              ri=0
+              for TR_SRC in "${TR_DIRS[@]}"; do
+                ri=$((ri+1)); PQD=/tmp/systrace_pq_$ri
+                timeout 1800 bash scripts/neuron_trace_to_parquet.sh "$TR_SRC" "$PQD" >/dev/null 2>&1 || true
+                PQ=$(find "$PQD" -name SystemProfileEvents.parquet | head -1)
+                if [ -z "$PQ" ]; then echo "  [$ri] $(basename "$TR_SRC"): no parquet"; continue; fi
+                python3 scripts/trace_report.py --neuron-parquet "$PQ" --anchor most-frequent --per-run 400 \
+                  --top 20 --json-out "$LOCAL_RESULTS/trace_report_$ri.json" > "$LOCAL_RESULTS/trace_report_$ri.txt" 2>&1 || true
+                echo "  [$ri] $(basename "$TR_SRC"): $(grep -m1 -E '^== phase' "$LOCAL_RESULTS/trace_report_$ri.txt")"
+              done
+              [ -s "$LOCAL_RESULTS/trace_report_1.txt" ] && cat "$LOCAL_RESULTS/trace_report_1.txt"
+              echo "=== [4] per-NEFF engine breakdown + dominant-NEFF metrics ($PROF_CLI) ==="
+              run_explorer
+
+              echo "=== PROFILER-OVERHEAD COMPARISON ==="
+              echo "  clean    (no profiler, REAL latency) : ${T_CLEAN:-N/A} s/run"
+              echo "  profiled (profiler on)               : ${T_PROF:-N/A} s/run"
+              echo "  reference                            : $REFERENCE_LINE"
+              echo "  (compare engine SHARES from run 3, not absolute µs)"
+
+              echo "=== [5] INSTRUCTION-LEVEL DMA ANALYSIS (names the op behind each heavy NEFF) ==="
+              bash scripts/neuron/run_dma_analysis.sh "$LOCAL_RESULTS/ntff_pairs" \
+                2>&1 | tee "$LOCAL_RESULTS/dma_analysis.txt" || echo "DMA analysis skipped"
+              else
+                echo "DEEP_PROFILE=0: skipped profiled run, system trace, per-NEFF sweep, DMA analysis"
+              fi
+
+              cp /tmp/wan2_i2v_output.mp4 "$LOCAL_RESULTS/" 2>/dev/null && echo "video archived" || echo "NO VIDEO PRODUCED"
+              ARCHIVE=/tmp/wan2-i2v-14b_results_$RUN_TS.tar.gz
+              tar -czf "$ARCHIVE" -C /tmp results 2>/dev/null || true
+              cp "$ARCHIVE" "$ARCHIVE_DIR/" 2>/dev/null && echo "Saved: $ARCHIVE_DIR/$(basename "$ARCHIVE")" || echo "persist skipped"
+              echo "╔══════════════════ kubectl cp (from your laptop) ══════════════════╗"
+              for IMPL in $ATTN_IMPLS; do
+                echo "  kubectl cp default/$HOSTNAME:/tmp/results/dit_pairs_$IMPL.tar.gz ./dit_pairs_$IMPL.tar.gz"
+                echo "  kubectl cp default/$HOSTNAME:/tmp/results/wan2_i2v_output_clean_$IMPL.mp4 ./wan2_i2v_output_clean_$IMPL.mp4"
+              done
+              echo "  kubectl cp default/$HOSTNAME:$ARCHIVE ./$(basename "$ARCHIVE")"
+              find "$LOCAL_RESULTS" -maxdepth 2 -type f 2>/dev/null | sed 's/^/    /' | head -40
+              echo "╚════════════════════════════════════════════════════════════════════╝"
+              echo "╔══ VALIDATE video. $GIT_BRANCH @ ${GIT_SHA:0:12} SP=${SP_DEGREE} steps=${NUM_STEPS} ══╗"
+
+              echo ""
+              echo "████████████████████████████████████████████████████████████████"
+              echo "███ BENCHMARK COMPLETE — clean=${T_CLEAN:-N/A}s profiled=${T_PROF:-N/A}s ($GIT_BRANCH @ ${GIT_SHA:0:12})"
+              echo "███ results: $LOCAL_RESULTS  (archive: $ARCHIVE_DIR/$(basename "$ARCHIVE"))"
+              echo "███ grep 'BENCHMARK COMPLETE' to confirm; pod now idles for kubectl cp"
+              echo "████████████████████████████████████████████████████████████████"
+
+              echo "Pod stays alive 10 days for kubectl cp. Results: $LOCAL_RESULTS"
+
+              echo "════════ ATTENTION PROGRESSION (same spec, same node) ════════"
+              cat "$LOCAL_RESULTS"/attn_kernel_*.txt 2>/dev/null || true
+              for IMPL in $ATTN_IMPLS; do result_line "$IMPL"; done
+              sleep 864000
+          resources:
+            claims:
+              - name: neurons
+            requests:
+              cpu: 22
+              memory: 220Gi
+            limits:
+              cpu: 22
+              memory: 220Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: MODE
+              value: "validate"
+            - name: LOOP_FLAGS
+              value: "FAST_QKV_NKI=1"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: TORCH_NEURONX_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_FLAGS
+              value: "--model-type=transformer"
+            - name: TP_DEGREE
+              value: "8"
+            - name: SP_DEGREE
+              value: "1"
+            - name: T5_RANK
+              value: "0"
+            - name: VAE_TP_DEGREE
+              value: "2"
+            - name: USE_NKI_KERNELS
+              value: "1"
+            - name: ATTN_IMPLS
+              value: "fast_cte+oproj+adaln+vaetile+t5+qkvnki"
+            - name: FAST_DIT
+              value: "1"
+            - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
+              value: "134217728"
+            - name: DEEP_PROFILE
+              value: "0"
+            - name: OUT_H
+              value: "368"
+            - name: OUT_W
+              value: "480"
+            - name: NUM_STEPS
+              value: "10"
+            - name: NUM_RUNS
+              value: "1"
+            - name: FRAME_NUM
+              value: "21"
+            - name: INSTANCE_TYPE
+              value: "trn3-dev1.48xlarge"
+            - name: LNC_CONFIG
+              value: "LNC2"
+            - name: NUM_NEURON_DEVICES
+              value: "2"
+            - name: CUDA_VISIBLE_DEVICES
+              value: ""
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
