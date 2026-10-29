@@ -469,7 +469,7 @@ def main():
         run_time = time.time() - run_start
 
         if rank == 0:
-            logger.info(f"═══ {run_label} DONE: encode={encode_time:.2f}s, denoise={denoise_time:.1f}s, vae={vae_time:.1f}s, total={run_time:.1f}s ═══")
+            logger.info(f"═══ {run_label} DONE: encode={encode_time:.2f}s, denoise={denoise_time:.2f}s, vae={vae_time:.2f}s, total={run_time:.2f}s ═══")
             run_results.append({
                 'run': run_idx + 1,
                 'encode': encode_time,
