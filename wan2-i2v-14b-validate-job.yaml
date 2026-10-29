@@ -60,6 +60,16 @@ spec:
               PROF_CLI=$(command -v neuron-explorer || ls /opt/aws/neuron/bin/neuron-explorer 2>/dev/null || command -v neuron-profile || echo neuron-profile)
               echo "PROFILER CLI: $PROF_CLI"
 
+              # Node cache (hostPath /opt/wan2-i2v-14b, shared with the serve pods): the 118 GB of
+              # weights are downloaded once per node; prepare.sh then finds them at MODEL_PATH.
+              NODE_CACHE=/node-cache; mkdir -p "$NODE_CACHE"
+              uv pip install --python "$(command -v python3)" huggingface_hub >/dev/null 2>&1
+              ln -sfn "$NODE_CACHE/Wan2.2-I2V-A14B" /tmp/Wan2.2-I2V-A14B
+              flock "$NODE_CACHE/model.lock" bash -c '
+                [ -f "$1/Wan2.2-I2V-A14B/.complete" ] && { echo "model: on node cache"; exit 0; }
+                echo "model: downloading to node cache (resumes a partial download)"
+                python3 -c "from huggingface_hub import snapshot_download as d; d(\"Wan-AI/Wan2.2-I2V-A14B\", local_dir=\"$1/Wan2.2-I2V-A14B\")"
+                touch "$1/Wan2.2-I2V-A14B/.complete"' _ "$NODE_CACHE"
               bash scripts/prepare.sh 2>&1 | tee "$LOCAL_RESULTS/prepare.txt" | tail -5 || { echo "PREPARE FAILED"; exit 1; }
 
               NKI_STATUS=$(python3 -c 'import wan.modules.attention as a; print("self="+str(a._NKI_SELF_AVAILABLE), "cross="+str(a._NKI_CROSS_AVAILABLE), "SEQLEN_MULT="+str(a.SELF_ATTN_SEQLEN_MULTIPLE))' 2>&1 | tr '\n' ' ')
@@ -376,6 +386,8 @@ spec:
               cpu: 22
               memory: 220Gi
           volumeMounts:
+            - name: node-cache
+              mountPath: /node-cache
             - name: dshm
               mountPath: /dev/shm
             - name: 621547421844-ap-southeast-4-pvc
@@ -442,6 +454,10 @@ spec:
                   name: github-token
                   key: GITHUB_TOKEN
       volumes:
+        - name: node-cache
+          hostPath:
+            path: /opt/wan2-i2v-14b
+            type: DirectoryOrCreate
         - name: dshm
           emptyDir:
             medium: Memory
