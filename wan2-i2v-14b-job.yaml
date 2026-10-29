@@ -216,7 +216,9 @@ spec:
                 export ATTN_IMPL="$IMPL"
                 case "$IMPL" in fast_*)
                   F="${IMPL#fast_}"; export ATTN_IMPL=fast FAST_ATTN_IMPL="${F%%+*}"
-                  export FAST_MLP=0 FAST_OPROJ=0 FAST_ADALN=0
+                  export FAST_MLP=0 FAST_OPROJ=0 FAST_ADALN=0 FAST_QKV=0 FAST_QKV_CHUNKS=1
+                  case "$IMPL" in *+qkv*) export FAST_QKV=1 ;; esac
+                  case "$IMPL" in *+qkvc*) export FAST_QKV_CHUNKS=${QKV_CHUNKS:-4} ;; esac
                   case "$IMPL" in *+mlp*) export FAST_MLP=1 ;; esac
                   case "$IMPL" in *+oproj*) export FAST_OPROJ=1 ;; esac
                   case "$IMPL" in *+adaln*) export FAST_ADALN=1 ;; esac
@@ -225,7 +227,7 @@ spec:
                   case "$IMPL" in *+vaetile*) export VAE_IMPL=static_tiled ;; esac
                   export T5_IMPL=eager
                   case "$IMPL" in *+t5*) export T5_IMPL=fast ;; esac
-                  echo "  FAST_ATTN_IMPL=$FAST_ATTN_IMPL FAST_MLP=$FAST_MLP FAST_OPROJ=$FAST_OPROJ FAST_ADALN=$FAST_ADALN VAE_IMPL=$VAE_IMPL T5_IMPL=$T5_IMPL" ;;
+                  echo "  FAST_ATTN_IMPL=$FAST_ATTN_IMPL FAST_MLP=$FAST_MLP FAST_OPROJ=$FAST_OPROJ FAST_ADALN=$FAST_ADALN FAST_QKV=$FAST_QKV FAST_QKV_CHUNKS=$FAST_QKV_CHUNKS VAE_IMPL=$VAE_IMPL T5_IMPL=$T5_IMPL" ;;
                 esac
                 rm -rf $NEFF_DIRS; mkdir -p $NEFF_DIRS
                 touch "/tmp/stage_start_$IMPL"; sleep 1
@@ -248,6 +250,11 @@ spec:
                   echo "  (no block summary)"
                 fi
 
+                echo "=== [1d $IMPL] DiT BLOCK ENGINE OVERLAP (instruction table of the block NEFF) ==="
+                BLK=/tmp/blk_$IMPL; rm -rf "$BLK"; mkdir -p "$BLK"
+                for f in "$B1"/*.neff "$B1"/*.ntff; do [ -s "$f" ] && ln -sf "$f" "$BLK/$(basename "$f")"; done
+                timeout 2400 bash scripts/neuron/run_dma_analysis.sh "$BLK" 2>&1 \
+                  | sed -n '/--- engine overlap/,$p' | tee "$LOCAL_RESULTS/engine_overlap_$IMPL.txt" | head -60 || true
                 echo "=== [2/3 $IMPL] CLEAN RUN (NO profiler) — median total = REAL LATENCY ==="
                 WAN_DUMP_DIR="$LOCAL_RESULTS/dump_$IMPL" run_wan "$LOCAL_RESULTS/clean_$IMPL.txt" 4 | grep -iE "denoise=|vae=|total=|FAILED" || echo "CLEAN RUN FAILED"
                 GATE_REF="$ARCHIVE_DIR/gate_ref/output.pt"
@@ -380,13 +387,13 @@ spec:
             - name: USE_NKI_KERNELS
               value: "1"
             - name: ATTN_IMPLS
-              value: "fast_cte+oproj+adaln+vaetile+t5"
+              value: "fast_cte+oproj+adaln+vaetile+t5+qkv fast_cte+oproj+adaln+vaetile+t5+qkv+qkvc"
             - name: FAST_DIT
               value: "1"
             - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
               value: "134217728"
             - name: DEEP_PROFILE
-              value: "1"
+              value: "0"
             - name: OUT_H
               value: "368"
             - name: OUT_W

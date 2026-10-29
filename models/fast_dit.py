@@ -46,6 +46,12 @@ LNC = int(os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2"))
 FAST_MLP = os.environ.get("FAST_MLP", "0") == "1"
 FAST_OPROJ = os.environ.get("FAST_OPROJ", "0") == "1"
 FAST_ADALN = os.environ.get("FAST_ADALN", "0") == "1"
+# FAST_QKV=1: self-attn q|k|v as ONE matmul on concatenated weights (weights load once, one
+# larger matmul); outputs are the same dot products, split after. FAST_QKV_CHUNKS=N (with
+# FAST_ADALN): run norm1+modulation and the QKV matmul over N row chunks so the vector engine
+# can normalize chunk i+1 while the tensor engine multiplies chunk i (per-row math unchanged).
+FAST_QKV = os.environ.get("FAST_QKV", "0") == "1"
+FAST_QKV_CHUNKS = int(os.environ.get("FAST_QKV_CHUNKS", "1"))
 COMPILE_KW = dict(backend="neuron", dynamic=False, fullgraph=True)
 
 
@@ -309,14 +315,25 @@ class _FastBlock(nn.Module):
         e = [t.squeeze(2) for t in (blk.modulation.unsqueeze(0) + e).chunk(6, dim=2)]  # [1, 1, C]
 
         C = x.shape[-1]
-        if FAST_ADALN:
+        if FAST_QKV and FAST_ADALN and FAST_QKV_CHUNKS > 1:
             plain, res_gate, res = _get_adaln()
-            h = plain(x.reshape(B * L, C), _row(1 + e[1], C, x.dtype), _row(e[0], C, x.dtype)).view(B, L, C)
+            mul, add = _row(1 + e[1], C, x.dtype), _row(e[0], C, x.dtype)
+            qkv = torch.cat([F.linear(plain(xc, mul, add), sa.qkv_w, sa.qkv_b)
+                             for xc in torch.tensor_split(x.reshape(B * L, C), FAST_QKV_CHUNKS)], 0)
+            q, k, v = qkv.view(B, L, -1).split(sa.qkv_split, dim=-1)
         else:
-            h = blk.norm1(x).to(torch.bfloat16) * (1 + e[1]) + e[0]
-        q, k = _tp_rms_qk(F.linear(h, sa.q.weight, sa.q.bias),
-                          F.linear(h, sa.k.weight, sa.k.bias), sa.norm_q, sa.norm_k)
-        v = F.linear(h, sa.v.weight, sa.v.bias).view(B, L, n, d)
+            if FAST_ADALN:
+                plain, res_gate, res = _get_adaln()
+                h = plain(x.reshape(B * L, C), _row(1 + e[1], C, x.dtype), _row(e[0], C, x.dtype)).view(B, L, C)
+            else:
+                h = blk.norm1(x).to(torch.bfloat16) * (1 + e[1]) + e[0]
+            if FAST_QKV:
+                q, k, v = F.linear(h, sa.qkv_w, sa.qkv_b).split(sa.qkv_split, dim=-1)
+            else:
+                q, k, v = (F.linear(h, sa.q.weight, sa.q.bias), F.linear(h, sa.k.weight, sa.k.bias),
+                           F.linear(h, sa.v.weight, sa.v.bias))
+        q, k = _tp_rms_qk(q, k, sa.norm_q, sa.norm_k)
+        v = v.reshape(B, L, n, d)
         q, k = _rope(q.view(B, L, n, d), cos, sin), _rope(k.view(B, L, n, d), cos, sin)
         if FAST_OPROJ and FAST_ATTN_IMPL == "cte":
             y = _o_proj(sa, None, _attn_dmajor(q, k, v))
@@ -429,6 +446,15 @@ def _prepare_kernel_weights(model):
         mod.register_buffer(name, t.contiguous(), persistent=False)
 
     for blk in model.blocks:
+        if FAST_QKV:
+            sa = blk.self_attn
+            w = torch.cat([sa.q.weight, sa.k.weight, sa.v.weight], 0).contiguous()
+            b = torch.cat([sa.q.bias, sa.k.bias, sa.v.bias], 0).contiguous()
+            buf(sa, "qkv_w", w)
+            buf(sa, "qkv_b", b)
+            sa.qkv_split = (sa.q.weight.shape[0], sa.k.weight.shape[0], sa.v.weight.shape[0])
+            for lin in (sa.q, sa.k, sa.v):                       # free the originals
+                lin.weight.data = torch.empty(0, dtype=lin.weight.dtype, device=lin.weight.device)
         if FAST_MLP:
             f = blk.ffn
             buf(f, "up_w_t", f[0].weight.t())                    # [H, I_local]
