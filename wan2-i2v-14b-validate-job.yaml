@@ -386,7 +386,7 @@ spec:
             - name: MODE
               value: "validate"
             - name: LOOP_FLAGS
-              value: "FAST_QKV_NKI=1"
+              value: "FAST_QKV_NKI=1 FAST_CROSSQ_NKI=1"
             - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
             - name: NEURON_CC_LOG_LEVEL
