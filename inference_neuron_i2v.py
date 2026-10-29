@@ -395,6 +395,8 @@ def main():
 
             if FAST_DIT:
                 noise_pred = fast[needed](latent, y_device, t.item())
+                if step_idx == 0:   # references only; copied to CPU after the timers
+                    step0_refs = (latent, noise_pred, float(t.item()), guide_scale, needed)
             elif needed != current_on_device:
                 if rank == 0:
                     logger.info(f"  Step {step_idx}: swapping to {needed}_noise_model")
@@ -482,6 +484,12 @@ def main():
                 os.makedirs(dump_dir, exist_ok=True)
                 torch.save({"frames": video_np.contiguous(), "latent": latent.cpu().float()},
                            os.path.join(dump_dir, "output.pt"))
+                if FAST_DIT:
+                    l0, n0, t0, g0, ex0 = step0_refs
+                    torch.save({"latent_in": l0.cpu().float(), "noise_pred": n0.cpu().float(),
+                                "y": y_device.cpu().float(), "t": t0, "guide": g0, "expert": ex0,
+                                "ctx": ctx_tensor[0].cpu().float(), "ctx_null": ctx_null_tensor[0].cpu().float()},
+                               os.path.join(dump_dir, "step0.pt"))
                 logger.info(f"Dumped frames {tuple(video_np.shape)} + latent to {dump_dir}/output.pt")
 
     if rank == 0 and run_results:

@@ -73,6 +73,14 @@ spec:
               export MODEL_PATH=/tmp/Wan2.2-I2V-A14B
               WORLD_SIZE=$(( ${TP_DEGREE:-4} * ${SP_DEGREE:-2} ))
 
+              if [ "${MODE:-bench}" = validate ]; then   # accuracy suite only (scripts/validate/)
+                echo "════════ VALIDATE: LOOP_FLAGS=${LOOP_FLAGS:-FAST_QKV=1} ════════"
+                THREADS=22 bash scripts/validate/validate_job.sh 2>&1 | tee "$LOCAL_RESULTS/validate.txt"
+                cp /tmp/validate.tar.gz "$ARCHIVE_DIR/validate_$RUN_TS.tar.gz" 2>/dev/null || true
+                echo "███ VALIDATE COMPLETE ($GIT_BRANCH @ ${GIT_SHA:0:12}); pod idles for kubectl cp"
+                sleep 864000
+              fi
+
               run_wan() {
                 local OUT="$1" RUNS="$2"
                 NUM_RUNS="$RUNS" torchrun --nproc_per_node="$WORLD_SIZE" --master_port=29500 \
