@@ -52,6 +52,11 @@ FAST_ADALN = os.environ.get("FAST_ADALN", "0") == "1"
 # can normalize chunk i+1 while the tensor engine multiplies chunk i (per-row math unchanged).
 FAST_QKV = os.environ.get("FAST_QKV", "0") == "1"
 FAST_QKV_CHUNKS = int(os.environ.get("FAST_QKV_CHUNKS", "1"))
+# FAST_QKV_NKI=1: norm1 + modulation + q|k|v projection + bias in ONE nkilib qkv (CTE) kernel.
+# AdaLN with a uniform timestep is LayerNorm with gamma = 1 + scale and beta = shift, which the
+# kernel fuses with the matmul and pipelines tile by tile (vector-engine norm overlapping the
+# tensor-engine matmul). Replaces the adaln kernel + QKV matmuls of the self-attention input.
+FAST_QKV_NKI = os.environ.get("FAST_QKV_NKI", "0") == "1"
 COMPILE_KW = dict(backend="neuron", dynamic=False, fullgraph=True)
 
 
@@ -171,6 +176,29 @@ def _get_adaln():
 
 def _row(v, H, dtype):
     return v.reshape(1, H).to(dtype)
+
+
+_qkv_call = None
+
+
+def _get_qkv():
+    """nkilib qkv: input [B, S, H], weight [H, I], bias [1, I], gamma [1, H], beta [1, H]
+    -> LayerNorm(input) * gamma + beta, @ weight + bias  ->  [B, S, I]."""
+    global _qkv_call
+    if _qkv_call is None:
+        import nki
+        from nkilib.core.qkv.qkv import qkv
+        from nkilib.core.utils.common_types import NormType, QKVOutputLayout
+
+        @nki.jit
+        def _qkv_kernel(hidden, weight, bias, gamma, beta):
+            return qkv(hidden, weight, QKVOutputLayout.BSD, bias=bias,
+                       fused_norm_type=NormType.LAYER_NORM, gamma_norm_weights=gamma,
+                       layer_norm_bias=beta, norm_eps=1e-6)
+
+        _qkv_call = _wrap(_qkv_kernel, "wan14b::qkv_ln")
+        logger.info(f"[fast_dit] nkilib qkv (LayerNorm fused) via {FAST_KERNEL_WRAP} lnc={LNC}")
+    return _qkv_call
 
 
 _oproj_call = None
@@ -315,7 +343,12 @@ class _FastBlock(nn.Module):
         e = [t.squeeze(2) for t in (blk.modulation.unsqueeze(0) + e).chunk(6, dim=2)]  # [1, 1, C]
 
         C = x.shape[-1]
-        if FAST_QKV and FAST_ADALN and FAST_QKV_CHUNKS > 1:
+        if FAST_QKV_NKI:
+            qkv = _get_qkv()(x, sa.qkv_wt, sa.qkv_b2, _row(1 + e[1], C, x.dtype), _row(e[0], C, x.dtype))
+            q, k, v = qkv.view(B, L, -1).split(sa.qkv_split, dim=-1)
+            if FAST_ADALN:
+                plain, res_gate, res = _get_adaln()
+        elif FAST_QKV and FAST_ADALN and FAST_QKV_CHUNKS > 1:
             plain, res_gate, res = _get_adaln()
             mul, add = _row(1 + e[1], C, x.dtype), _row(e[0], C, x.dtype)
             qkv = torch.cat([F.linear(plain(xc, mul, add), sa.qkv_w, sa.qkv_b)
@@ -446,7 +479,15 @@ def _prepare_kernel_weights(model):
         mod.register_buffer(name, t.contiguous(), persistent=False)
 
     for blk in model.blocks:
-        if FAST_QKV:
+        if FAST_QKV_NKI:
+            sa = blk.self_attn
+            w = torch.cat([sa.q.weight, sa.k.weight, sa.v.weight], 0)        # [I, H]
+            buf(sa, "qkv_wt", w.t())                                          # [H, I]
+            buf(sa, "qkv_b2", torch.cat([sa.q.bias, sa.k.bias, sa.v.bias], 0).view(1, -1))
+            sa.qkv_split = (sa.q.weight.shape[0], sa.k.weight.shape[0], sa.v.weight.shape[0])
+            for lin in (sa.q, sa.k, sa.v):
+                lin.weight.data = torch.empty(0, dtype=lin.weight.dtype, device=lin.weight.device)
+        elif FAST_QKV:
             sa = blk.self_attn
             w = torch.cat([sa.q.weight, sa.k.weight, sa.v.weight], 0).contiguous()
             b = torch.cat([sa.q.bias, sa.k.bias, sa.v.bias], 0).contiguous()
@@ -498,6 +539,8 @@ class FastWanDiT:
         self.device = device
         self.cos, self.sin = _rope_tables(model.freqs, self.grid, model.dim // model.num_heads, device)
         # Build kernel wrappers BEFORE tracing (imports inside a trace break fullgraph).
+        if FAST_QKV_NKI:
+            _get_qkv()
         if FAST_ATTN_IMPL in ("cte", "constmax"):
             _get_cte()          # cross-attention (and self-attention for cte)
         if FAST_ATTN_IMPL == "constmax":
