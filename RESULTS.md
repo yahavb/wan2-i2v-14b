@@ -25,6 +25,37 @@ in the same job. Videos were checked by eye (the accuracy gate).
 Total = VAE encode + denoise + VAE decode + mp4 write. Text encode is measured separately
 (second, warm encode of both prompts) and is not in the total.
 
+## trn3 (`trn3-dev1.48xlarge`, 2 devices, LNC2, TP8), branch `latency_loop`
+
+Same spec (368x480, 21 frames, 10 steps, batched CFG). Latency = run 3 and 4 of 4 in one process
+(compile and the first loaded runs excluded). Block = the DiT block NEFF (400 executions per
+video), profiled across all 8 ranks; engine numbers from `scripts/engine_overlap.py` on its
+instruction table. Every row is in `perf_ledger.jsonl`.
+
+| Change | Flag | Block | Tensor busy | 1 engine busy | Total | Frames vs baseline |
+|---|---|---|---|---|---|---|
+| baseline (trn2 default config) | -- | 10.60 ms | 7.22 ms | 2.63 ms | **5.10 s** | reference |
+| one q\|k\|v matmul | `FAST_QKV=1` | 10.71 ms | 7.05 ms | 2.81 ms | 5.1 s | refuted |
+| adaln+QKV in 4 torch-level chunks | `FAST_QKV_CHUNKS=4` | 11.29 ms | 7.24 ms | 3.38 ms | -- | refuted |
+| norm1+mod+QKV+bias in nkilib `qkv` kernel | `FAST_QKV_NKI=1` | 10.22 ms | 6.71 ms | 2.43 ms | **4.90 s** | 25.8 dB |
+| + cross-attn q in the same kernel | `+FAST_CROSSQ_NKI=1` | 9.64 ms | 7.17 ms | 2.10 ms | **4.72 s** | 23.0 dB |
+| + norm2+mod+FFN up in the same kernel | `+FAST_FFNUP_NKI=1` | 9.48 ms | 7.23 ms | 2.61 ms | **4.65 s** | 24.8 dB |
+| + cross-attn residual in the adaln kernel | `+FAST_XRES_KERNEL=1` | 10.12 ms | 6.74 ms | 2.56 ms | 4.87 s | refuted |
+
+Frames differ from the baseline for every kernel change (different accumulation order, amplified
+over 10 steps); quality is judged by `MODE=validate` (`scripts/validate/`), not by the baseline
+PSNR above.
+
+Findings:
+- AdaLN with a uniform timestep is LayerNorm with gamma = 1 + scale, beta = shift, so nkilib
+  `qkv` (CTE) fuses it with the following matmul and pipelines the vector-engine norm against
+  the tensor-engine matmul inside one kernel. Splitting the same work at torch level does not
+  overlap: the compiler re-merges the chunk matmuls and every NKI custom call is a barrier.
+- With the three fusions the tensor engine is busy 76% of the block (7.23 of 9.48 ms) and is
+  the bound. Remaining tensor time: the fused-kernel matmuls 2.5 ms, attention 1.3 ms, FFN down
+  1.0 ms, O-proj 0.7 ms, transposes ~0.9 ms (compiler-inserted around the residual adds
+  `x + gate * y`, plus the kernel's input transpose at `qkv_cte.py:2192`).
+
 ## DiT block (one fullgraph NEFF = one transformer block, 400 executions per video)
 
 | Stage | Block time | Block MFU | Change |
