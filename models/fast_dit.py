@@ -61,6 +61,10 @@ FAST_QKV_NKI = os.environ.get("FAST_QKV_NKI", "0") == "1"
 # (affine LayerNorm with norm3's weight/bias), replacing the adaln res_gate kernel + q matmul.
 # The gated residual x + gate * y becomes a plain torch add.
 FAST_CROSSQ_NKI = os.environ.get("FAST_CROSSQ_NKI", "0") == "1"
+# FAST_FFNUP_NKI=1: FFN up-projection = (norm2(x) * (1 + e4) + e3) @ W_up + b in the nkilib qkv
+# kernel (LayerNorm gamma = 1 + e4, beta = e3), replacing the adaln res kernel + up matmul.
+# The residual x + y becomes a plain torch add.
+FAST_FFNUP_NKI = os.environ.get("FAST_FFNUP_NKI", "0") == "1"
 COMPILE_KW = dict(backend="neuron", dynamic=False, fullgraph=True)
 
 
@@ -396,6 +400,12 @@ class _FastBlock(nn.Module):
         else:
             y = _row_linear(ca.o, _attn(q, ck, cv).reshape(B, L, n * d))
 
+        if FAST_FFNUP_NKI:  # x = x + y (torch) ; u = (norm2(x)*(1+e4)+e3) @ W_up + b (one kernel)
+            x = x + y.reshape(B, L, C)
+            f0 = blk.ffn[0]
+            u = _get_qkv()(x, f0.w_t, f0.b2, _row(1 + e[4], C, x.dtype), _row(e[3], C, x.dtype))
+            y = _row_linear(blk.ffn[2], blk.ffn[1](u.view(B, L, -1)))
+            return x + y * e[5]
         if FAST_ADALN:   # x = x + y ; h = norm2(x) * (1 + e4) + e3, one kernel
             x, h = res(y.reshape(B * L, C), _row(1 + e[4], C, x.dtype), _row(e[3], C, x.dtype),
                        x.reshape(B * L, C))
@@ -489,6 +499,11 @@ def _prepare_kernel_weights(model):
         mod.register_buffer(name, t.contiguous(), persistent=False)
 
     for blk in model.blocks:
+        if FAST_FFNUP_NKI:
+            f0 = blk.ffn[0]
+            buf(f0, "w_t", f0.weight.t())                                     # [H, I local]
+            buf(f0, "b2", f0.bias.view(1, -1))
+            f0.weight.data = torch.empty(0, dtype=f0.weight.dtype, device=f0.weight.device)
         if FAST_CROSSQ_NKI:
             ca = blk.cross_attn
             buf(ca, "q_wt", ca.q.weight.t())                                  # [H, N*D local]
@@ -557,7 +572,7 @@ class FastWanDiT:
         self.device = device
         self.cos, self.sin = _rope_tables(model.freqs, self.grid, model.dim // model.num_heads, device)
         # Build kernel wrappers BEFORE tracing (imports inside a trace break fullgraph).
-        if FAST_QKV_NKI or FAST_CROSSQ_NKI:
+        if FAST_QKV_NKI or FAST_CROSSQ_NKI or FAST_FFNUP_NKI:
             _get_qkv()
         if FAST_ATTN_IMPL in ("cte", "constmax"):
             _get_cte()          # cross-attention (and self-attention for cte)

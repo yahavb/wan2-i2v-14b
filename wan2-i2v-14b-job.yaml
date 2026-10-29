@@ -229,6 +229,7 @@ spec:
                   case "$IMPL" in *+qkvc*) export FAST_QKV_CHUNKS=${QKV_CHUNKS:-4} ;; esac
                   case "$IMPL" in *+qkvnki*) export FAST_QKV_NKI=1 ;; esac
                   export FAST_CROSSQ_NKI=0; case "$IMPL" in *+xqnki*) export FAST_CROSSQ_NKI=1 ;; esac
+                  export FAST_FFNUP_NKI=0; case "$IMPL" in *+upnki*) export FAST_FFNUP_NKI=1 ;; esac
                   case "$IMPL" in *+mlp*) export FAST_MLP=1 ;; esac
                   case "$IMPL" in *+oproj*) export FAST_OPROJ=1 ;; esac
                   case "$IMPL" in *+adaln*) export FAST_ADALN=1 ;; esac
@@ -237,7 +238,7 @@ spec:
                   case "$IMPL" in *+vaetile*) export VAE_IMPL=static_tiled ;; esac
                   export T5_IMPL=eager
                   case "$IMPL" in *+t5*) export T5_IMPL=fast ;; esac
-                  echo "  FAST_ATTN_IMPL=$FAST_ATTN_IMPL FAST_MLP=$FAST_MLP FAST_OPROJ=$FAST_OPROJ FAST_ADALN=$FAST_ADALN FAST_QKV=$FAST_QKV FAST_QKV_CHUNKS=$FAST_QKV_CHUNKS FAST_QKV_NKI=$FAST_QKV_NKI FAST_CROSSQ_NKI=$FAST_CROSSQ_NKI VAE_IMPL=$VAE_IMPL T5_IMPL=$T5_IMPL" ;;
+                  echo "  FAST_ATTN_IMPL=$FAST_ATTN_IMPL FAST_MLP=$FAST_MLP FAST_OPROJ=$FAST_OPROJ FAST_ADALN=$FAST_ADALN FAST_QKV=$FAST_QKV FAST_QKV_CHUNKS=$FAST_QKV_CHUNKS FAST_QKV_NKI=$FAST_QKV_NKI FAST_CROSSQ_NKI=$FAST_CROSSQ_NKI FAST_FFNUP_NKI=$FAST_FFNUP_NKI VAE_IMPL=$VAE_IMPL T5_IMPL=$T5_IMPL" ;;
                 esac
                 rm -rf $NEFF_DIRS; mkdir -p $NEFF_DIRS
                 touch "/tmp/stage_start_$IMPL"; sleep 1
@@ -403,7 +404,7 @@ spec:
             - name: USE_NKI_KERNELS
               value: "1"
             - name: ATTN_IMPLS
-              value: "fast_cte+oproj+adaln+vaetile+t5+qkvnki+xqnki"
+              value: "fast_cte+oproj+adaln+vaetile+t5+qkvnki+xqnki+upnki"
             - name: FAST_DIT
               value: "1"
             - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
