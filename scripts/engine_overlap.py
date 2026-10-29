@@ -37,6 +37,7 @@ ENGINE = ("engine", "engine_name", "queue", "engine_type")
 SRC = ("nki_source_location", "bir_debug_info_source_location", "source_location")
 OPC = ("opcode", "op_name", "instruction")
 HLO = ("hlo_name",)
+TTYPE = ("tensor_instruction_type",)
 
 
 def pick(cols, names):
@@ -67,7 +68,7 @@ def main():
     c_start, c_dur, c_end = pick(cols, START), pick(cols, DUR), pick(cols, END)
     c_eng = pick(cols, ENGINE)
     srcs = [c for c in (pick(cols, (s,)) for s in SRC) if c]
-    c_op, c_hlo = pick(cols, OPC), pick(cols, HLO)
+    c_op, c_hlo, c_tt = pick(cols, OPC), pick(cols, HLO), pick(cols, TTYPE)
     if not c_start or not c_eng or not (c_dur or c_end):
         print(f"missing a start, engine or duration/end column. columns: {cols}")
         return 2
@@ -75,20 +76,26 @@ def main():
     src_expr = ("COALESCE(" + ", ".join(f"NULLIF(CAST({c} AS VARCHAR), '')" for c in srcs) + ", '')") if srcs else "''"
     op_expr = f"COALESCE(CAST({c_op} AS VARCHAR), '')" if c_op else "''"
     hlo_expr = f"COALESCE(CAST({c_hlo} AS VARCHAR), '')" if c_hlo else "''"
+    if c_tt:  # tensor-engine transposes are MATMUL/LDWEIGHTS with type TRANSPOSE: label them
+        op_expr = (f"{op_expr} || CASE WHEN CAST({c_tt} AS VARCHAR) = 'TRANSPOSE' "
+                   f"THEN '(transpose)' ELSE '' END")
     print(f"columns used: start={c_start} end={'start+' + c_dur if c_dur else c_end} engine={c_eng} "
           f"source={srcs or 'none'} label={c_op}/{c_hlo}")
     rows = con.execute(
         f"SELECT CAST({c_eng} AS VARCHAR), CAST({c_start} AS BIGINT), CAST({end_expr} AS BIGINT), "
         f"{src_expr}, {op_expr}, {hlo_expr} FROM read_parquet('{path}') WHERE {c_start} IS NOT NULL ORDER BY 2").fetchall()
-    # key = "source line  opcode"; keep one HLO op name per key as an example
+    # key = "source line  opcode"; without a source line, fall back to the HLO op name
+    # (compiler-generated instructions of a torch op often carry only that); keep one HLO
+    # op name per key as an example. "(no source)" = neither a source line nor an HLO name.
     hlo_of = {}
     rows2 = []
     for e, s, t, src, op, hlo in rows:
         if t is None or t <= s:
             continue
-        key = f"{src or '(no source)'}  {op}"
-        hlo_of.setdefault(key, hlo.split("=")[0].strip()[:40] if hlo else "")
-        rows2.append((e, s, t, key, src))
+        h = hlo.split("=")[0].strip()[:40] if hlo else ""
+        key = f"{src}  {op}" if src else (f"(hlo {h})  {op}" if h else f"(no source)  {op}")
+        hlo_of.setdefault(key, h if src else (hlo.split("=", 1)[-1].strip()[:50] if hlo else ""))
+        rows2.append((e, s, t, key, src or h))
     rows = rows2
     if not rows:
         print("no instructions with a positive duration")
@@ -172,7 +179,7 @@ def main():
     for k in order[:4]:
         e = engines[k]
         tot = busy[k] or 1
-        print(f"\n{e}: top source lines by busy time ({100 * nosrc[e] / tot:.0f}% has no source location)")
+        print(f"\n{e}: top source lines by busy time ({100 * nosrc[e] / tot:.0f}% has neither a source line nor an HLO name)")
         for key, v in by_src[e].most_common(a.top):
             print(f"  {fmt(v)}  {100 * v / tot:5.1f}%  {key[-80:]}  {hlo_of.get(key, '')}")
     if a.json_out:
