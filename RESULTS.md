@@ -42,6 +42,18 @@ instruction table. Every row is in `perf_ledger.jsonl`.
 | + norm2+mod+FFN up in the same kernel | `+FAST_FFNUP_NKI=1` | 9.48 ms | 7.23 ms | 2.61 ms | **4.65 s** | 24.8 dB |
 | + cross-attn residual in the adaln kernel | `+FAST_XRES_KERNEL=1` | 10.12 ms | 6.74 ms | 2.56 ms | 4.87 s | refuted |
 
+**Validated** (`MODE=validate`, `scripts/validate/validate_job.sh`, `FAST_QKV_NKI=1 FAST_CROSSQ_NKI=1
+FAST_FFNUP_NKI=1`), all PASS:
+
+| Check | Candidate | Default (flags off) |
+|---|---|---|
+| total, run 3, same pod | 4.63 s | 5.14 s |
+| step-0 noise pred rel-RMS vs fp32 CPU DiT | 0.0396 | 0.0418 (plain-torch attention: 0.0311) |
+| video PSNR vs plain-torch bf16 trajectory | 23.15 dB (worst frame 21.58) | 23.03 dB (worst 21.25) |
+| VAE PSNR vs fp32 CPU decode | 43.08 dB | 43.11 dB |
+| main == flags-off branch (mp4 bytes) | -- | identical |
+| deterministic (candidate twice) | identical | -- |
+
 Frames differ from the baseline for every kernel change (different accumulation order, amplified
 over 10 steps); quality is judged by `MODE=validate` (`scripts/validate/`), not by the baseline
 PSNR above.
