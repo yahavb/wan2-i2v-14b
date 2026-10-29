@@ -57,6 +57,10 @@ FAST_QKV_CHUNKS = int(os.environ.get("FAST_QKV_CHUNKS", "1"))
 # kernel fuses with the matmul and pipelines tile by tile (vector-engine norm overlapping the
 # tensor-engine matmul). Replaces the adaln kernel + QKV matmuls of the self-attention input.
 FAST_QKV_NKI = os.environ.get("FAST_QKV_NKI", "0") == "1"
+# FAST_CROSSQ_NKI=1: cross-attention q = norm3(x) @ Wq + b in the same nkilib qkv kernel
+# (affine LayerNorm with norm3's weight/bias), replacing the adaln res_gate kernel + q matmul.
+# The gated residual x + gate * y becomes a plain torch add.
+FAST_CROSSQ_NKI = os.environ.get("FAST_CROSSQ_NKI", "0") == "1"
 COMPILE_KW = dict(backend="neuron", dynamic=False, fullgraph=True)
 
 
@@ -372,15 +376,21 @@ class _FastBlock(nn.Module):
             y = _o_proj(sa, None, _attn_dmajor(q, k, v))
         else:
             y = _row_linear(sa.o, _self_attn(q, k, v).reshape(B, L, n * d))
-        if FAST_ADALN:   # x = x + gate*y ; h = norm3(x) (affine LN), one kernel
+        if FAST_CROSSQ_NKI:  # x = x + gate*y (torch) ; q = norm3(x) @ Wq + b (one kernel)
             n3 = blk.norm3
-            x, h = res_gate(y.reshape(B * L, C), _row(n3.weight, C, x.dtype), _row(n3.bias, C, x.dtype),
-                            x.reshape(B * L, C), _row(e[2], C, torch.float32))
-            x, h = x.view(B, L, C), h.view(B, L, C)
+            x = x + (y.reshape(B, L, C) * e[2]).to(x.dtype)
+            q = _get_qkv()(x, ca.q_wt, ca.q_b2, n3.w_row.to(x.dtype), n3.b_row.to(x.dtype))
+            q = _tp_rms(q.view(B, L, -1), ca.norm_q).view(B, L, n, d)
         else:
-            x = x + y * e[2]
-            h = blk.norm3(x)
-        q = _tp_rms(F.linear(h, ca.q.weight, ca.q.bias), ca.norm_q).view(B, L, n, d)
+            if FAST_ADALN:   # x = x + gate*y ; h = norm3(x) (affine LN), one kernel
+                n3 = blk.norm3
+                x, h = res_gate(y.reshape(B * L, C), _row(n3.weight, C, x.dtype), _row(n3.bias, C, x.dtype),
+                                x.reshape(B * L, C), _row(e[2], C, torch.float32))
+                x, h = x.view(B, L, C), h.view(B, L, C)
+            else:
+                x = x + y * e[2]
+                h = blk.norm3(x)
+            q = _tp_rms(F.linear(h, ca.q.weight, ca.q.bias), ca.norm_q).view(B, L, n, d)
         if FAST_OPROJ:
             y = _o_proj(ca, None, _attn_dmajor(q, ck, cv))
         else:
@@ -479,6 +489,14 @@ def _prepare_kernel_weights(model):
         mod.register_buffer(name, t.contiguous(), persistent=False)
 
     for blk in model.blocks:
+        if FAST_CROSSQ_NKI:
+            ca = blk.cross_attn
+            buf(ca, "q_wt", ca.q.weight.t())                                  # [H, N*D local]
+            buf(ca, "q_b2", ca.q.bias.view(1, -1))
+            n3 = blk.norm3
+            buf(n3, "w_row", n3.weight.view(1, -1))
+            buf(n3, "b_row", n3.bias.view(1, -1))
+            ca.q.weight.data = torch.empty(0, dtype=ca.q.weight.dtype, device=ca.q.weight.device)
         if FAST_QKV_NKI:
             sa = blk.self_attn
             w = torch.cat([sa.q.weight, sa.k.weight, sa.v.weight], 0)        # [I, H]
@@ -539,7 +557,7 @@ class FastWanDiT:
         self.device = device
         self.cos, self.sin = _rope_tables(model.freqs, self.grid, model.dim // model.num_heads, device)
         # Build kernel wrappers BEFORE tracing (imports inside a trace break fullgraph).
-        if FAST_QKV_NKI:
+        if FAST_QKV_NKI or FAST_CROSSQ_NKI:
             _get_qkv()
         if FAST_ATTN_IMPL in ("cte", "constmax"):
             _get_cte()          # cross-attention (and self-attention for cte)
