@@ -65,6 +65,10 @@ FAST_CROSSQ_NKI = os.environ.get("FAST_CROSSQ_NKI", "0") == "1"
 # kernel (LayerNorm gamma = 1 + e4, beta = e3), replacing the adaln res kernel + up matmul.
 # The residual x + y becomes a plain torch add.
 FAST_FFNUP_NKI = os.environ.get("FAST_FFNUP_NKI", "0") == "1"
+# FAST_QKV_SPLIT=1 (with FAST_QKV_NKI): q, k and v as three calls of the same kernel on [H, D]
+# weights (13 MB each at TP 4) instead of one on the fused [H, 3D] (39 MB, more than one core's
+# 24 MB SBUF); the fused LayerNorm runs three times.
+FAST_QKV_SPLIT = os.environ.get("FAST_QKV_SPLIT", "0") == "1"
 # FAST_XRES_KERNEL=1 (with FAST_CROSSQ_NKI + FAST_ADALN): the gated residual x + gate * y before
 # the cross-attention runs in the adaln res_gate kernel (vector engine) instead of a torch add,
 # which the compiler lowers with tensor-engine transposes; its normalized output is unused.
@@ -355,7 +359,13 @@ class _FastBlock(nn.Module):
         e = [t.squeeze(2) for t in (blk.modulation.unsqueeze(0) + e).chunk(6, dim=2)]  # [1, 1, C]
 
         C = x.shape[-1]
-        if FAST_QKV_NKI:
+        if FAST_QKV_NKI and FAST_QKV_SPLIT:  # q, k, v as three kernel calls (each weight fits SBUF)
+            g1, b1 = _row(1 + e[1], C, x.dtype), _row(e[0], C, x.dtype)
+            q, k, v = (_get_qkv()(x, w, bb, g1, b1).view(B, L, -1)
+                       for w, bb in ((sa.q_wt, sa.q_b2), (sa.k_wt, sa.k_b2), (sa.v_wt, sa.v_b2)))
+            if FAST_ADALN:
+                plain, res_gate, res = _get_adaln()
+        elif FAST_QKV_NKI:
             qkv = _get_qkv()(x, sa.qkv_wt, sa.qkv_b2, _row(1 + e[1], C, x.dtype), _row(e[0], C, x.dtype))
             q, k, v = qkv.view(B, L, -1).split(sa.qkv_split, dim=-1)
             if FAST_ADALN:
@@ -530,9 +540,14 @@ def prepare_kernel_weights(model):
             ca.q.weight.data = torch.empty(0, dtype=ca.q.weight.dtype, device=ca.q.weight.device)
         if FAST_QKV_NKI:
             sa = blk.self_attn
-            w = torch.cat([sa.q.weight, sa.k.weight, sa.v.weight], 0)        # [I, H]
-            buf(sa, "qkv_wt", w.t())                                          # [H, I]
-            buf(sa, "qkv_b2", torch.cat([sa.q.bias, sa.k.bias, sa.v.bias], 0).view(1, -1))
+            if FAST_QKV_SPLIT:   # one [H, D] weight per projection
+                for nm, lin in (("q", sa.q), ("k", sa.k), ("v", sa.v)):
+                    buf(sa, f"{nm}_wt", lin.weight.t())
+                    buf(sa, f"{nm}_b2", lin.bias.view(1, -1))
+            else:
+                w = torch.cat([sa.q.weight, sa.k.weight, sa.v.weight], 0)        # [I, H]
+                buf(sa, "qkv_wt", w.t())                                          # [H, I]
+                buf(sa, "qkv_b2", torch.cat([sa.q.bias, sa.k.bias, sa.v.bias], 0).view(1, -1))
             sa.qkv_split = (sa.q.weight.shape[0], sa.k.weight.shape[0], sa.v.weight.shape[0])
             for lin in (sa.q, sa.k, sa.v):
                 lin.weight.data = torch.empty(0, dtype=lin.weight.dtype, device=lin.weight.device)

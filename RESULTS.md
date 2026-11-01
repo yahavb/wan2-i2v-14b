@@ -31,7 +31,8 @@ Times: mean of runs 3 and 4 of 4 in one process.
 |---|---|---|---|---|---|---|
 | one device, TP 4 (above) | default stage | 21.51 ms | 8.71 s | 0.70 s | 9.84 s | 0.0362 |
 | FFN through nkilib `mlp` (up + GELU + down in one kernel), not the qkv-kernel up projection | `FAST_MLP=1 FAST_FFNUP_NKI=0` (`+mlp`, no `+upnki`) | 20.16 ms | 8.14 s | 0.65 s | 9.20 s | 0.0348 |
-| + mp4 encoded during the decode: blend, uint8 and ffmpeg per latent frame; ffmpeg spawned without fork | `+VAE_STREAM=1` (`+vstream`) | 20.16 ms | 8.16 s | 0.46 s | **9.03 s** | 0.0348 |
+| + mp4 encoded during the decode: blend, uint8 and ffmpeg per latent frame; ffmpeg spawned without fork | `+VAE_STREAM=1` (`+vstream`) | 20.16 ms | 8.16 s | 0.46 s | 9.03 s | 0.0348 |
+| + self-attention q, k and v as three nkilib qkv calls on [5120, 1280] weights, not one on the fused [5120, 3840] | `+FAST_QKV_SPLIT=1` (`+qsplit`) | 19.36 ms | 7.78 s | 0.39 s | **8.59 s** | 0.0389 |
 
 - Block = one DiT block NEFF on real inputs (`scripts/validate/block_bench.py`, layer 0 of the high
   expert at step 0, `DUMP_BLOCK_IN`). At TP 8 on two devices nkilib `mlp` lost (+1.32 ms, I = 1728);
@@ -41,8 +42,21 @@ Times: mean of runs 3 and 4 of 4 in one process.
   same DiT flags). Before it, the warm VAE phase was tile decode 0.19 s, gather 0.01 s, blend on
   the host 0.07 s, uint8 0.06 s, mp4 write 0.39 s (`VAE_TIMING=1`).
 - Video vs the default-flags single-device run: 24.4 dB (accumulation order), checked by eye.
+- `FAST_QKV_SPLIT`: the fused q|k|v weight is 39 MB per rank at TP 4, more than one core's 24 MB
+  SBUF; each [5120, 1280] weight is 13 MB. The LayerNorm runs once per call (three times). Block
+  output vs the fused kernel's: rel-RMS 1e-5. Block vs fp32 CPU: 0.00344 at layer 0 and 0.00361
+  at layer 20, the same as the fused kernel at both layers. The step-0 change (0.0348 -> 0.0389) is
+  accumulation order through 40 blocks, still below the 2-device run's 0.0395. Video vs the
+  `+vstream` run: 25.1 dB, checked by eye.
 - Block ablations with `FAST_MLP` (ms of the 20.16 ms block): self-attention 3.28 (attention_cte
-  and the q / k / v layout copies), all-reduces 1.49, cross-attention 0.69, RoPE 0.52.
+  and the q / k / v layout copies), all-reduces 1.49, cross-attention 0.69, RoPE 0.52, the whole
+  self-attention prologue (QK-norm, RoPE, scale, layout copies) 0.82. Collectives alone: the 3
+  all-reduces of a [2, 4140, 5120] bf16 tensor 3.19 ms; as 3 reduce-scatters + all-gathers 2.90 ms.
+- No gain (block ms against 20.16-20.20 at the time): K pre-transposed with the softmax scale
+  inside attention_cte 20.19; the 5B branch's `attention_cte_lb` kernel 20.22; cross-attention K/V
+  stored in the kernel's layout 20.23; one torch q|k|v matmul (`FAST_QKV=1`) instead of the qkv
+  kernel 20.12; the FFN kernel over 2 or 4 row chunks 20.12 / 20.30; the cross-attention q by
+  matmul (`FAST_CROSSQ_NKI=0`) 21.00.
 - Refuted: const-max self-attention (the 5B branch's fused `attention_cmax` kernel, QK-norm + RoPE
   inside, ported to LNC2 with one CFG half per core): 21.51 -> 20.04 ms per block and step-0
   accurate, but the video was NaN. The QK-norm weight bound (sqrt(d) * max|g_q| * max|g_k| per head)

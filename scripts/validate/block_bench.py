@@ -7,8 +7,10 @@
   no_sa    self-attention returns its v                     -> self-attention kernel cost
   no_xa    cross-attention returns its q                    -> cross-attention kernel cost
   ar_only  the 3 all-reduces of a [B, L, C] bf16 tensor alone
+  rsag_only  the same as 3 reduce-scatters + all-gathers (the Megatron sequence-parallel split)
   no_qkn   QK RMSNorm skipped (self q/k and cross q; their sum-of-squares all-reduce too)
   no_rope  RoPE skipped
+  no_prep  the self-attention prologue skipped (QK-norm, RoPE, softmax scale, q / k / v permutes)
   no_gelu  the FFN's GELU skipped
 The ablations change the math: timing probes only. ref prints rel_rms vs an fp32 CPU reference
 (REF32=1, cached); BB_SAVE=<file> saves ref's output, BB_CMP=<file> compares it with a saved one
@@ -148,6 +150,17 @@ def main():
             fd._tp_rms = lambda t, nrm: t
         elif var == "no_rope":
             fd._rope = lambda t, c_, s_: t
+        elif var == "no_prep":   # self-attention prologue: QK-norm, RoPE, scale, layout copies
+            fd._tp_rms_qk = lambda q, k, nq, nk: (q, k)
+            fd._rope = lambda t, c_, s_: t
+
+            def flat(q, k, v, _o=saved["_attn_dmajor"]):
+                B_, Lq_, n_, d_ = q.shape
+                if k.shape[1] != Lq_:
+                    return _o(q, k, v)
+                q3, k3, v3 = (t.reshape(B_ * n_, Lq_, d_) for t in (q, k, v))   # no permutes
+                return fd._get_cte(True)(q3, k3, v3).reshape(B_, n_, d_, Lq_)
+            fd._attn_dmajor = flat
         elif var == "no_gelu":
             blk.ffn[1] = nn.Identity()
         elif var in ("no_sa", "no_xa"):
@@ -163,6 +176,16 @@ def main():
             def unit(x_, e_, c_, s_, k_, v_):
                 for _ in range(3):
                     x_ = fd._all_reduce(x_) * 0.25
+                return x_
+        elif var == "rsag_only":   # the same 3 reductions as reduce-scatter + all-gather (Megatron SP)
+            import torch.distributed._functional_collectives as funcol
+            from models.tp_utils import get_tp_group
+
+            def unit(x_, e_, c_, s_, k_, v_):
+                g = get_tp_group()
+                for _ in range(3):
+                    sh = funcol.reduce_scatter_tensor(x_.reshape(-1, x_.shape[-1]), "sum", 0, g) * 0.25
+                    x_ = funcol.all_gather_tensor(sh, 0, g).view_as(x_)
                 return x_
         else:
             unit = fd._FastBlock(blk)
