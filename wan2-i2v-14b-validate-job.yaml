@@ -251,6 +251,7 @@ spec:
                   case "$IMPL" in *+vaetile*) export VAE_IMPL=static_tiled ;; esac
                   export T5_IMPL=eager
                   case "$IMPL" in *+t5*) export T5_IMPL=fast ;; esac
+                  export VAE_STREAM=0; case "$IMPL" in *+vstream*) export VAE_STREAM=1 ;; esac
                   echo "  FAST_ATTN_IMPL=$FAST_ATTN_IMPL FAST_MLP=$FAST_MLP FAST_OPROJ=$FAST_OPROJ FAST_ADALN=$FAST_ADALN FAST_QKV=$FAST_QKV FAST_QKV_CHUNKS=$FAST_QKV_CHUNKS FAST_QKV_NKI=$FAST_QKV_NKI VAE_IMPL=$VAE_IMPL T5_IMPL=$T5_IMPL" ;;
                 esac
                 rm -rf $NEFF_DIRS; mkdir -p $NEFF_DIRS
@@ -403,7 +404,7 @@ spec:
             - name: MODE
               value: "validate"
             - name: LOOP_FLAGS
-              value: "FAST_QKV_NKI=1 FAST_CROSSQ_NKI=1 FAST_FFNUP_NKI=1"
+              value: "FAST_QKV_NKI=1 FAST_CROSSQ_NKI=1 FAST_MLP=1 VAE_STREAM=1"
             - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
             - name: NEURON_CC_LOG_LEVEL

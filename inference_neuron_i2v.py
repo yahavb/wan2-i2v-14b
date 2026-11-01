@@ -57,6 +57,13 @@ def setup_distributed():
 
 
 MEM_LOG = os.environ.get("MEM_LOG", "0") == "1"
+# VAE_STREAM=1 (VAE_IMPL=static_tiled): blend + uint8 + mp4 encode per latent frame during the decode
+# (models/vae_static21.decode_tiled_stream). The encoder (ffmpeg) is spawned without imageio's
+# preexec_fn, so Python uses vfork / posix_spawn instead of fork: forking this process (tens of GB
+# resident) stalls the runtime's threads while the page tables are copied.
+VAE_STREAM = os.environ.get("VAE_STREAM", "0") == "1"
+if VAE_STREAM:
+    os.environ.setdefault("IMAGEIO_FFMPEG_NO_PREVENT_SIGINT", "1")
 
 
 def release_device_cache(tag):
@@ -333,7 +340,7 @@ def main():
             m = m.to(torch.bfloat16)
             prepare_kernel_weights(m)      # kernel layouts on the host: the device gets one copy
             m = m.to(NEURON_DEVICE)
-            fast[name] = FastWanDiT(m, grid=grid, guide_scale=g, device=NEURON_DEVICE)
+            fast[name] = FastWanDiT(m, grid=grid, guide_scale=g, device=NEURON_DEVICE, name=name)
             fast[name].set_context(ctx_tensor, ctx_null_tensor)
             release_device_cache(f"{name}_noise_model resident")
         if FAST_EMBED_HOST:   # each expert's time modulation for this schedule, computed once
@@ -485,23 +492,50 @@ def main():
             if rank == 0:
                 logger.info(f"{run_label} VAE decode (TP={VAE_TP_DEGREE})...")
             x0 = [latent.to(torch.bfloat16)]
+            streamed = False
             if VAE_IMPL == "static_tiled":
                 # one tile per rank: 2x4 on 8 ranks (two devices at LNC2, or one at LNC1), 2x2 on 4
                 default_grid = {8: "2x4", 4: "2x2", 2: "1x2", 1: "1x1"}.get(world_size, f"1x{world_size}")
                 grid = tuple(int(v) for v in os.environ.get("VAE_TILE_GRID", default_grid).split("x"))
-                videos = vae.decode_tiled(x0, grid=grid, overlap=int(os.environ.get("VAE_TILE_OVERLAP", "4")))
+                overlap = int(os.environ.get("VAE_TILE_OVERLAP", "4"))
+                if VAE_STREAM:
+                    # the mp4 is encoded while the device decodes: each latent frame's blended
+                    # pixels go to the encoder as soon as they exist (same frames, same mp4 bytes)
+                    import imageio
+                    output_path = "/tmp/wan2_i2v_output.mp4"
+                    writer = imageio.get_writer(output_path, fps=16, codec='libx264') if rank == 0 else None
+                    chunks = []
+
+                    def on_frames(v):  # [3, f, H, W] fp32 in [-1, 1]
+                        u8 = ((v.clamp(-1, 1) * 0.5 + 0.5) * 255).byte().permute(1, 2, 3, 0)
+                        for fr in u8:
+                            writer.append_data(fr.numpy())
+                        chunks.append(u8)
+
+                    vae.decode_tiled_stream(x0[0], grid=grid, overlap=overlap, on_frames=on_frames)
+                    if rank == 0:
+                        writer.close()
+                        video_np = torch.cat(chunks, 0)
+                        logger.info(f"Video saved to {output_path} ({video_np.shape[0]} frames, streamed)")
+                    streamed = True
+                else:
+                    videos = vae.decode_tiled(x0, grid=grid, overlap=overlap)
             else:
                 videos = vae.decode(x0)
-            if rank == 0:
+            if rank == 0 and not streamed:
                 video = videos[0]
                 import imageio
                 output_path = "/tmp/wan2_i2v_output.mp4"
+                t_u8 = time.time()
                 video_cpu = video.cpu().float()
                 video_np = ((video_cpu.clamp(-1, 1) * 0.5 + 0.5) * 255).byte()
                 if video_np.dim() == 4 and video_np.shape[0] == 3:
                     video_np = video_np.permute(1, 2, 3, 0)
                 frames = [video_np[i].numpy() for i in range(video_np.shape[0])]
+                t_mp4 = time.time()
                 imageio.mimwrite(output_path, frames, fps=16, codec='libx264')
+                if os.environ.get("VAE_TIMING", "0") == "1":
+                    logger.info(f"[vae timing] to uint8 frames: {t_mp4 - t_u8:.3f}s, mp4 write: {time.time() - t_mp4:.3f}s")
                 logger.info(f"Video saved to {output_path} ({len(frames)} frames)")
 
         dist.barrier()

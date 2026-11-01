@@ -25,6 +25,31 @@ Times: mean of runs 3 and 4 of 4 in one process.
 - Device memory peak (neuron-monitor): `s-lnc2` rank 0 20.8 GiB of 24 (17.6 GiB allocated tensors);
   `s-lnc1` rank 0 12.7 GiB, HBM stack of ranks 0+1 21.8 of 24 GiB.
 
+### `s-lnc2` speedups (same spec, runs 2-4 of 4)
+
+| Change | Flags | Block | Denoise | VAE decode + output | Total | step-0 vs fp32 |
+|---|---|---|---|---|---|---|
+| one device, TP 4 (above) | default stage | 21.51 ms | 8.71 s | 0.70 s | 9.84 s | 0.0362 |
+| FFN through nkilib `mlp` (up + GELU + down in one kernel), not the qkv-kernel up projection | `FAST_MLP=1 FAST_FFNUP_NKI=0` (`+mlp`, no `+upnki`) | 20.16 ms | 8.14 s | 0.65 s | 9.20 s | 0.0348 |
+| + mp4 encoded during the decode: blend, uint8 and ffmpeg per latent frame; ffmpeg spawned without fork | `+VAE_STREAM=1` (`+vstream`) | 20.16 ms | 8.16 s | 0.46 s | **9.03 s** | 0.0348 |
+
+- Block = one DiT block NEFF on real inputs (`scripts/validate/block_bench.py`, layer 0 of the high
+  expert at step 0, `DUMP_BLOCK_IN`). At TP 8 on two devices nkilib `mlp` lost (+1.32 ms, I = 1728);
+  at TP 4 (I = 3456) it wins 1.35 ms per block. rel-RMS of the block output vs fp32 CPU: 0.00344
+  (default 0.00346).
+- `VAE_STREAM`: same frames and the same mp4 bytes as the unstreamed decode (checked with the
+  same DiT flags). Before it, the warm VAE phase was tile decode 0.19 s, gather 0.01 s, blend on
+  the host 0.07 s, uint8 0.06 s, mp4 write 0.39 s (`VAE_TIMING=1`).
+- Video vs the default-flags single-device run: 24.4 dB (accumulation order), checked by eye.
+- Block ablations with `FAST_MLP` (ms of the 20.16 ms block): self-attention 3.28 (attention_cte
+  and the q / k / v layout copies), all-reduces 1.49, cross-attention 0.69, RoPE 0.52.
+- Refuted: const-max self-attention (the 5B branch's fused `attention_cmax` kernel, QK-norm + RoPE
+  inside, ported to LNC2 with one CFG half per core): 21.51 -> 20.04 ms per block and step-0
+  accurate, but the video was NaN. The QK-norm weight bound (sqrt(d) * max|g_q| * max|g_k| per head)
+  is not a bound here: on the low-noise expert's first step (t = 882), layer 2 head 23 reaches a
+  scaled score of 433 against a weight bound of 31.7 (per-head |q| up to 76.6), so exp(score - 15)
+  overflows. A constant max is unsafe for this model's activations.
+
 ## Two Neuron devices
 
 Spec for every row: 368x480, 21 frames, 10 steps, batched CFG, trn2, 2 Neuron devices

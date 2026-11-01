@@ -402,21 +402,68 @@ def decode_tiled(self, zs, grid=(2, 4), overlap=4):
     import torch.distributed as dist
     rank, world = dist.get_rank(), dist.get_world_size()
     assert world == grid[0] * grid[1], f"grid {grid} needs {grid[0] * grid[1]} ranks, have {world}"
+    import time
+    timing = os.environ.get("VAE_TIMING", "0") == "1" and rank == 0
+
+    def mark(tag, t_prev):  # VAE_TIMING=1: synchronized sub-phase times on rank 0
+        if not timing:
+            return t_prev
+        torch.neuron.synchronize()
+        t = time.time()
+        logger.info(f"[vae timing] {tag}: {t - t_prev:.3f}s")
+        return t
+
     out = []
     for u in zs:
+        t0 = time.time()
         _, T, H, W = u.shape
         th, tw, starts = _tile_layout(H, W, grid, overlap)
         y0, x0 = starts[rank]
         tile = self.decode([u[:, :, y0:y0 + th, x0:x0 + tw].contiguous()])[0]      # [3, Tf, 8th, 8tw] fp32
         tile = tile.to(torch.bfloat16).contiguous()
+        t0 = mark("tile decode", t0)
         gathered = torch.empty((world,) + tuple(tile.shape), dtype=tile.dtype, device=tile.device)
         dist.all_gather_into_tensor(gathered, tile)
         if rank != 0:
             out.append(None)
             continue
-        acc = _blend(gathered.float().cpu(), starts, th, tw, H, W, overlap)
+        g_cpu = gathered.float().cpu()
+        t0 = mark("all-gather + to host", t0)
+        acc = _blend(g_cpu, starts, th, tw, H, W, overlap)
         out.append(acc.clamp_(-1, 1))
+        mark("blend on host", t0)
     return out if rank == 0 else None
 
 
 StaticWanVAE.decode_tiled = decode_tiled
+
+
+def decode_tiled_stream(self, z, grid=(2, 4), overlap=4, on_frames=None):
+    """decode_tiled for one latent z [16, T, H, W], streamed per latent frame (VAE_STREAM=1): every
+    rank decodes its tile's frame i, the tiles are all-gathered, and rank 0 blends them and passes
+    the pixel frames [3, f, 8H, 8W] (fp32, clamped to [-1, 1]) to on_frames while the device
+    decodes frame i + 1. Same graphs and per-element operations as decode() + decode_tiled() (the
+    blend weights do not depend on time), so the frames are identical; the caller can encode the mp4
+    during the decode instead of after it."""
+    import torch.distributed as dist
+    rank, world = dist.get_rank(), dist.get_world_size()
+    assert world == grid[0] * grid[1], f"grid {grid} needs {grid[0] * grid[1]} ranks, have {world}"
+    m, (mean, inv_std) = self.model, self.vae.scale
+    _, T, H, W = z.shape
+    th, tw, starts = _tile_layout(H, W, grid, overlap)
+    y0, x0 = starts[rank]
+    zt = z[:, :, y0:y0 + th, x0:x0 + tw].contiguous().unsqueeze(0)
+    zt = (zt / inv_std.view(1, m.z_dim, 1, 1, 1) + mean.view(1, m.z_dim, 1, 1, 1)).to(m.conv2.weight.dtype)
+    B, _, _, h, w = zt.shape
+    cache = _dec_cache(m, B, h, w, zt.dtype, zt.device)
+    for i in range(T):
+        res = self.dec(zt[:, :, i:i + 1], *cache, first_chunk=(i == 0))
+        cache = list(res[1:])
+        tile = res[0].float().clamp_(-1, 1).squeeze(0).to(torch.bfloat16).contiguous()   # [3, f, 8th, 8tw]
+        gathered = torch.empty((world,) + tuple(tile.shape), dtype=tile.dtype, device=tile.device)
+        dist.all_gather_into_tensor(gathered, tile)
+        if rank == 0:
+            on_frames(_blend(gathered.float().cpu(), starts, th, tw, H, W, overlap).clamp_(-1, 1))
+
+
+StaticWanVAE.decode_tiled_stream = decode_tiled_stream

@@ -580,6 +580,31 @@ def _rope_tables(freqs, grid, head_dim, device):
 # Same bits as computing them every step; frees 0.86 GiB per rank for both experts, which a
 # single device at LNC1 (12 GiB per core) needs.
 FAST_EMBED_HOST = os.environ.get("FAST_EMBED_HOST", "0") == "1"
+# DUMP_BLOCK_IN=<dir>: rank 0 saves real block inputs for scripts/validate/block_bench.py on each
+# expert's first call (its text context, e / e0, and x before the blocks in DUMP_BLOCK_LAYERS).
+DUMP_BLOCK_IN = os.environ.get("DUMP_BLOCK_IN", "")
+DUMP_BLOCK_LAYERS = [int(v) for v in os.environ.get("DUMP_BLOCK_LAYERS", "0").split(",") if v]
+# NAN_CHECK_DIR=<dir> (debug, syncs every block): log the first block whose input is not finite and
+# save the previous block's input (rank 0) there, to replay the failing block in the block bench.
+NAN_CHECK_DIR = os.environ.get("NAN_CHECK_DIR", "")
+
+
+def build_kernels():
+    """Build the kernel wrappers the FAST_* flags use BEFORE tracing (an import or an nki.jit
+    closure created inside a trace breaks fullgraph)."""
+    if FAST_QKV_NKI or FAST_CROSSQ_NKI or FAST_FFNUP_NKI:
+        _get_qkv()
+    if FAST_ATTN_IMPL in ("cte", "constmax"):
+        _get_cte()          # cross-attention (and self-attention for cte)
+    if FAST_ATTN_IMPL == "constmax":
+        _get_constmax()
+    if FAST_OPROJ:
+        _get_cte(True)
+        _get_oproj()
+    if FAST_MLP:
+        _get_mlp()
+    if FAST_ADALN:
+        _get_adaln()
 
 
 class FastWanDiT:
@@ -591,26 +616,17 @@ class FastWanDiT:
         noise_pred = fast(latent, y, t)          # latent [16, F, H, W], y [20, F, H, W]
     """
 
-    def __init__(self, model, grid, guide_scale, device):
+    def __init__(self, model, grid, guide_scale, device, name=""):
         torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 256)
         self.model = model
+        self.name = name
+        self._dump_rank0 = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        self._dump = bool(DUMP_BLOCK_IN) and self._dump_rank0
+        self._nan_seen, self._prev_x = False, None
         self.grid = tuple(int(g) for g in grid)
         self.device = device
         self.cos, self.sin = _rope_tables(model.freqs, self.grid, model.dim // model.num_heads, device)
-        # Build kernel wrappers BEFORE tracing (imports inside a trace break fullgraph).
-        if FAST_QKV_NKI or FAST_CROSSQ_NKI or FAST_FFNUP_NKI:
-            _get_qkv()
-        if FAST_ATTN_IMPL in ("cte", "constmax"):
-            _get_cte()          # cross-attention (and self-attention for cte)
-        if FAST_ATTN_IMPL == "constmax":
-            _get_constmax()
-        if FAST_OPROJ:
-            _get_cte(True)
-            _get_oproj()
-        if FAST_MLP:
-            _get_mlp()
-        if FAST_ADALN:
-            _get_adaln()
+        build_kernels()
         prepare_kernel_weights(model)
         self.time = torch.compile(_FastTime(model), **COMPILE_KW)
         self.patch = torch.compile(_FastPatch(model.patch_embedding), **COMPILE_KW)
@@ -652,6 +668,9 @@ class FastWanDiT:
     def set_context(self, ctx_cond, ctx_null):
         def run():
             context = self.text(torch.cat([ctx_cond, ctx_null], dim=0).to(torch.bfloat16))
+            if self._dump:
+                os.makedirs(DUMP_BLOCK_IN, exist_ok=True)
+                torch.save(context.cpu(), os.path.join(DUMP_BLOCK_IN, f"{self.name}_ctx.pt"))
             return [kv(context) for kv in self.cross_kv]
         self.context = self._on_device(run)
 
@@ -675,7 +694,21 @@ class FastWanDiT:
         else:
             e, e0 = self._time_embed(t)
         x = self.patch(latent.to(torch.bfloat16), y.to(torch.bfloat16))
-        for blk, (ck, cv) in zip(self.blocks, self.context):
+        dump, self._dump = self._dump, False
+        if dump:
+            torch.save({"e": e.cpu(), "e0": e0.cpu(), "t": float(t)}, os.path.join(DUMP_BLOCK_IN, f"{self.name}_e.pt"))
+        for i, (blk, (ck, cv)) in enumerate(zip(self.blocks, self.context)):
+            if dump and i in DUMP_BLOCK_LAYERS:
+                torch.save(x.cpu(), os.path.join(DUMP_BLOCK_IN, f"{self.name}_L{i}_x.pt"))
+            if NAN_CHECK_DIR and not self._nan_seen and not bool(torch.isfinite(x).all()):
+                self._nan_seen = True       # NAN_CHECK_DIR (debug): first non-finite block input
+                logger.warning(f"[fast_dit] {self.name} t={float(t):.1f}: non-finite input to block {i}")
+                if self._dump_rank0:
+                    os.makedirs(NAN_CHECK_DIR, exist_ok=True)
+                    torch.save({"x": self._prev_x, "e0": e0.cpu(), "layer": i - 1, "t": float(t)},
+                               os.path.join(NAN_CHECK_DIR, f"{self.name}_bad.pt"))
+            if NAN_CHECK_DIR and not self._nan_seen:
+                self._prev_x = x.cpu()
             x = blk(x, e0, self.cos, self.sin, ck, cv)
         return self.head(x, e)
 
