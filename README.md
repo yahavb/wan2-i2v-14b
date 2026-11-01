@@ -7,25 +7,30 @@ Image-to-video generation with the [Wan-AI/Wan2.2-I2V-A14B](https://huggingface.
 - **Model**: 14B parameter dual-model DiT (high_noise + low_noise, boundary at t=0.9)
 - **DiT**: dim=5120, 40 heads, 40 layers, ffn_dim=13824
 - **VAE**: Wan2.1 VAE, stride (4, 8, 8), 16 latent channels
-- **TP=8**: DiT sharded across 8 NeuronCores (5 heads/rank, ~2B params/rank)
-- **VAE TP=2**: Decoder channel-parallel across 2 ranks
-- **NKI kernels**: Flash self-attention, cross-attention, RoPE (new `import nki` API)
+- **TP=4 or 8**: DiT sharded across the ranks (10 or 5 heads/rank), both experts resident
+- **VAE**: fullgraph, decode tiled over all ranks
+- **NKI kernels**: nkilib attention_cte, qkv, output projection, conv3d
 
 ## Resource Requirements
 
-| Config | Resource Claim | NeuronCores | HBM per NC |
-|--------|---------------|-------------|------------|
-| Single ND | `s-lnc1-trn2` | 8 | ~4GB |
-| Dual ND | `m-trn2` | 8 (LNC2) | ~6GB |
+Both experts (2 x 28.6 GB in bf16), the UMT5 encoder and the VAE fit on **one** Neuron device
+(trn2: 96 GiB HBM, 8 physical cores). Measured on trn2.48xlarge at 368x480, 21 frames, 10 steps,
+batched CFG, the job's default flags; times are the mean of warm runs 3 and 4:
 
-The single ND config (`s-lnc1-trn2`) requires:
-- Resolution: 256x448, 17 frames (seq_len=2,100)
-- Single DiT model on device at a time (swap at boundary)
-- VAE TP=2 (TP=8 triggers compiler instruction limit)
+| Config | Resource claim | Ranks | Device memory per rank (peak) | Total | Denoise | VAE encode / decode |
+|---|---|---|---|---|---|---|
+| one device, LNC2 (job default) | `s-lnc2` | TP 4 | 20.8 GiB of 24 (rank 0) | **9.8 s** | 8.7 s | 0.42 / 0.70 s |
+| one device, LNC1 | `s-lnc1` | TP 8 | 12.7 GiB (rank 0); ranks 0+1 share a 24 GiB stack: 21.8 | **10.5 s** | 9.2 s | 0.64 / 0.64 s |
+| two devices, LNC2 | `m-lnc2` | TP 8 | -- | **6.35 s** | 5.36 s | 0.42 / 0.53 s |
 
-The dual ND config (`m-trn2`) supports:
-- Resolution: 480x832, 33 frames (seq_len=13,572)
-- Both DiT models resident simultaneously
+- `s-lnc2` needs only `TP_DEGREE=4` (and `VAE_TILE_GRID=2x2`, the default for 4 ranks).
+- `s-lnc1` also needs `NEURON_LOGICAL_NC_CONFIG=1 TP_DEGREE=8 VAE_ENCODE_RANK0=1 FAST_EMBED_HOST=1`.
+  Two cores share each 24 GiB HBM stack, and without the two flags step 0 runs out of memory:
+  `VAE_ENCODE_RANK0` encodes the image on rank 0 only and broadcasts `y`; `FAST_EMBED_HOST` keeps
+  the text/time embedding weights (0.43 GiB per expert per rank) on the host and caches each
+  step's time modulation. Both give bit-identical output (checked at LNC2).
+- Step-0 noise prediction vs an fp32 CPU DiT (rel-RMS): `s-lnc2` 0.0362, `s-lnc1` 0.0376,
+  `m-lnc2` 0.0395.
 
 ## Deploy
 
@@ -71,21 +76,20 @@ Step 6-9: ~7-8s (warm, low_noise_model)
 - Video: `/tmp/wan2_i2v_output.mp4` (17 frames at 16fps)
 - Archived to: `/var/mdl/wan2_2_i2v/runs/<timestamp>/wan2_i2v_output.mp4`
 
-## Memory Layout (s-lnc1-trn2)
+## Memory Layout (one device)
 
-Each of 4 HBMs (16GB) is shared by 2 NeuronCores:
+Rank 0, allocated tensors (`MEM_LOG=1`), plus the runtime's share from neuron-monitor:
 
-| Component | Per-rank HBM |
-|-----------|-------------|
-| DiT weights (1 model, TP=8) | ~2GB |
-| Compiled NEFFs (code) | ~140MB |
-| Scratchpad | 512MB |
-| Activations (seq_len=2100) | ~60MB |
-| VAE (ranks 0,1 only) | ~150MB |
-| Collectives + runtime | ~60MB |
-| **Total per NC** | **~3GB** |
+| Component | `s-lnc2` (TP 4) | `s-lnc1` (TP 8) |
+|---|---|---|
+| VAE (weights + packed NKI conv filters) | 0.50 GiB | 0.50 GiB |
+| high + low noise experts (with `FAST_EMBED_HOST`) | 14.15 GiB | 7.05 GiB |
+| peak during a run (activations; VAE encode on rank 0) | 17.56 GiB | 10.45 GiB |
+| shared scratchpad + NEFF code + constants | 2.0 GiB | 1.4 GiB |
 
-T5 is freed after encoding. Only one DiT model on device at a time. VAE decoder sharded across 2 ranks.
+T5 runs on every rank for the prompt and is freed afterwards (`release_device_cache` returns the
+cached blocks). Kernel weight layouts are built on the host before the experts move to the
+device, so no device-side transposition copies stay in the allocator cache.
 
 ## Configuration
 
@@ -109,8 +113,5 @@ Uses the latest Neuron DLC with new NKI APIs (`import nki` top-level):
 
 ## Scaling Up
 
-To run at higher resolution (480x832, 33+ frames), use `m-trn2` resource claim which provides 2 NDs with more HBM headroom. Edit the job manifest:
-- Change `s-lnc1-trn2` → `m-trn2`
-- Set `FRAME_NUM=33`
-- Update `max_area` in `inference_neuron_i2v.py` to `480 * 832`
-- Can load both DiT models simultaneously (no swap needed)
+Two devices (`m-lnc2`, `TP_DEGREE=8`, `VAE_TILE_GRID=2x4`, `NUM_NEURON_DEVICES=2`) give 6.35 s at
+the same spec. Resolution and frame count are set by `OUT_H`, `OUT_W`, `FRAME_NUM` (4n+1).

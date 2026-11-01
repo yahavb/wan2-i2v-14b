@@ -15,7 +15,12 @@ spec:
         node-type: trn3-dev1
       resourceClaims:
         - name: neurons
-          resourceClaimTemplateName: m-lnc2
+          # One Neuron device at LNC2 (4 logical cores, TP 4). Alternatives:
+          #   s-lnc1: TP_DEGREE=8, VAE_TILE_GRID=2x4, NEURON_LOGICAL_NC_CONFIG=1, VAE_ENCODE_RANK0=1,
+          #           FAST_EMBED_HOST=1 (12 GiB per core: frees the replicated embeddings and the
+          #           encoder activations on ranks 1..7)
+          #   m-lnc2: two devices, TP_DEGREE=8, VAE_TILE_GRID=2x4, NUM_NEURON_DEVICES=2
+          resourceClaimTemplateName: s-lnc2
       containers:
         - name: inference
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -27,7 +32,7 @@ spec:
               set -euo pipefail
 
               cd /tmp
-              BRANCH=main
+              BRANCH=loop_engineering
               git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-i2v-14b.git wan2-i2v-14b
               cd wan2-i2v-14b
 
@@ -407,7 +412,9 @@ spec:
             - name: NEURON_CC_FLAGS
               value: "--model-type=transformer"
             - name: TP_DEGREE
-              value: "8"
+              value: "4"
+            - name: VAE_TILE_GRID
+              value: "2x2"
             - name: SP_DEGREE
               value: "1"
             - name: T5_RANK
@@ -439,7 +446,7 @@ spec:
             - name: LNC_CONFIG
               value: "LNC2"
             - name: NUM_NEURON_DEVICES
-              value: "2"
+              value: "1"
             - name: CUDA_VISIBLE_DEVICES
               value: ""
             - name: HF_TOKEN

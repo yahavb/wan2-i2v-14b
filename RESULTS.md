@@ -1,5 +1,32 @@
 # Wan2.2-I2V-A14B on Trainium2: results log
 
+## One Neuron device (branch `loop_engineering`)
+
+Same spec as below (368x480, 21 frames, 10 steps, batched CFG, the validated default flags
+`fast_cte+oproj+adaln+vaetile+t5+qkvnki+xqnki+upnki`), trn2.48xlarge, both experts resident.
+Times: mean of runs 3 and 4 of 4 in one process.
+
+| Config | Claim | Total | Denoise | VAE encode | VAE decode | step-0 vs fp32 | Video vs 2 devices |
+|---|---|---|---|---|---|---|---|
+| 2 devices, LNC2, TP 8 (reference, same host) | `m-lnc2` | 6.35 s | 5.36 s | 0.47 s | 0.53 s | 0.0395 | -- |
+| 1 device, LNC2, TP 4 | `s-lnc2` | **9.84 s** | 8.71 s | 0.42 s | 0.70 s | 0.0362 | 25.7 dB (worst frame 24.2) |
+| 1 device, LNC1, TP 8, `VAE_ENCODE_RANK0=1 FAST_EMBED_HOST=1` | `s-lnc1` | **10.50 s** | 9.23 s | 0.64 s | 0.64 s | 0.0376 | -- |
+
+- step-0 = rel-RMS of the step-0 CFG noise prediction against `scripts/validate/ref_fp32.py`
+  (fp32 CPU DiT on the same input). The single-device outputs differ from the 2-device run only
+  by accumulation order (TP 4 vs 8), like any kernel change; frames checked by eye.
+- `s-lnc2` runs `main`'s code unchanged (`TP_DEGREE=4`, `VAE_TILE_GRID=2x2`). This branch's code
+  changes are bit-identical at LNC2 (latent, frames, mp4 and step-0 equal to `main`):
+  host-side kernel weight layouts, `release_device_cache` between phases, `VAE_ENCODE_RANK0`,
+  `FAST_EMBED_HOST`.
+- `s-lnc1` ran out of device memory without the two flags: ranks 2i and 2i+1 share a 24 GiB HBM
+  stack, and the experts take 7.05 GiB per rank. First failure: the per-run VAE encode on every
+  rank (66 MiB cache tensors); then the DiT activations at step 0 and the decoder NEFF load.
+- Device memory peak (neuron-monitor): `s-lnc2` rank 0 20.8 GiB of 24 (17.6 GiB allocated tensors);
+  `s-lnc1` rank 0 12.7 GiB, HBM stack of ranks 0+1 21.8 of 24 GiB.
+
+## Two Neuron devices
+
 Spec for every row: 368x480, 21 frames, 10 steps, batched CFG, trn2, 2 Neuron devices
 (`m-lnc2`, 8 logical cores at LNC2). Numbers are medians of clean runs (no profiler),
 taken from the job's `RESULT` lines. Stages in one table row group ran on the same node

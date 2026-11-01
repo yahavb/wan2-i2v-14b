@@ -499,9 +499,16 @@ class _FastHead(nn.Module):
         return uncond + self.guide_scale * (cond - uncond)
 
 
-def _prepare_kernel_weights(model):
+def prepare_kernel_weights(model):
     """Kernel weight layouts, made once (both kernels take [in, out]); originals freed.
-    Row-parallel biases are pre-divided by TP so the all-reduce sum adds them once."""
+    Row-parallel biases are pre-divided by TP so the all-reduce sum adds them once.
+    Call it on the host model before .to(device) (inference_neuron_i2v.py does): the layouts
+    are then copied to the device once, with no device-side originals or transposition
+    temporaries left in the allocator cache. FastWanDiT calls it again; the second call is a
+    no-op."""
+    if getattr(model, "_kernel_weights_ready", False):
+        return
+    model._kernel_weights_ready = True
     tp = get_tp_world_size()
 
     def buf(mod, name, t):
@@ -566,11 +573,21 @@ def _rope_tables(freqs, grid, head_dim, device):
     return torch.cos(ang).to(device), torch.sin(ang).to(device)
 
 
+# FAST_EMBED_HOST=1: the text embedding and the time embedding / projection (232M replicated
+# params per expert, 0.43 GiB per rank in bf16) live on the host and visit the device only to run:
+# set_context() (once per prompt) and cache_timesteps() (once per schedule: the time modulation
+# depends on t alone, so each step's e / e0 is computed once by the same graph and reused).
+# Same bits as computing them every step; frees 0.86 GiB per rank for both experts, which a
+# single device at LNC1 (12 GiB per core) needs.
+FAST_EMBED_HOST = os.environ.get("FAST_EMBED_HOST", "0") == "1"
+
+
 class FastWanDiT:
     """Batched-CFG, fullgraph-compiled forward over one TP-sharded expert.
 
         fast = FastWanDiT(model, grid=(F, H/2, W/2), guide_scale=g, device=dev)
         fast.set_context(ctx_cond, ctx_null)     # [1, 512, 4096] each, once per prompt
+        fast.cache_timesteps(ts)                 # optional: e / e0 for these t, computed once
         noise_pred = fast(latent, y, t)          # latent [16, F, H, W], y [20, F, H, W]
     """
 
@@ -594,7 +611,7 @@ class FastWanDiT:
             _get_mlp()
         if FAST_ADALN:
             _get_adaln()
-        _prepare_kernel_weights(model)
+        prepare_kernel_weights(model)
         self.time = torch.compile(_FastTime(model), **COMPILE_KW)
         self.patch = torch.compile(_FastPatch(model.patch_embedding), **COMPILE_KW)
         self.text = torch.compile(_FastText(model.text_embedding), **COMPILE_KW)
@@ -603,17 +620,60 @@ class FastWanDiT:
         self.head = torch.compile(
             _FastHead(model.head, self.grid, model.patch_size, model.out_dim, guide_scale), **COMPILE_KW)
         self.context = None
+        self._time_cache = {}
+        self._embed_on_host = False
+        if FAST_EMBED_HOST:
+            self._embed_to(torch.device("cpu"))
         logger.info(f"[fast_dit] grid={self.grid} L={math.prod(self.grid)} attn={FAST_ATTN_IMPL} "
-                    f"fullgraph=True blocks={len(self.blocks)} cfg_batch=2 guide={guide_scale}")
+                    f"fullgraph=True blocks={len(self.blocks)} cfg_batch=2 guide={guide_scale} "
+                    f"embed_host={FAST_EMBED_HOST}")
+
+    def _embed_to(self, device):
+        """Move the text / time embedding modules between the host and the device."""
+        m = self.model
+        for mod in (m.text_embedding, m.time_embedding, m.time_projection):
+            mod.to(device)
+        self._embed_on_host = device.type == "cpu"
+        if self._embed_on_host:
+            import gc
+            gc.collect()
+            torch.neuron.empty_cache()
+
+    def _on_device(self, fn):
+        """Run fn with the embedding modules on the device (FAST_EMBED_HOST moves them back after)."""
+        if not self._embed_on_host:
+            return fn()
+        self._embed_to(self.device)
+        try:
+            return fn()
+        finally:
+            self._embed_to(torch.device("cpu"))
 
     def set_context(self, ctx_cond, ctx_null):
-        context = self.text(torch.cat([ctx_cond, ctx_null], dim=0).to(torch.bfloat16))
-        self.context = [kv(context) for kv in self.cross_kv]
+        def run():
+            context = self.text(torch.cat([ctx_cond, ctx_null], dim=0).to(torch.bfloat16))
+            return [kv(context) for kv in self.cross_kv]
+        self.context = self._on_device(run)
 
-    def __call__(self, latent, y, t):
+    def _time_embed(self, t):
         from wan.modules.model import sinusoidal_embedding_1d
         s = sinusoidal_embedding_1d(self.model.freq_dim, torch.tensor([float(t)], dtype=torch.float64))
-        e, e0 = self.time(s.to(torch.bfloat16).view(1, 1, -1).to(self.device))
+        return self.time(s.to(torch.bfloat16).view(1, 1, -1).to(self.device))
+
+    def cache_timesteps(self, ts):
+        """Compute and keep e / e0 for every t in ts (one device visit for the embedding weights)."""
+        todo = [float(t) for t in ts if float(t) not in self._time_cache]
+        if todo:
+            self._time_cache.update(self._on_device(lambda: {t: self._time_embed(t) for t in todo}))
+
+    def __call__(self, latent, y, t):
+        if float(t) in self._time_cache:
+            e, e0 = self._time_cache[float(t)]
+        elif self._embed_on_host:
+            self.cache_timesteps([t])
+            e, e0 = self._time_cache[float(t)]
+        else:
+            e, e0 = self._time_embed(t)
         x = self.patch(latent.to(torch.bfloat16), y.to(torch.bfloat16))
         for blk, (ck, cv) in zip(self.blocks, self.context):
             x = blk(x, e0, self.cos, self.sin, ck, cv)

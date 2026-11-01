@@ -56,6 +56,21 @@ def setup_distributed():
     return dist.get_rank(), dist.get_world_size()
 
 
+MEM_LOG = os.environ.get("MEM_LOG", "0") == "1"
+
+
+def release_device_cache(tag):
+    """Return the caching allocator's free blocks to the runtime after a phase frees its tensors
+    (T5 after encoding, VAE encode intermediates), so the next phase can use that HBM. On one
+    device the two DiT experts leave little headroom; blocks cached by an earlier phase
+    otherwise stay reserved. MEM_LOG=1 logs allocated / reserved device memory on rank 0."""
+    gc.collect()
+    torch.neuron.empty_cache()
+    if MEM_LOG and dist.get_rank() == 0:
+        logger.info(f"[mem] {tag}: allocated {torch.neuron.memory_allocated() / 2**30:.2f} GiB, "
+                    f"reserved {torch.neuron.memory_reserved() / 2**30:.2f} GiB")
+
+
 FRAME_NUM = int(os.environ.get("FRAME_NUM", "81"))
 INSTANCE_TYPE = os.environ.get("INSTANCE_TYPE", "trn2.48xlarge")
 LNC_CONFIG = os.environ.get("LNC_CONFIG", "LNC2")
@@ -129,7 +144,7 @@ def main():
         ctx_tensor.copy_(ctx[0:1])
         ctx_null_tensor.copy_(ctx[1:2])
         del ft5, ctx
-        gc.collect()
+        release_device_cache("T5 freed")
     elif rank == T5_RANK:
         logger.info("Loading T5...")
         text_encoder = T5EncoderModel(
@@ -150,6 +165,7 @@ def main():
         ctx_null_tensor[0, :context_null[0].shape[0]] = context_null[0].to(torch.bfloat16)
         del text_encoder, context, context_null
         gc.collect()
+        torch.neuron.empty_cache()
         logger.info("T5 encoded and freed")
 
     if T5_IMPL != "fast":
@@ -233,6 +249,11 @@ def main():
     VAE_TP_DEGREE = (1 if VAE_IMPL == "static" else world_size if VAE_IMPL == "static_tiled"
                      else int(os.environ.get("VAE_TP_DEGREE", "8")))
     VAE_TP_RANKS = list(range(VAE_TP_DEGREE))
+    # VAE_ENCODE_RANK0=1: only rank 0 runs the whole-frame encode and broadcasts y (the same bits
+    # every rank would compute). On one device at LNC1 the two resident DiT experts leave about
+    # 2 GiB per core, less than the 368x480 encoder's activations on every rank.
+    VAE_ENCODE_RANK0 = os.environ.get("VAE_ENCODE_RANK0", "0") == "1"
+    ENC_RANKS = [VAE_RANK] if VAE_ENCODE_RANK0 else VAE_TP_RANKS
 
     # Load VAE on all VAE TP ranks, shard decoder
     if rank in VAE_TP_RANKS:
@@ -266,7 +287,7 @@ def main():
         broadcast to the other ranks. Called once here (warms the NEFFs) and again,
         timed, at the start of every run."""
         y = torch.zeros((z_dim + 4, T_latent, lat_h, lat_w), dtype=torch.bfloat16, device=NEURON_DEVICE)
-        if rank in VAE_TP_RANKS:
+        if rank in ENC_RANKS:
             img_for_vae = torch.nn.functional.interpolate(
                 img_tensor[None], size=(oh, ow), mode='bicubic').transpose(0, 1)
             img_seq = torch.cat([img_for_vae, torch.zeros(3, F - 1, oh, ow)], dim=1)
@@ -274,8 +295,12 @@ def main():
             msk_device = msk.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
             y = torch.cat([msk_device, z[0].to(torch.bfloat16)], dim=0)
             del z, img_seq, img_for_vae
-        # Broadcast y to any ranks not in VAE TP group (if VAE_TP_DEGREE < TP_DEGREE)
-        if VAE_TP_DEGREE < TP_DEGREE:
+            if VAE_ENCODE_RANK0:
+                # return the encoder's activation blocks (~1.4 GiB at 368x480): rank 0 shares its
+                # HBM stack with rank 1 at LNC1, and both need the room for the DiT activations
+                torch.neuron.empty_cache()
+        # Broadcast y to any ranks that did not encode (VAE_TP_DEGREE < TP_DEGREE, or VAE_ENCODE_RANK0)
+        if VAE_ENCODE_RANK0 or VAE_TP_DEGREE < TP_DEGREE:
             dist.broadcast(y, src=VAE_RANK)
         y[0, 0, 0, 0].item()  # force execution so the encode timing is real
         return y
@@ -283,7 +308,7 @@ def main():
     y_device = encode_image()
     if rank == 0:
         logger.info(f"VAE encode done: y shape = {y_device.shape}")
-    gc.collect()
+    release_device_cache("VAE encode done")
 
     # ── Load DiT models with TP + SP sharding ──
     init_tp_group(tp_degree=TP_DEGREE)
@@ -295,7 +320,7 @@ def main():
     FAST_DIT = os.environ.get("FAST_DIT", "0") == "1"
     if FAST_DIT:
         assert SP_DEGREE == 1 and TP_DEGREE == world_size, "FAST_DIT needs SP_DEGREE=1, TP_DEGREE=world size"
-        from models.fast_dit import FastWanDiT
+        from models.fast_dit import FAST_EMBED_HOST, FastWanDiT, prepare_kernel_weights
         grid = (T_latent, lat_h // 2, lat_w // 2)
         fast = {}
         for name, sub, g in (("high", config.high_noise_checkpoint, config.sample_guide_scale[1]),
@@ -305,9 +330,21 @@ def main():
             m = WanModel.from_pretrained(MODEL_PATH, subfolder=sub)
             m.eval().requires_grad_(False)
             shard_model_tp(m, tp_rank, TP_DEGREE)
-            m = m.to(torch.bfloat16).to(NEURON_DEVICE)
+            m = m.to(torch.bfloat16)
+            prepare_kernel_weights(m)      # kernel layouts on the host: the device gets one copy
+            m = m.to(NEURON_DEVICE)
             fast[name] = FastWanDiT(m, grid=grid, guide_scale=g, device=NEURON_DEVICE)
             fast[name].set_context(ctx_tensor, ctx_null_tensor)
+            release_device_cache(f"{name}_noise_model resident")
+        if FAST_EMBED_HOST:   # each expert's time modulation for this schedule, computed once
+            sch = FlowUniPCMultistepScheduler(
+                num_train_timesteps=config.num_train_timesteps, shift=1, use_dynamic_shifting=False)
+            sch.set_timesteps(int(os.environ.get("NUM_STEPS", "10")), device=torch.device("cpu"),
+                              shift=config.sample_shift)
+            bnd = config.boundary * config.num_train_timesteps
+            for name in ("high", "low"):
+                fast[name].cache_timesteps([t.item() for t in sch.timesteps if (t.item() >= bnd) == (name == "high")])
+            release_device_cache("timesteps cached")
         dist.barrier()
         if rank == 0:
             logger.info("[FAST_DIT] both experts resident, contexts set")
@@ -358,6 +395,7 @@ def main():
 
 
     latent_orig = noise.clone()
+    release_device_cache("before the runs")
     run_results = []
     boundary = config.boundary * config.num_train_timesteps
     current_on_device = 'high'
@@ -448,7 +486,9 @@ def main():
                 logger.info(f"{run_label} VAE decode (TP={VAE_TP_DEGREE})...")
             x0 = [latent.to(torch.bfloat16)]
             if VAE_IMPL == "static_tiled":
-                grid = tuple(int(v) for v in os.environ.get("VAE_TILE_GRID", "2x4").split("x"))
+                # one tile per rank: 2x4 on 8 ranks (two devices at LNC2, or one at LNC1), 2x2 on 4
+                default_grid = {8: "2x4", 4: "2x2", 2: "1x2", 1: "1x1"}.get(world_size, f"1x{world_size}")
+                grid = tuple(int(v) for v in os.environ.get("VAE_TILE_GRID", default_grid).split("x"))
                 videos = vae.decode_tiled(x0, grid=grid, overlap=int(os.environ.get("VAE_TILE_OVERLAP", "4")))
             else:
                 videos = vae.decode(x0)
@@ -467,9 +507,13 @@ def main():
         dist.barrier()
         vae_time = time.time() - vae_start
         run_time = time.time() - run_start
+        if VAE_ENCODE_RANK0:   # after the timers: free the decode tiles' blocks before the next encode
+            release_device_cache(f"{run_label} decoded")
 
         if rank == 0:
             logger.info(f"═══ {run_label} DONE: encode={encode_time:.2f}s, denoise={denoise_time:.2f}s, vae={vae_time:.2f}s, total={run_time:.2f}s ═══")
+            if MEM_LOG:
+                logger.info(f"[mem] {run_label}: peak allocated {torch.neuron.max_memory_allocated() / 2**30:.2f} GiB")
             run_results.append({
                 'run': run_idx + 1,
                 'encode': encode_time,
