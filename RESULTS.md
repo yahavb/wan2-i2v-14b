@@ -32,7 +32,9 @@ Times: mean of runs 3 and 4 of 4 in one process.
 | one device, TP 4 (above) | default stage | 21.51 ms | 8.71 s | 0.70 s | 9.84 s | 0.0362 |
 | FFN through nkilib `mlp` (up + GELU + down in one kernel), not the qkv-kernel up projection | `FAST_MLP=1 FAST_FFNUP_NKI=0` (`+mlp`, no `+upnki`) | 20.16 ms | 8.14 s | 0.65 s | 9.20 s | 0.0348 |
 | + mp4 encoded during the decode: blend, uint8 and ffmpeg per latent frame; ffmpeg spawned without fork | `+VAE_STREAM=1` (`+vstream`) | 20.16 ms | 8.16 s | 0.46 s | 9.03 s | 0.0348 |
-| + self-attention q, k and v as three nkilib qkv calls on [5120, 1280] weights, not one on the fused [5120, 3840] | `+FAST_QKV_SPLIT=1` (`+qsplit`) | 19.36 ms | 7.78 s | 0.39 s | **8.59 s** | 0.0389 |
+| + self-attention q, k and v as three nkilib qkv calls on [5120, 1280] weights, not one on the fused [5120, 3840] | `+FAST_QKV_SPLIT=1` (`+qsplit`) | 19.36 ms | 7.78 s | 0.39 s | 8.59 s | 0.0389 |
+| + residual stream sharded by token between the 4 ranks (Megatron sequence parallelism): reduce-scatter + all-gather instead of each all-reduce, residual adds, gates and norm2 on a quarter of the rows | `+FAST_SP=1` (`+sp`) | 19.05 ms | 7.66 s | 0.39 s | 8.47 s | 0.0348 |
+| + norm1 and norm3 (with its gated residual) on the rank's rows too, in the adaln kernel, all-gathered normalized; the q / k / v and cross-q kernels without their fused LayerNorm | `+FAST_SP_LN=1` (`+spln`) | 18.51 ms | 7.44 s | 0.42 s | **8.28 s** | 0.0390 |
 
 - Block = one DiT block NEFF on real inputs (`scripts/validate/block_bench.py`, layer 0 of the high
   expert at step 0, `DUMP_BLOCK_IN`). At TP 8 on two devices nkilib `mlp` lost (+1.32 ms, I = 1728);
@@ -48,6 +50,21 @@ Times: mean of runs 3 and 4 of 4 in one process.
   at layer 20, the same as the fused kernel at both layers. The step-0 change (0.0348 -> 0.0389) is
   accumulation order through 40 blocks, still below the 2-device run's 0.0395. Video vs the
   `+vstream` run: 25.1 dB, checked by eye.
+- `FAST_SP`: the collectives move the same bytes as the three all-reduces; the gain is the
+  replicated elementwise work, now on 2070 of the 8280 rows (the patch embedding keeps the rank's
+  rows, the head runs on them and all-gathers its 64-wide output). Its output (latent, frames, mp4)
+  is byte-identical to the `+mlp` run's: the split q / k / v and the sequence-parallel sums happen
+  to round like the fused kernel with all-reduces. Block bench with `FAST_SP` (rank 0's rows vs the
+  unsharded block): rel-RMS 2e-5 (high expert layer 0), 1e-5 (low expert layer 39), 0.27 / 0.30 ms
+  faster.
+- `FAST_SP_LN`: without sequence parallelism, one shared norm1 before plain q / k / v kernels was no
+  faster (19.36 vs 19.31 ms): the adaln kernel on all 8280 rows costs what the three fused
+  LayerNorms do. On a quarter of the rows it wins 0.55 ms. Block vs fp32 CPU (rank 0's rows):
+  0.00305 (`+sp` 0.00321).
+- Runs 2-4 of `+spln`: 8.24, 8.22, 8.37 s (run 4's VAE phase 0.52 s, the others 0.37-0.38 s).
+  Video vs the 2-device reference run: `+spln` 27.4 dB (worst frame 25.5), the closest of the
+  single-device runs (default stage 25.7 dB, `+mlp` / `+sp` 23.2, `+qsplit` 22.5); checked by eye.
+- `+sp` and `+spln` were measured at `s-lnc2` (TP 4) only.
 - Block ablations with `FAST_MLP` (ms of the 20.16 ms block): self-attention 3.28 (attention_cte
   and the q / k / v layout copies), all-reduces 1.49, cross-attention 0.69, RoPE 0.52, the whole
   self-attention prologue (QK-norm, RoPE, scale, layout copies) 0.82. Collectives alone: the 3
@@ -55,8 +72,21 @@ Times: mean of runs 3 and 4 of 4 in one process.
 - No gain (block ms against 20.16-20.20 at the time): K pre-transposed with the softmax scale
   inside attention_cte 20.19; the 5B branch's `attention_cte_lb` kernel 20.22; cross-attention K/V
   stored in the kernel's layout 20.23; one torch q|k|v matmul (`FAST_QKV=1`) instead of the qkv
-  kernel 20.12; the FFN kernel over 2 or 4 row chunks 20.12 / 20.30; the cross-attention q by
-  matmul (`FAST_CROSSQ_NKI=0`) 21.00.
+  kernel 20.12; the FFN kernel over 2 or 4 slices of its hidden dim (weights that fit SBUF, the
+  q / k / v split's idea) 20.12 / 20.30; the cross-attention q by matmul (`FAST_CROSSQ_NKI=0`) 21.00.
+- No gain on the `+qsplit` block (19.28-19.32 ms):
+  - the two CFG halves as independent chains in one graph, so one half's all-reduce could run
+    during the other half's kernels: 20.57 ms, the same as running them one after the other
+    (20.59). The compiler schedules one half after the other; halving the kernels' rows costs
+    1.27 ms. `--tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'`
+    changed nothing here or on the `+sp` block;
+  - q and k each normalized and rotated right after its kernel (separate sum-of-squares
+    all-reduces): 19.34;
+  - RoPE on [real | imaginary] halves (q / k weight columns permuted on the host): 19.28;
+  - cross-attention over 128 keys instead of 512 (the 442 / 386 pad tokens of the two prompts
+    share one key and value; the missing copies added back exactly from the kernel's softmax
+    statistics): 21.58. The kernel is no faster (its time is the q side: 4140 queries x 20 heads)
+    and the correction's elementwise ops on the d-major layout cost 2.3 ms.
 - Refuted: const-max self-attention (the 5B branch's fused `attention_cmax` kernel, QK-norm + RoPE
   inside, ported to LNC2 with one CFG half per core): 21.51 -> 20.04 ms per block and step-0
   accurate, but the video was NaN. The QK-norm weight bound (sqrt(d) * max|g_q| * max|g_k| per head)

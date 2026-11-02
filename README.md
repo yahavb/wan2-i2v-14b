@@ -19,7 +19,7 @@ batched CFG, the job's default flags; times are the mean of warm runs 3 and 4:
 
 | Config | Resource claim | Ranks | Device memory per rank (peak) | Total | Denoise | VAE encode / decode |
 |---|---|---|---|---|---|---|
-| one device, LNC2 (job default) | `s-lnc2` | TP 4 | 20.8 GiB of 24 (rank 0) | **8.6 s** (9.8 s before `+mlp+vstream+qsplit`) | 7.8 s | 0.41 / 0.39 s |
+| one device, LNC2 (job default) | `s-lnc2` | TP 4 | 20.8 GiB of 24 (rank 0) | **8.3 s** (9.8 s before `+mlp+vstream+qsplit+sp+spln`) | 7.4 s | 0.41 / 0.42 s |
 | one device, LNC1 | `s-lnc1` | TP 8 | 12.7 GiB (rank 0); ranks 0+1 share a 24 GiB stack: 21.8 | **10.5 s** | 9.2 s | 0.64 / 0.64 s |
 | two devices, LNC2 | `m-lnc2` | TP 8 | -- | **6.35 s** | 5.36 s | 0.42 / 0.53 s |
 
@@ -29,11 +29,13 @@ batched CFG, the job's default flags; times are the mean of warm runs 3 and 4:
   `VAE_ENCODE_RANK0` encodes the image on rank 0 only and broadcasts `y`; `FAST_EMBED_HOST` keeps
   the text/time embedding weights (0.43 GiB per expert per rank) on the host and caches each
   step's time modulation. Both give bit-identical output (checked at LNC2).
-- Step-0 noise prediction vs an fp32 CPU DiT (rel-RMS): `s-lnc2` 0.0362 (0.0389 with
-  `+mlp+vstream+qsplit`), `s-lnc1` 0.0376, `m-lnc2` 0.0395.
-- The job's default stage is `fast_cte+oproj+adaln+vaetile+t5+qkvnki+xqnki+mlp+vstream+qsplit`
-  (`FAST_MLP=1`, `VAE_STREAM=1`, `FAST_QKV_SPLIT=1`; see RESULTS.md). The `s-lnc1` and `m-lnc2`
-  rows were measured with the previous stage (`+upnki`, no `+vstream`, no `+qsplit`).
+- Step-0 noise prediction vs an fp32 CPU DiT (rel-RMS): `s-lnc2` 0.0362 (0.0390 with
+  `+mlp+vstream+qsplit+sp+spln`), `s-lnc1` 0.0376, `m-lnc2` 0.0395.
+- The job's default stage is
+  `fast_cte+oproj+adaln+vaetile+t5+qkvnki+xqnki+mlp+vstream+qsplit+sp+spln` (`FAST_MLP=1`,
+  `VAE_STREAM=1`, `FAST_QKV_SPLIT=1`, `FAST_SP=1`, `FAST_SP_LN=1`; see RESULTS.md). The `s-lnc1`
+  and `m-lnc2` rows were measured with the previous stage (`+upnki`, none of the later flags);
+  `+sp+spln` are untested at TP 8.
 
 ## Deploy
 

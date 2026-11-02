@@ -36,7 +36,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed._functional_collectives as funcol
 
-from models.tp_utils import get_tp_group, get_tp_world_size
+from models.tp_utils import get_tp_group, get_tp_rank, get_tp_world_size
 
 logger = logging.getLogger(__name__)
 
@@ -602,6 +602,18 @@ DUMP_BLOCK_LAYERS = [int(v) for v in os.environ.get("DUMP_BLOCK_LAYERS", "0").sp
 # NAN_CHECK_DIR=<dir> (debug, syncs every block): log the first block whose input is not finite and
 # save the previous block's input (rank 0) there, to replay the failing block in the block bench.
 NAN_CHECK_DIR = os.environ.get("NAN_CHECK_DIR", "")
+# FAST_SP=1 (TP > 1, with FAST_QKV_NKI + FAST_QKV_SPLIT + FAST_OPROJ + FAST_CROSSQ_NKI + FAST_ADALN +
+# FAST_MLP): Megatron sequence parallelism inside the TP group. Between blocks each rank keeps only
+# its B*L/tp rows of the residual stream: the blocks all-gather before the q / k / v, cross-q and
+# FFN kernels and reduce-scatter after the two O-projections and the FFN (the same bytes as the
+# three all-reduces), so the residual adds, gates and the norm2 kernel run on a quarter of the
+# rows. _FastPatchSP keeps the rank's rows; _FastHeadSP runs the head on them and all-gathers.
+FAST_SP = os.environ.get("FAST_SP", "0") == "1"
+# FAST_SP_LN=1 (with FAST_SP): the two LayerNorms before the kernels that need every row also run
+# on this rank's rows, in the adaln kernel, and are all-gathered instead of x: norm1 + modulation
+# (then three qkv kernel calls without their fused LayerNorm, which each call would recompute on
+# all rows) and the gated residual + norm3 (res_gate; then the cross-q kernel without a norm).
+FAST_SP_LN = os.environ.get("FAST_SP_LN", "0") == "1"
 
 
 def build_kernels():
@@ -644,12 +656,20 @@ class FastWanDiT:
         build_kernels()
         prepare_kernel_weights(model)
         self.time = torch.compile(_FastTime(model), **COMPILE_KW)
-        self.patch = torch.compile(_FastPatch(model.patch_embedding), **COMPILE_KW)
         self.text = torch.compile(_FastText(model.text_embedding), **COMPILE_KW)
-        self.blocks = [torch.compile(_FastBlock(b), **COMPILE_KW) for b in model.blocks]
         self.cross_kv = [torch.compile(_FastCrossKV(b), **COMPILE_KW) for b in model.blocks]
-        self.head = torch.compile(
-            _FastHead(model.head, self.grid, model.patch_size, model.out_dim, guide_scale), **COMPILE_KW)
+        if FAST_SP:          # residual stream sharded by token between blocks
+            assert not (DUMP_BLOCK_IN or NAN_CHECK_DIR), "DUMP_BLOCK_IN / NAN_CHECK_DIR need FAST_SP=0"
+            shape = (2, math.prod(self.grid))                      # (CFG batch, L)
+            self.patch = torch.compile(_FastPatchSP(model.patch_embedding), **COMPILE_KW)
+            self.blocks = [torch.compile(_FastBlockSP(b, shape), **COMPILE_KW) for b in model.blocks]
+            self.head = torch.compile(
+                _FastHeadSP(model.head, self.grid, model.patch_size, model.out_dim, guide_scale), **COMPILE_KW)
+        else:
+            self.patch = torch.compile(_FastPatch(model.patch_embedding), **COMPILE_KW)
+            self.blocks = [torch.compile(_FastBlock(b), **COMPILE_KW) for b in model.blocks]
+            self.head = torch.compile(
+                _FastHead(model.head, self.grid, model.patch_size, model.out_dim, guide_scale), **COMPILE_KW)
         self.context = None
         self._time_cache = {}
         self._embed_on_host = False
@@ -657,7 +677,7 @@ class FastWanDiT:
             self._embed_to(torch.device("cpu"))
         logger.info(f"[fast_dit] grid={self.grid} L={math.prod(self.grid)} attn={FAST_ATTN_IMPL} "
                     f"fullgraph=True blocks={len(self.blocks)} cfg_batch=2 guide={guide_scale} "
-                    f"embed_host={FAST_EMBED_HOST}")
+                    f"embed_host={FAST_EMBED_HOST} sp={FAST_SP}")
 
     def _embed_to(self, device):
         """Move the text / time embedding modules between the host and the device."""
@@ -735,3 +755,127 @@ class FastWanDiT:
             logger.warning(f"[fast_dit] graph breaks ({sum(breaks.values())}): {breaks}")
         else:
             logger.info("[fast_dit] no graph breaks")
+
+
+# ─── FAST_SP: sequence-parallel residual stream (defined last: the units above keep their lines) ──
+
+def _sp_check():
+    assert get_tp_world_size() > 1, "FAST_SP needs TP > 1"
+    assert FAST_QKV_NKI and FAST_QKV_SPLIT and FAST_OPROJ and FAST_CROSSQ_NKI and FAST_ADALN and FAST_MLP, \
+        "FAST_SP supports FAST_QKV_NKI + FAST_QKV_SPLIT + FAST_OPROJ + FAST_CROSSQ_NKI + FAST_ADALN + FAST_MLP"
+    assert not (FAST_FFNUP_NKI or FAST_XRES_KERNEL) and FAST_ATTN_IMPL == "cte", \
+        "FAST_SP: FAST_FFNUP_NKI, FAST_XRES_KERNEL off and FAST_ATTN_IMPL=cte"
+
+
+_qkv_plain_call = None
+
+
+def _get_qkv_plain():
+    """nkilib qkv without a fused norm: input [B, S, H] @ weight [H, I] + bias [1, I] -> [B, S, I]."""
+    global _qkv_plain_call
+    if _qkv_plain_call is None:
+        import nki
+        from nkilib.core.qkv.qkv import qkv
+        from nkilib.core.utils.common_types import QKVOutputLayout
+
+        @nki.jit
+        def _qkv_plain_kernel(hidden, weight, bias):
+            return qkv(hidden, weight, QKVOutputLayout.BSD, bias=bias)
+
+        _qkv_plain_call = _wrap(_qkv_plain_kernel, "wan14b::qkv_plain")
+        logger.info(f"[fast_dit] nkilib qkv (no norm) via {FAST_KERNEL_WRAP} lnc={LNC}")
+    return _qkv_plain_call
+
+
+def _sp_rows(BL):
+    """This rank's rows of the flattened [B*L, C] residual stream (rank r: rows r*S .. r*S + S)."""
+    tp = get_tp_world_size()
+    assert BL % tp == 0, f"FAST_SP: B*L = {BL} not divisible by TP {tp}"
+    S = BL // tp
+    return get_tp_rank() * S, S
+
+
+class _FastPatchSP(nn.Module):
+    """_FastPatch, then this rank's rows [B*L/tp, C] of the [2, L, C] CFG batch."""
+
+    def __init__(self, patch_embedding):
+        super().__init__()
+        self.patch_embedding = patch_embedding
+
+    def forward(self, latent, y):
+        x = self.patch_embedding(torch.cat([latent, y], dim=0).unsqueeze(0)).flatten(2).transpose(1, 2)
+        L, C = x.shape[1], x.shape[2]
+        r0, S = _sp_rows(2 * L)
+        return x.expand(2, -1, -1).reshape(2 * L, C)[r0:r0 + S].contiguous()
+
+
+class _FastBlockSP(nn.Module):
+    """_FastBlock's math with the residual stream sharded by token: xs [B*L/tp, C] in and out.
+    The q / k / v, cross-q and FFN kernels take the all-gathered rows; the O-projections and the FFN
+    are reduce-scattered back to this rank's rows (rank order = row order)."""
+
+    def __init__(self, block, shape):
+        super().__init__()
+        _sp_check()
+        if FAST_SP_LN:
+            _get_qkv_plain()     # build before tracing
+        self.block = block
+        self.B, self.L = shape
+
+    def forward(self, xs, e, cos, sin, ck, cv):
+        blk, B, L = self.block, self.B, self.L
+        sa, ca, n3, f = blk.self_attn, blk.cross_attn, blk.norm3, blk.ffn
+        n, d = sa.num_heads, sa.head_dim
+        g = get_tp_group()
+        C = xs.shape[-1]
+        dt = xs.dtype
+        e = [t.reshape(1, C) for t in (blk.modulation.unsqueeze(0) + e).chunk(6, dim=2)]
+        g1, b1 = _row(1 + e[1], C, dt), _row(e[0], C, dt)
+        wb = ((sa.q_wt, sa.q_b2), (sa.k_wt, sa.k_b2), (sa.v_wt, sa.v_b2))
+        if FAST_SP_LN:      # norm1 + modulation on this rank's rows, then plain projections
+            plain, res_gate = _get_adaln()[:2]
+            h = funcol.all_gather_tensor(plain(xs, g1, b1), 0, g).view(B, L, C)
+            q, k, v = (_get_qkv_plain()(h, w, bb).view(B, L, -1) for w, bb in wb)
+        else:
+            x = funcol.all_gather_tensor(xs, 0, g).view(B, L, C)
+            q, k, v = (_get_qkv()(x, w, bb, g1, b1).view(B, L, -1) for w, bb in wb)
+        q, k = _tp_rms_qk(q, k, sa.norm_q, sa.norm_k)
+        v = v.reshape(B, L, n, d)
+        q, k = _rope(q.view(B, L, n, d), cos, sin), _rope(k.view(B, L, n, d), cos, sin)
+        y = _get_oproj()(_attn_dmajor(q, k, v), sa.o_w_t, sa.o_b_scaled)
+        ys = funcol.reduce_scatter_tensor(y.reshape(B * L, C), "sum", 0, g)
+        if FAST_SP_LN:      # xs + gate * ys and norm3 (affine) of it on this rank's rows, one kernel
+            xs, hs = res_gate(ys, _row(n3.weight, C, dt), _row(n3.bias, C, dt), xs, _row(e[2], C, torch.float32))
+            h = funcol.all_gather_tensor(hs, 0, g).view(B, L, C)
+            q = _get_qkv_plain()(h, ca.q_wt, ca.q_b2)
+        else:
+            xs = xs + (ys * e[2]).to(dt)
+            x = funcol.all_gather_tensor(xs, 0, g).view(B, L, C)
+            q = _get_qkv()(x, ca.q_wt, ca.q_b2, n3.w_row.to(dt), n3.b_row.to(dt))
+        q = _tp_rms(q.view(B, L, -1), ca.norm_q).view(B, L, n, d)
+        y = _get_oproj()(_attn_dmajor(q, ck, cv), ca.o_w_t, ca.o_b_scaled)
+        ys = funcol.reduce_scatter_tensor(y.reshape(B * L, C), "sum", 0, g)
+        res = _get_adaln()[2]
+        xs, hs = res(ys, _row(1 + e[4], C, dt), _row(e[3], C, dt), xs)
+        h = funcol.all_gather_tensor(hs, 0, g)
+        y = _get_mlp()(h.reshape(1, B * L, C), f.up_w_t, f.down_w_t, f.up_b2, f.down_b_scaled)
+        ys = funcol.reduce_scatter_tensor(y.reshape(B * L, C), "sum", 0, g)
+        return xs + ys * e[5]
+
+
+class _FastHeadSP(_FastHead):
+    """_FastHead on this rank's rows, then the all-gather of the (64-wide) head output."""
+
+    def forward(self, xs, e):                   # xs [B*L/tp, C], e [1, 1, C]
+        hd = self.head
+        f, h, w = self.grid
+        p, q, r = self.patch_size
+        c = self.out_dim
+        C = xs.shape[-1]
+        m = [t.reshape(1, C) for t in (hd.modulation.unsqueeze(0) + e.unsqueeze(2)).chunk(2, dim=2)]
+        ys = hd.head(hd.norm(xs) * (1 + m[1]) + m[0])                       # [S, p*q*r*c]
+        y = funcol.all_gather_tensor(ys.contiguous(), 0, get_tp_group())     # [B*L, p*q*r*c]
+        y = y.view(-1, f, h, w, p, q, r, c).permute(0, 7, 1, 4, 2, 5, 3, 6)
+        y = y.reshape(y.shape[0], c, f * p, h * q, w * r).to(torch.bfloat16)
+        cond, uncond = y[0], y[1]
+        return uncond + self.guide_scale * (cond - uncond)

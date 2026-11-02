@@ -8,6 +8,9 @@
   no_xa    cross-attention returns its q                    -> cross-attention kernel cost
   ar_only  the 3 all-reduces of a [B, L, C] bf16 tensor alone
   rsag_only  the same as 3 reduce-scatters + all-gathers (the Megatron sequence-parallel split)
+  cfg2     the two CFG halves as independent chains, stage-interleaved (all-reduce / compute overlap)
+  cfg2_seq the two CFG halves one after the other (the cost of halving the kernels' rows)
+  sp       models.fast_dit._FastBlockSP (FAST_SP): this rank's B*L/tp rows in and out (compares rows of rank 0)
   no_qkn   QK RMSNorm skipped (self q/k and cross q; their sum-of-squares all-reduce too)
   no_rope  RoPE skipped
   no_prep  the self-attention prologue skipped (QK-norm, RoPE, softmax scale, q / k / v permutes)
@@ -88,6 +91,60 @@ def ref32_out(blk32, x, e0, ctx, rank):
 def rel(a, b):
     a, b = a.float(), b.float()
     return ((a - b).pow(2).mean().sqrt() / b.pow(2).mean().sqrt()).item()
+
+
+def cfg_halves_unit(fd, blk, interleave):
+    """The block with the two CFG halves as independent chains in one graph (cfg2 / cfg2_seq).
+    Same math as _FastBlock for FAST_QKV_NKI + FAST_QKV_SPLIT + FAST_OPROJ + FAST_CROSSQ_NKI +
+    FAST_ADALN + FAST_MLP, cut at the three [B, L, C] all-reduces. interleave=True issues stage s
+    of both halves before stage s + 1, so one half's all-reduce can overlap the other's compute."""
+    assert fd.FAST_QKV_NKI and fd.FAST_QKV_SPLIT and fd.FAST_OPROJ and fd.FAST_CROSSQ_NKI
+    assert fd.FAST_ADALN and fd.FAST_MLP and not fd.FAST_FFNUP_NKI and not fd.FAST_XRES_KERNEL
+    sa, ca, n3, f = blk.self_attn, blk.cross_attn, blk.norm3, blk.ffn
+    n, d = sa.num_heads, sa.head_dim
+
+    def s1(x, e, cos, sin, ck, cv):
+        B, L, C = x.shape
+        g1, b1 = fd._row(1 + e[1], C, x.dtype), fd._row(e[0], C, x.dtype)
+        q, k, v = (fd._get_qkv()(x, w, bb, g1, b1).view(B, L, -1)
+                   for w, bb in ((sa.q_wt, sa.q_b2), (sa.k_wt, sa.k_b2), (sa.v_wt, sa.v_b2)))
+        q, k = fd._tp_rms_qk(q, k, sa.norm_q, sa.norm_k)
+        v = v.reshape(B, L, n, d)
+        q, k = fd._rope(q.view(B, L, n, d), cos, sin), fd._rope(k.view(B, L, n, d), cos, sin)
+        return x, fd._get_oproj()(fd._attn_dmajor(q, k, v), sa.o_w_t, sa.o_b_scaled)
+
+    def s2(x, y, e, cos, sin, ck, cv):
+        B, L, C = x.shape
+        x = x + (y.reshape(B, L, C) * e[2]).to(x.dtype)
+        q = fd._get_qkv()(x, ca.q_wt, ca.q_b2, n3.w_row.to(x.dtype), n3.b_row.to(x.dtype))
+        q = fd._tp_rms(q.view(B, L, -1), ca.norm_q).view(B, L, n, d)
+        return x, fd._get_oproj()(fd._attn_dmajor(q, ck, cv), ca.o_w_t, ca.o_b_scaled)
+
+    def s3(x, y, e, cos, sin, ck, cv):
+        B, L, C = x.shape
+        res = fd._get_adaln()[2]
+        x, h = res(y.reshape(B * L, C), fd._row(1 + e[4], C, x.dtype), fd._row(e[3], C, x.dtype),
+                   x.reshape(B * L, C))
+        y = fd._get_mlp()(h.reshape(1, B * L, -1), f.up_w_t, f.down_w_t, f.up_b2, f.down_b_scaled)
+        return x.view(B, L, C), y
+
+    def unit(x_, e_, c_, s_, k_, v_):
+        e = [t.squeeze(2) for t in (blk.modulation.unsqueeze(0) + e_).chunk(6, dim=2)]
+        halves = [[x_[i:i + 1], None, k_[i:i + 1], v_[i:i + 1]] for i in range(2)]
+
+        def step(h, s):
+            x, y = s(h[0], *([] if s is s1 else [h[1]]), e, c_, s_, h[2], h[3])
+            h[0], h[1] = x, fd._all_reduce(y)
+        if interleave:
+            for s in (s1, s2, s3):
+                for h in halves:
+                    step(h, s)
+        else:
+            for h in halves:
+                for s in (s1, s2, s3):
+                    step(h, s)
+        return torch.cat([h[0] + h[1].reshape(h[0].shape) * e[5] for h in halves], 0)
+    return unit
 
 
 def main():
@@ -187,12 +244,18 @@ def main():
                     sh = funcol.reduce_scatter_tensor(x_.reshape(-1, x_.shape[-1]), "sum", 0, g) * 0.25
                     x_ = funcol.all_gather_tensor(sh, 0, g).view_as(x_)
                 return x_
+        elif var in ("cfg2", "cfg2_seq"):
+            unit = cfg_halves_unit(fd, blk, interleave=var == "cfg2")
+        elif var == "sp":      # FAST_SP's block: this rank's B*L/tp rows in and out
+            unit = fd._FastBlockSP(blk, (B, L))
         else:
             unit = fd._FastBlock(blk)
         f = torch.compile(unit, **fd.COMPILE_KW)
+        S = B * L // world
+        x_in = x.reshape(B * L, DIM)[rank * S:(rank + 1) * S].contiguous() if var == "sp" else x
         t0 = time.perf_counter()
         try:
-            y = f(x, e0, cos, sin, ck, cv)
+            y = f(x_in, e0, cos, sin, ck, cv)
             torch.neuron.synchronize()
         except Exception as ex:  # noqa: BLE001
             if rank == 0:
@@ -203,29 +266,34 @@ def main():
             continue
         t_first = time.perf_counter() - t0
         for _ in range(3):
-            y = f(x, e0, cos, sin, ck, cv)
+            y = f(x_in, e0, cos, sin, ck, cv)
         torch.neuron.synchronize()
         dist.barrier()
         t0 = time.perf_counter()
         for _ in range(REPS):
-            y = f(x, e0, cos, sin, ck, cv)
+            y = f(x_in, e0, cos, sin, ck, cv)
         torch.neuron.synchronize()
         ms = (time.perf_counter() - t0) / REPS * 1e3
-        tt = torch.tensor([ms], dtype=torch.float32)
         if rank == 0:
             yc = y.float().cpu()
             acc = ""
-            if var == "ref" and y32 is not None:
-                acc += f" rel_rms_vs_fp32={rel(yc, y32):.5f}"
-            if var == "ref" and os.environ.get("BB_CMP"):      # another process's saved ref output
-                yo = torch.load(os.environ["BB_CMP"])
-                acc += f" vs_BB_CMP: equal={torch.equal(yc, yo)} rel_rms={rel(yc, yo):.5f}"
-            if var == "ref" and os.environ.get("BB_SAVE"):
-                torch.save(yc, os.environ["BB_SAVE"])
-            if first is None:
-                first = (var, yc)
-            elif var == "ref" or first[0] == "ref":
-                acc += f" rel_rms_vs_{first[0]}={rel(yc, first[1]):.5f}"
+            if var == "sp":     # rank 0 holds rows 0..S-1: compare them, as [B, L, C]-shaped refs
+                if y32 is not None:
+                    acc += f" rel_rms_vs_fp32(rows 0..{S - 1})={rel(yc, y32.reshape(B * L, DIM)[:S]):.5f}"
+                if first is not None and first[0] == "ref":
+                    acc += f" rel_rms_vs_ref(rows 0..{S - 1})={rel(yc, first[1].reshape(B * L, DIM)[:S]):.5f}"
+            else:
+                if var == "ref" and y32 is not None:
+                    acc += f" rel_rms_vs_fp32={rel(yc, y32):.5f}"
+                if var == "ref" and os.environ.get("BB_CMP"):      # another process's saved ref output
+                    yo = torch.load(os.environ["BB_CMP"])
+                    acc += f" vs_BB_CMP: equal={torch.equal(yc, yo)} rel_rms={rel(yc, yo):.5f}"
+                if var == "ref" and os.environ.get("BB_SAVE"):
+                    torch.save(yc, os.environ["BB_SAVE"])
+                if first is None:
+                    first = (var, yc)
+                elif var == "ref" or first[0] == "ref":
+                    acc += f" rel_rms_vs_{first[0]}={rel(yc, first[1]):.5f}"
             print(f"{var:>8}: {ms:8.3f} ms/block (first call {t_first:.1f}s){acc}", flush=True)
         for k, v in saved.items():
             setattr(fd, k, v)
