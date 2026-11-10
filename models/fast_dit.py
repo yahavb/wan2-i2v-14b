@@ -837,9 +837,27 @@ def _get_qkv_plain():
 def _sp_rows(BL):
     """This rank's rows of the flattened [B*L, C] residual stream (rank r: rows r*S .. r*S + S)."""
     tp = get_tp_world_size()
-    assert BL % tp == 0, f"FAST_SP: B*L = {BL} not divisible by TP {tp}"
-    S = BL // tp
+    S = (BL + _sp_pad(BL)) // tp
     return get_tp_rank() * S, S
+
+
+def _sp_pad(BL):
+    """Zero rows appended so B*L splits evenly over TP (B*L = 4140 at TP 8 under FAST_CFGP: 4 rows).
+    The pad rows live only in the sharded residual stream: every all-gather drops them before the
+    kernels, every reduce-scatter input gets them back as zeros. Real rows are unchanged."""
+    return (-BL) % get_tp_world_size()
+
+
+def _sp_ag(t, g, BL):
+    full = funcol.all_gather_tensor(t, 0, g)
+    return full[:BL] if _sp_pad(BL) else full
+
+
+def _sp_rs(y, g, BL):
+    pad = _sp_pad(BL)
+    if pad:
+        y = F.pad(y, (0, 0, 0, pad))
+    return funcol.reduce_scatter_tensor(y, "sum", 0, g)
 
 
 class _FastPatchSP(nn.Module):
@@ -854,7 +872,10 @@ class _FastPatchSP(nn.Module):
         L, C = x.shape[1], x.shape[2]
         B = _cfg_b()
         r0, S = _sp_rows(B * L)
-        return x.expand(B, -1, -1).reshape(B * L, C)[r0:r0 + S].contiguous()
+        x = x.expand(B, -1, -1).reshape(B * L, C)
+        if _sp_pad(B * L):
+            x = F.pad(x, (0, 0, 0, _sp_pad(B * L)))
+        return x[r0:r0 + S].contiguous()
 
 
 class _FastBlockSP(nn.Module):
@@ -882,32 +903,32 @@ class _FastBlockSP(nn.Module):
         wb = ((sa.q_wt, sa.q_b2), (sa.k_wt, sa.k_b2), (sa.v_wt, sa.v_b2))
         if FAST_SP_LN:      # norm1 + modulation on this rank's rows, then plain projections
             plain, res_gate = _get_adaln()[:2]
-            h = funcol.all_gather_tensor(plain(xs, g1, b1), 0, g).view(B, L, C)
+            h = _sp_ag(plain(xs, g1, b1), g, B * L).view(B, L, C)
             q, k, v = (_get_qkv_plain()(h, w, bb).view(B, L, -1) for w, bb in wb)
         else:
-            x = funcol.all_gather_tensor(xs, 0, g).view(B, L, C)
+            x = _sp_ag(xs, g, B * L).view(B, L, C)
             q, k, v = (_get_qkv()(x, w, bb, g1, b1).view(B, L, -1) for w, bb in wb)
         q, k = _tp_rms_qk(q, k, sa.norm_q, sa.norm_k)
         v = v.reshape(B, L, n, d)
         q, k = _rope(q.view(B, L, n, d), cos, sin), _rope(k.view(B, L, n, d), cos, sin)
         y = _get_oproj()(_attn_dmajor(q, k, v), sa.o_w_t, sa.o_b_scaled)
-        ys = funcol.reduce_scatter_tensor(y.reshape(B * L, C), "sum", 0, g)
+        ys = _sp_rs(y.reshape(B * L, C), g, B * L)
         if FAST_SP_LN:      # xs + gate * ys and norm3 (affine) of it on this rank's rows, one kernel
             xs, hs = res_gate(ys, _row(n3.weight, C, dt), _row(n3.bias, C, dt), xs, _row(e[2], C, torch.float32))
-            h = funcol.all_gather_tensor(hs, 0, g).view(B, L, C)
+            h = _sp_ag(hs, g, B * L).view(B, L, C)
             q = _get_qkv_plain()(h, ca.q_wt, ca.q_b2)
         else:
             xs = xs + (ys * e[2]).to(dt)
-            x = funcol.all_gather_tensor(xs, 0, g).view(B, L, C)
+            x = _sp_ag(xs, g, B * L).view(B, L, C)
             q = _get_qkv()(x, ca.q_wt, ca.q_b2, n3.w_row.to(dt), n3.b_row.to(dt))
         q = _tp_rms(q.view(B, L, -1), ca.norm_q).view(B, L, n, d)
         y = _get_oproj()(_attn_dmajor(q, ck, cv), ca.o_w_t, ca.o_b_scaled)
-        ys = funcol.reduce_scatter_tensor(y.reshape(B * L, C), "sum", 0, g)
+        ys = _sp_rs(y.reshape(B * L, C), g, B * L)
         res = _get_adaln()[2]
         xs, hs = res(ys, _row(1 + e[4], C, dt), _row(e[3], C, dt), xs)
-        h = funcol.all_gather_tensor(hs, 0, g)
+        h = _sp_ag(hs, g, B * L)
         y = _get_mlp()(h.reshape(1, B * L, C), f.up_w_t, f.down_w_t, f.up_b2, f.down_b_scaled)
-        ys = funcol.reduce_scatter_tensor(y.reshape(B * L, C), "sum", 0, g)
+        ys = _sp_rs(y.reshape(B * L, C), g, B * L)
         return xs + ys * e[5]
 
 
@@ -922,7 +943,8 @@ class _FastHeadSP(_FastHead):
         C = xs.shape[-1]
         m = [t.reshape(1, C) for t in (hd.modulation.unsqueeze(0) + e.unsqueeze(2)).chunk(2, dim=2)]
         ys = hd.head(hd.norm(xs) * (1 + m[1]) + m[0])                       # [S, p*q*r*c]
-        y = funcol.all_gather_tensor(ys.contiguous(), 0, get_tp_group())     # [B*L, p*q*r*c]
+        y = funcol.all_gather_tensor(ys.contiguous(), 0, get_tp_group())     # [B*L (+pad), p*q*r*c]
+        y = y[:f * h * w * _cfg_b()]
         y = y.view(-1, f, h, w, p, q, r, c).permute(0, 7, 1, 4, 2, 5, 3, 6)
         y = y.reshape(y.shape[0], c, f * p, h * q, w * r).to(torch.bfloat16)
         if FAST_CFGP:
