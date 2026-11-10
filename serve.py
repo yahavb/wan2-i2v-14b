@@ -347,10 +347,13 @@ def main():
         return mp4, timings
 
     # Warmup: compiles (or loads from cache) every graph a request uses.
-    for i in range(2):
+    # WARMUP_RUNS (default 3): the second run in a process still pays a slow VAE decode
+    # (2.6 s vs 0.24 s warm at 4 devices), so the first real request would be slow after only two.
+    warm = int(os.environ.get("WARMUP_RUNS", "3"))
+    for i in range(warm):
         _, timings = generate(DEFAULT_PROMPT, "", 42, NUM_STEPS, default_image())
         if rank == 0:
-            logger.info(f"warmup {i + 1}/2: {timings}")
+            logger.info(f"warmup {i + 1}/{warm}: {timings}")
 
     assert heartbeat(), "warmup heartbeat: wrong all-reduce sum"
     jobs = queue.Queue()
