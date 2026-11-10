@@ -11,7 +11,7 @@ core 1.573e14 (trn3, from a profile) and 1.667e14 (trn2, spec): estimates.
 
 | HW | Devices | Claim | Layout | Stage | Denoise | Total | e2e MFU | PSNR vs fp32 R |
 |---|---|---|---|---|---|---|---|---|
-| trn3 | 4 | `l-lnc2` | TP 8 x CFG 2 | `+mlp+vstream+qsplit` | 2.22 s | **2.85 s** (serve.py HTTP 3.0 s) | 32% | 23.1 dB |
+| trn3 | 4 | `l-lnc2` | TP 8 x CFG 2 | `+mlp+vstream+qsplit` | 2.22 s | **2.85 s** (serve.py HTTP 3.0 s; 2.6 s with a repeated image) | 32% | 23.1 dB |
 | trn3 | 2 | `m-lnc2` | TP 4 x CFG 2 | `+mlp+vstream+qsplit+sp+spln` | 3.05 s | **3.69 s** | 50% | 22.0 dB |
 | trn3 | 2 | `m-lnc2` | TP 8, batched CFG | `+mlp+vstream+qsplit+sp+spln` | 3.46 s | 4.11 s | 45% | 25.0 dB |
 | trn3 | 2 | `m-lnc2` | TP 8, batched CFG | validated stage (previous best) | 3.79 s | 4.58 s | 40% | 24.2 dB |
@@ -27,6 +27,9 @@ core 1.573e14 (trn3, from a profile) and 1.667e14 (trn2, spec): estimates.
 - Refuted: `FAST_SP` at TP 8 x CFG 2 (rows padded 4140 → 4144): 3.41 vs 2.84 s same session.
 - Gate floors (user-labelled, all approved): first-9-frame PSNR vs R >= 21.5 dB, step-0 rel-RMS
   <= 0.045 and <= 1.3 x base, sharpness vs R >= 0.90, whole PSNR >= 21.5 dB and within 2.5 dB of base.
+- serve.py: `VAE_STREAM` (mp4 during the decode, 0.40 → 0.25 s), `Y_CACHE` (a repeated image reuses
+  its VAE encode, exact: same mp4 bytes), request broadcast over a gloo group (on the neuron backend
+  every new request size cost ~2 s once), `WARMUP_RUNS=3`. Warm request 2.60-2.62 s for any prompt.
 - The deploy (`wan2-i2v-14b-deploy.yaml`) and bench job (`wan2-i2v-14b-job.yaml`) default to the trn3
   4-device row.
 

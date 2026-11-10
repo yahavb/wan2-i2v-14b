@@ -1,6 +1,7 @@
 # Wan2.2-I2V-A14B serve, minimum latency: one trn3 node, 4 Neuron devices (l-lnc2, 16 ranks),
 # TP 8 x CFG 2 (FAST_CFGP: one TP group per CFG half). Measured 2026-11-10 (commit e0d9020):
-# warm HTTP request 3.0 s (text 0.04, VAE encode 0.38, denoise 2.32, decode+mp4 0.25), 368x480,
+# warm HTTP request 2.6 s with a repeated image (Y_CACHE skips the VAE encode), 3.0 s with a new
+# image (text 0.04, VAE encode 0.38, denoise 2.32, decode+mp4 0.25), 368x480,
 # 21 frames, 10 steps; passes scripts/validate/gate_wan.sh. First boot compiles ~8 min; the
 # first request right after the first boot is slow while the NEFF cache is archived.
 # Other device counts (bench, same node, 2026-11-10): 2 trn3 devices: m-lnc2, NPROC 8, TP 4 x CFG 2
