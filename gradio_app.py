@@ -87,11 +87,18 @@ def describe_video(mp4_b64, question):
                              {"type": "text", "text": question}]}]}
     r = requests.post(f"{VLM_URL}/chat/completions", json=body, timeout=600)
     r.raise_for_status()
-    reply = r.json()["choices"][0]["message"]["content"]
-    if "to=user" not in reply:
+    msg = r.json()["choices"][0]["message"]
+    reply = msg.get("content") or ""
+    if "to=user" in reply:  # server without a reasoning parser: content holds both channels
+        return reply.rsplit("to=user", 1)[-1].strip()     # drop the model's reasoning channel
+    if msg.get("reasoning_content") is None and "to=self" in reply:
         raise RuntimeError(f"no final answer within {VLM_MAX_TOKENS} tokens (only reasoning); "
                            "raise VLM_MAX_TOKENS")
-    return reply.rsplit("to=user", 1)[-1].strip()     # drop the model's reasoning channel
+    # server with --reasoning-parser muse_glimmer: content is the final answer only
+    if not reply.strip():
+        raise RuntimeError(f"no final answer within {VLM_MAX_TOKENS} tokens (only reasoning); "
+                           "raise VLM_MAX_TOKENS")
+    return reply.strip()
 
 
 def server_info():
