@@ -1,3 +1,11 @@
+# Wan2.2-I2V-A14B serve, minimum latency: one trn3 node, 4 Neuron devices (l-lnc2, 16 ranks),
+# TP 8 x CFG 2 (FAST_CFGP: one TP group per CFG half). Measured 2026-11-10 (commit e0d9020):
+# warm HTTP request 3.0 s (text 0.04, VAE encode 0.38, denoise 2.32, decode+mp4 0.25), 368x480,
+# 21 frames, 10 steps; passes scripts/validate/gate_wan.sh. First boot compiles ~8 min; the
+# first request right after the first boot is slow while the NEFF cache is archived.
+# Other device counts (bench, same node, 2026-11-10): 2 trn3 devices: m-lnc2, NPROC 8, TP 4 x CFG 2
+# (FAST_CFGP=1 FAST_SP=1 FAST_SP_LN=1, VAE_TILE_GRID=2x4) 3.69 s; 1 device: s-lnc2, NPROC 4, no
+# FAST_CFGP, VAE_TILE_GRID=2x2, 6.54 s. Those two were measured with the bench job, not serve.py.
 apiVersion: v1
 kind: Service
 metadata:
@@ -16,7 +24,7 @@ metadata:
   name: wan2-i2v-14b-serve
   namespace: default
 spec:
-  replicas: 3
+  replicas: 1
   strategy:
     type: Recreate
   selector:
@@ -28,10 +36,10 @@ spec:
         app: wan2-i2v-14b-serve
     spec:
       nodeSelector:
-        node-type: trn2
+        node-type: trn3-dev1
       resourceClaims:
         - name: neurons
-          resourceClaimTemplateName: s-lnc2
+          resourceClaimTemplateName: l-lnc2
       # Gate startup on a quick matmul health check of this pod's own chips.
       # Runs in-process, so it sees only the devices allocated by the claim.
       initContainers:
@@ -50,7 +58,7 @@ spec:
               - name: neurons
       containers:
         - name: inference
-          image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
           imagePullPolicy: Always
           command:
             - /bin/bash
@@ -144,11 +152,11 @@ spec:
             claims:
               - name: neurons
             requests:
-              cpu: 11
-              memory: 110Gi
+              cpu: 40
+              memory: 500Gi
             limits:
-              cpu: 11
-              memory: 110Gi
+              cpu: 40
+              memory: 500Gi
           volumeMounts:
             - {name: neuron-top-patch, mountPath: /opt/neuron-top-patch, readOnly: true}   # neuron-top-patch
             - name: dshm
@@ -158,6 +166,8 @@ spec:
             - name: node-cache
               mountPath: /node-cache
           env:
+            - name: FAST_CFGP
+              value: "1"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: NEURON_RT_LOG_LEVEL
@@ -180,9 +190,9 @@ spec:
             - name: FAULT_INJECTION
               value: "1"
             - name: NPROC
-              value: "4"
+              value: "16"
             - name: VAE_TILE_GRID
-              value: "2x2"
+              value: "4x4"
             - name: ATTN_IMPL
               value: "fast"
             - name: FAST_ATTN_IMPL
@@ -192,7 +202,7 @@ spec:
             - name: FAST_ADALN
               value: "1"
             - name: FAST_MLP
-              value: "0"
+              value: "1"
             - name: USE_NKI_KERNELS
               value: "1"
             - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
