@@ -172,5 +172,7 @@ with gr.Blocks(title="Wan2.2 image-to-video and Muse-Glimmer-30B on AWS Trainium
     demo.load(server_info, None, status)
     btn.click(generate, [image, prompt, negative, seed, steps, vlm_prompt], [video, status, description, score])
 
+# allowed_paths: Gradio serves only files under the working directory or its temp dir; the app runs
+# from / (python /app/gradio_app.py), so the example images in assets/demo must be allowed explicitly.
 demo.queue().launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", "7860")),
-                    root_path=os.environ.get("ROOT_PATH", ""))
+                    root_path=os.environ.get("ROOT_PATH", ""), allowed_paths=[DEMO_DIR])
