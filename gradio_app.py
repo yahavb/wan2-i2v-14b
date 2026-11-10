@@ -26,11 +26,28 @@ DEFAULT_PROMPT = (
     "Blurred beach scenery forms the background featuring crystal-clear waters, "
     "distant green hills, and a blue sky dotted with white clouds."
 )
+# Three start images (assets/demo, Wan2.1 examples, Apache-2.0) with a prompt that fits each; the
+# server crops every image to the output size. Clicking an example fills both the image and the prompt.
+DEMO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "demo")
+EXAMPLES = [
+    ("cat_surfboard.jpg", DEFAULT_PROMPT),
+    ("blue_bird.jpg",
+     "A fluffy cartoon blue bird with big brown eyes stands on a dirt path. It ruffles its feathers, "
+     "tilts its head curiously, blinks, and hops forward toward the camera. Soft blurred garden "
+     "background with green grass, warm afternoon light, 3D animation style."),
+    ("girl_red_dress.jpg",
+     "A cheerful cartoon girl in a red embroidered Chinese New Year outfit laughs and dances, "
+     "swinging her wide sleeves while her black pigtails bounce. Bright plain background, festive "
+     "and joyful mood, smooth 3D animation style."),
+]
 # The server's fallback start image (MODEL_PATH/examples/i2v_input.JPG), shown so it is visible.
 DEFAULT_IMAGE_URL = "https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B/resolve/main/examples/i2v_input.JPG"
 
 
 def default_image():
+    local = os.path.join(DEMO_DIR, EXAMPLES[0][0])
+    if os.path.exists(local):
+        return local
     path = os.path.join(tempfile.gettempdir(), "wan_default_i2v_input.jpg")
     if not os.path.exists(path):
         try:
@@ -137,6 +154,9 @@ with gr.Blocks(title="Wan2.2 image-to-video and Muse-Glimmer-30B on AWS Trainium
                 steps = gr.Slider(label="Steps", minimum=1, maximum=50, value=10, step=1)
             vlm_prompt = gr.Textbox(label="Question for Muse-Glimmer", value=DEFAULT_VLM_PROMPT, lines=2)
             btn = gr.Button("Generate", variant="primary")
+            gr.Examples([[os.path.join(DEMO_DIR, f), p] for f, p in EXAMPLES
+                         if os.path.exists(os.path.join(DEMO_DIR, f))],
+                        inputs=[image, prompt], label="Start images (click one: it sets the image and the prompt)")
         with gr.Column():
             video = gr.Video(label="Video", autoplay=True, loop=True, height=420)
             status = gr.Textbox(label="Status", interactive=False, lines=3)

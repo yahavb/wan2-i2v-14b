@@ -328,8 +328,8 @@ def main():
         # Y_CACHE (default 1): the conditioning y depends only on the image, so a repeated image
         # (same pixels) reuses the last encode. Exact; saves the VAE encode (0.38 s at 4 devices).
         key = hashlib.sha1(img.tobytes() + repr((img.size, img.mode)).encode()).hexdigest()
-        if Y_CACHE and y_cache.get("key") == key:
-            y = y_cache["y"]
+        if Y_CACHE and key in y_cache:
+            y = y_cache[key]
         else:
             img_tensor = TF.to_tensor(fit(img, OUT_H, OUT_W)).sub_(0.5).div_(0.5)
             img_for_vae = torch.nn.functional.interpolate(
@@ -339,7 +339,9 @@ def main():
             y = torch.cat([msk, z[0].to(torch.bfloat16)], dim=0)
             y[0, 0, 0, 0].item()
             if Y_CACHE:
-                y_cache.update(key=key, y=y)
+                if len(y_cache) >= 16:          # y is 0.7 MB on device; keep the 16 newest images
+                    y_cache.pop(next(iter(y_cache)))
+                y_cache[key] = y
         t_encode = time.time() - t1
 
         t2 = time.time()
