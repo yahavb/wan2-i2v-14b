@@ -219,6 +219,10 @@ def run_server(jobs, state):
 
 def main():
     dist.init_process_group(backend="neuron")
+    # Control messages (the request dict) go over a CPU gloo group: broadcast_object_list on the
+    # neuron backend puts the pickled request in a device tensor of its own length, and every new
+    # length cost ~2 s on the first request that had it (seen at 4 devices).
+    ctrl = dist.new_group(backend="gloo")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.neuron.set_device(local_rank)
     rank, world_size = dist.get_rank(), dist.get_world_size()
@@ -409,7 +413,7 @@ def main():
             except queue.Empty:
                 pass
         msg = [job.req if job is not None else {"type": "heartbeat"}]
-        dist.broadcast_object_list(msg, src=0)
+        dist.broadcast_object_list(msg, src=0, group=ctrl)
         req = msg[0]
 
         if req["type"] == "heartbeat":
