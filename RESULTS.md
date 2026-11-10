@@ -1,5 +1,36 @@
 # Wan2.2-I2V-A14B on Trainium2: results log
 
+## Minimum latency per device count (2026-11-10, branch `latency_loop` → main)
+
+368x480, 21 frames, 10 steps, batched or CFG-parallel guidance. Bench: median of warm runs 2-4 of
+4 in one process; trn3 rows ran on one node (ip-…-229) in one session, trn2 rows on the trn2 node.
+Accuracy: `scripts/validate/gate_wan.sh` against a CPU fp32 rollout of the same inputs
+(`scripts/validate/ref_rollout_fp32.py`); every row passes. MFU = 10 steps x 2.30e14 model FLOPs
+(analytical: 40 blocks x 4140 tokens x 2 CFG halves) / (logical cores x peak x wall); peak per LNC2
+core 1.573e14 (trn3, from a profile) and 1.667e14 (trn2, spec): estimates.
+
+| HW | Devices | Claim | Layout | Stage | Denoise | Total | e2e MFU | PSNR vs fp32 R |
+|---|---|---|---|---|---|---|---|---|
+| trn3 | 4 | `l-lnc2` | TP 8 x CFG 2 | `+mlp+vstream+qsplit` | 2.22 s | **2.85 s** (serve.py HTTP 3.0 s) | 32% | 23.1 dB |
+| trn3 | 2 | `m-lnc2` | TP 4 x CFG 2 | `+mlp+vstream+qsplit+sp+spln` | 3.05 s | **3.69 s** | 50% | 22.0 dB |
+| trn3 | 2 | `m-lnc2` | TP 8, batched CFG | `+mlp+vstream+qsplit+sp+spln` | 3.46 s | 4.11 s | 45% | 25.0 dB |
+| trn3 | 2 | `m-lnc2` | TP 8, batched CFG | validated stage (previous best) | 3.79 s | 4.58 s | 40% | 24.2 dB |
+| trn3 | 1 | `s-lnc2` | TP 4, batched CFG | `+mlp+vstream+qsplit+sp+spln` | 5.83 s | **6.52 s** | 56% | 23.6 dB |
+| trn2 | 4 | `l-lnc2` | TP 8 x CFG 2 | validated `+vstream+qsplit` | 3.12 s | **3.91 s** | 22% | 23.1 dB |
+| trn2 | 2 | `m-lnc2` | TP 4 x CFG 2 | `+mlp+vstream+qsplit+sp+spln` | 3.91 s | **4.63 s** | 37% | 22.7 dB |
+| trn2 | 2 | `m-lnc2` | TP 8, batched CFG | validated stage | 5.35 s | 6.25 s | 28% | 23.7 dB |
+| trn2 | 1 | `s-lnc2` | TP 4, batched CFG | `+mlp+vstream+qsplit+sp+spln` | 7.70 s | **8.55 s** | 40% | 25.1 dB |
+
+- `FAST_CFGP=1` (new): world = 2 x TP, TP group 0 runs the conditional half and group 1 the
+  unconditional one at batch 1; the head swaps the two predictions (2-rank all-reduce on 2 devices,
+  world all-gather on 4: the runtime cannot build the {r, r+8} group across devices 0-1 / 2-3).
+- Refuted: `FAST_SP` at TP 8 x CFG 2 (rows padded 4140 → 4144): 3.41 vs 2.84 s same session.
+- Gate floors (user-labelled, all approved): first-9-frame PSNR vs R >= 21.5 dB, step-0 rel-RMS
+  <= 0.045 and <= 1.3 x base, sharpness vs R >= 0.90, whole PSNR >= 21.5 dB and within 2.5 dB of base.
+- The deploy (`wan2-i2v-14b-deploy.yaml`) and bench job (`wan2-i2v-14b-job.yaml`) default to the trn3
+  4-device row.
+
+
 ## One Neuron device (branch `loop_engineering`)
 
 Same spec as below (368x480, 21 frames, 10 steps, batched CFG, the validated default flags
