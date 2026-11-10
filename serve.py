@@ -65,6 +65,11 @@ OUT_W = int(os.environ.get("OUT_W", "480"))
 NUM_STEPS = int(os.environ.get("NUM_STEPS", "10"))
 MAX_STEPS = int(os.environ.get("MAX_STEPS", "50"))
 FPS = int(os.environ.get("FPS", "16"))
+# VAE_STREAM=1: encode the mp4 while the device decodes (see inference_neuron_i2v.py). ffmpeg is
+# spawned without imageio's preexec_fn, so Python uses posix_spawn instead of forking this process.
+VAE_STREAM = os.environ.get("VAE_STREAM", "0") == "1"
+if VAE_STREAM:
+    os.environ.setdefault("IMAGEIO_FFMPEG_NO_PREVENT_SIGINT", "1")
 VAE_TILE_GRID = tuple(int(v) for v in os.environ.get("VAE_TILE_GRID", "2x4").split("x"))
 VAE_TILE_OVERLAP = int(os.environ.get("VAE_TILE_OVERLAP", "4"))
 HEARTBEAT_S = int(os.environ.get("HEARTBEAT_S", "60"))
@@ -337,8 +342,26 @@ def main():
         t_denoise = time.time() - t2
 
         t3 = time.time()
-        videos = vae.decode_tiled([latent.to(torch.bfloat16)], grid=VAE_TILE_GRID, overlap=VAE_TILE_OVERLAP)
-        mp4 = to_mp4(videos[0]) if rank == 0 else None
+        if VAE_STREAM:   # mp4 encoded during the decode, one latent frame at a time (same frames)
+            import imageio
+            path = "/tmp/serve_out.mp4"
+            writer = imageio.get_writer(path, fps=FPS, codec="libx264") if rank == 0 else None
+
+            def on_frames(v):  # [3, f, H, W] fp32 in [-1, 1]
+                if writer is not None:
+                    for fr in ((v.clamp(-1, 1) * 0.5 + 0.5) * 255).byte().permute(1, 2, 3, 0):
+                        writer.append_data(fr.numpy())
+
+            vae.decode_tiled_stream(latent.to(torch.bfloat16), grid=VAE_TILE_GRID, overlap=VAE_TILE_OVERLAP,
+                                    on_frames=on_frames)
+            mp4 = None
+            if rank == 0:
+                writer.close()
+                with open(path, "rb") as f:
+                    mp4 = f.read()
+        else:
+            videos = vae.decode_tiled([latent.to(torch.bfloat16)], grid=VAE_TILE_GRID, overlap=VAE_TILE_OVERLAP)
+            mp4 = to_mp4(videos[0]) if rank == 0 else None
         dist.barrier()
         t_vae = time.time() - t3
         timings = {"text_encode": round(t_text, 2), "vae_encode": round(t_encode, 2),
