@@ -81,7 +81,7 @@ COMPILE_KW = dict(backend="neuron", dynamic=False, fullgraph=True)
 # all-reduce of a one-hot-scaled stack: x*1 + 0 is exact) and every rank combines them, so the
 # latents stay identical on all ranks. Numerics: the same math at batch 1 (kernel shapes differ).
 FAST_CFGP = os.environ.get("FAST_CFGP", "0") == "1"
-_CFG = {"group": None, "idx": 0}
+_CFG = {"group": None, "idx": 0, "world": 1, "tp": 1}
 
 
 def init_cfg_parallel(tp):
@@ -94,6 +94,7 @@ def init_cfg_parallel(tp):
         if rank % tp == r:
             _CFG["group"] = g
     _CFG["idx"] = rank // tp
+    _CFG["world"], _CFG["tp"] = world, tp
     logger.info(f"[fast_dit] CFG parallel: rank {rank} runs the {'un' if _CFG['idx'] else ''}conditional half")
 
 
@@ -102,9 +103,16 @@ def _cfg_b():
 
 
 def _cfg_exchange(y, sel):
-    """y [1, ...] (this group's half), sel [2] one-hot -> [2, ...] = (cond, uncond) on every rank."""
-    s = torch.cat([y * sel[0], y * sel[1]], dim=0)
-    return funcol.all_reduce(s, "sum", _CFG["group"])
+    """y [1, ...] (this group's half), sel [2] one-hot -> [2, ...] = (cond, uncond) on every rank.
+    world <= 8: all-reduce of the one-hot-scaled stack over the 2-rank group {r, r+TP}. On 4 devices
+    the runtime cannot build that group (devices d and d+2: "no_hier no_mesh"), so there it is an
+    all-gather over the world and rows 0 (cond, rank 0) and TP (uncond, rank TP) are kept. Exact."""
+    if _CFG["world"] <= 8:
+        s = torch.cat([y * sel[0], y * sel[1]], dim=0)
+        return funcol.all_reduce(s, "sum", _CFG["group"])
+    import torch.distributed as dist
+    g = funcol.all_gather_tensor(y.contiguous(), 0, dist.group.WORLD)
+    return torch.cat([g[0:1], g[_CFG["tp"]:_CFG["tp"] + 1]], dim=0)
 
 
 # ─── attention_cte kernel (staging cp_attention._wan_attention_kernel, tp_out=False) ───

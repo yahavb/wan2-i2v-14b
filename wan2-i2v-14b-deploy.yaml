@@ -16,7 +16,7 @@ metadata:
   name: wan2-i2v-14b-serve
   namespace: default
 spec:
-  replicas: 8
+  replicas: 3
   strategy:
     type: Recreate
   selector:
@@ -31,7 +31,23 @@ spec:
         node-type: trn2
       resourceClaims:
         - name: neurons
-          resourceClaimTemplateName: m-lnc2
+          resourceClaimTemplateName: s-lnc2
+      # Gate startup on a quick matmul health check of this pod's own chips.
+      # Runs in-process, so it sees only the devices allocated by the claim.
+      initContainers:
+        - name: neuron-healthcheck
+          image: public.ecr.aws/neuron/neuron-observer:0.2.0
+          command: ["sh", "-c"]
+          args:
+            - |
+              ls /dev/neuron*
+              neuron-observer health-check --test matmul
+          env:
+            - name: NEURON_RT_ALLOW_LEGACY_NEFF
+              value: "1"
+          resources:
+            claims:
+              - name: neurons
       containers:
         - name: inference
           image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04
@@ -128,11 +144,11 @@ spec:
             claims:
               - name: neurons
             requests:
-              cpu: 22
-              memory: 220Gi
+              cpu: 11
+              memory: 110Gi
             limits:
-              cpu: 22
-              memory: 220Gi
+              cpu: 11
+              memory: 110Gi
           volumeMounts:
             - {name: neuron-top-patch, mountPath: /opt/neuron-top-patch, readOnly: true}   # neuron-top-patch
             - name: dshm
@@ -164,7 +180,9 @@ spec:
             - name: FAULT_INJECTION
               value: "1"
             - name: NPROC
-              value: "8"
+              value: "4"
+            - name: VAE_TILE_GRID
+              value: "2x2"
             - name: ATTN_IMPL
               value: "fast"
             - name: FAST_ATTN_IMPL
