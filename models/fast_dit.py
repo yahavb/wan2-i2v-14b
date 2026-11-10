@@ -75,6 +75,37 @@ FAST_QKV_SPLIT = os.environ.get("FAST_QKV_SPLIT", "0") == "1"
 FAST_XRES_KERNEL = os.environ.get("FAST_XRES_KERNEL", "0") == "1"
 COMPILE_KW = dict(backend="neuron", dynamic=False, fullgraph=True)
 
+# FAST_CFGP=1: CFG parallelism. world = 2 x TP: TP group 0 (ranks 0..TP-1) runs the conditional
+# half, group 1 (TP..2TP-1) the unconditional half, each at batch 1 instead of the batched-CFG
+# batch 2. The head swaps the two [C, F, H, W] predictions over a 2-rank group {r, r+TP} (one
+# all-reduce of a one-hot-scaled stack: x*1 + 0 is exact) and every rank combines them, so the
+# latents stay identical on all ranks. Numerics: the same math at batch 1 (kernel shapes differ).
+FAST_CFGP = os.environ.get("FAST_CFGP", "0") == "1"
+_CFG = {"group": None, "idx": 0}
+
+
+def init_cfg_parallel(tp):
+    """Create the 2-rank CFG groups {r, r + tp}; every rank must call it (new_group is collective)."""
+    import torch.distributed as dist
+    world, rank = dist.get_world_size(), dist.get_rank()
+    assert world == 2 * tp, f"FAST_CFGP needs world = 2 x TP (world {world}, TP {tp})"
+    for r in range(tp):
+        g = dist.new_group([r, r + tp])
+        if rank % tp == r:
+            _CFG["group"] = g
+    _CFG["idx"] = rank // tp
+    logger.info(f"[fast_dit] CFG parallel: rank {rank} runs the {'un' if _CFG['idx'] else ''}conditional half")
+
+
+def _cfg_b():
+    return 1 if FAST_CFGP else 2
+
+
+def _cfg_exchange(y, sel):
+    """y [1, ...] (this group's half), sel [2] one-hot -> [2, ...] = (cond, uncond) on every rank."""
+    s = torch.cat([y * sel[0], y * sel[1]], dim=0)
+    return funcol.all_reduce(s, "sum", _CFG["group"])
+
 
 # ─── attention_cte kernel (staging cp_attention._wan_attention_kernel, tp_out=False) ───
 
@@ -475,6 +506,8 @@ class _FastPatch(nn.Module):
     def forward(self, latent, y):               # [16, F, H, W], [20, F, H, W]
         x = self.patch_embedding(torch.cat([latent, y], dim=0).unsqueeze(0))
         x = x.flatten(2).transpose(1, 2)        # [1, L, C]
+        if FAST_CFGP:
+            return x.contiguous()
         return x.expand(2, -1, -1).contiguous()
 
 
@@ -494,6 +527,9 @@ class _FastHead(nn.Module):
         super().__init__()
         self.head, self.grid, self.patch_size = head, grid, patch_size
         self.out_dim, self.guide_scale = out_dim, guide_scale
+        sel = torch.zeros(2, dtype=torch.bfloat16, device=next(head.parameters()).device)
+        sel[_CFG["idx"]] = 1
+        self.register_buffer("cfg_sel", sel, persistent=False)
 
     def forward(self, x, e):                    # e [1, 1, C]
         hd = self.head
@@ -505,6 +541,8 @@ class _FastHead(nn.Module):
         B = y.shape[0]
         y = y.view(B, f, h, w, p, q, r, c).permute(0, 7, 1, 4, 2, 5, 3, 6)
         y = y.reshape(B, c, f * p, h * q, w * r).to(torch.bfloat16)
+        if FAST_CFGP:
+            y = _cfg_exchange(y, self.cfg_sel)
         cond, uncond = y[0], y[1]
         return uncond + self.guide_scale * (cond - uncond)
 
@@ -660,7 +698,7 @@ class FastWanDiT:
         self.cross_kv = [torch.compile(_FastCrossKV(b), **COMPILE_KW) for b in model.blocks]
         if FAST_SP:          # residual stream sharded by token between blocks
             assert not (DUMP_BLOCK_IN or NAN_CHECK_DIR), "DUMP_BLOCK_IN / NAN_CHECK_DIR need FAST_SP=0"
-            shape = (2, math.prod(self.grid))                      # (CFG batch, L)
+            shape = (_cfg_b(), math.prod(self.grid))               # (CFG batch, L)
             self.patch = torch.compile(_FastPatchSP(model.patch_embedding), **COMPILE_KW)
             self.blocks = [torch.compile(_FastBlockSP(b, shape), **COMPILE_KW) for b in model.blocks]
             self.head = torch.compile(
@@ -676,7 +714,7 @@ class FastWanDiT:
         if FAST_EMBED_HOST:
             self._embed_to(torch.device("cpu"))
         logger.info(f"[fast_dit] grid={self.grid} L={math.prod(self.grid)} attn={FAST_ATTN_IMPL} "
-                    f"fullgraph=True blocks={len(self.blocks)} cfg_batch=2 guide={guide_scale} "
+                    f"fullgraph=True blocks={len(self.blocks)} cfg_batch={_cfg_b()} cfgp={FAST_CFGP} guide={guide_scale} "
                     f"embed_host={FAST_EMBED_HOST} sp={FAST_SP}")
 
     def _embed_to(self, device):
@@ -702,7 +740,8 @@ class FastWanDiT:
 
     def set_context(self, ctx_cond, ctx_null):
         def run():
-            context = self.text(torch.cat([ctx_cond, ctx_null], dim=0).to(torch.bfloat16))
+            ctx = (ctx_null if _CFG["idx"] else ctx_cond) if FAST_CFGP else torch.cat([ctx_cond, ctx_null], dim=0)
+            context = self.text(ctx.to(torch.bfloat16))
             if self._dump:
                 os.makedirs(DUMP_BLOCK_IN, exist_ok=True)
                 torch.save(context.cpu(), os.path.join(DUMP_BLOCK_IN, f"{self.name}_ctx.pt"))
@@ -805,8 +844,9 @@ class _FastPatchSP(nn.Module):
     def forward(self, latent, y):
         x = self.patch_embedding(torch.cat([latent, y], dim=0).unsqueeze(0)).flatten(2).transpose(1, 2)
         L, C = x.shape[1], x.shape[2]
-        r0, S = _sp_rows(2 * L)
-        return x.expand(2, -1, -1).reshape(2 * L, C)[r0:r0 + S].contiguous()
+        B = _cfg_b()
+        r0, S = _sp_rows(B * L)
+        return x.expand(B, -1, -1).reshape(B * L, C)[r0:r0 + S].contiguous()
 
 
 class _FastBlockSP(nn.Module):
@@ -877,5 +917,7 @@ class _FastHeadSP(_FastHead):
         y = funcol.all_gather_tensor(ys.contiguous(), 0, get_tp_group())     # [B*L, p*q*r*c]
         y = y.view(-1, f, h, w, p, q, r, c).permute(0, 7, 1, 4, 2, 5, 3, 6)
         y = y.reshape(y.shape[0], c, f * p, h * q, w * r).to(torch.bfloat16)
+        if FAST_CFGP:
+            y = _cfg_exchange(y, self.cfg_sel)
         cond, uncond = y[0], y[1]
         return uncond + self.guide_scale * (cond - uncond)

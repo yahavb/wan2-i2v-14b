@@ -262,8 +262,12 @@ def main():
     vae = StaticWanVAE(vae)
 
     # ── Both DiT experts resident, TP-sharded ──
-    init_tp_group(tp_degree=world_size)
-    init_sp_group(tp_degree=world_size)
+    from models.fast_dit import FAST_CFGP, init_cfg_parallel
+    tp = world_size // 2 if FAST_CFGP else world_size     # FAST_CFGP: one TP group per CFG half
+    init_tp_group(tp_degree=tp)
+    init_sp_group(tp_degree=tp)
+    if FAST_CFGP:
+        init_cfg_parallel(tp)
     tp_rank = get_tp_rank()
     grid = (T_latent, lat_h // 2, lat_w // 2)
     experts = {}
@@ -273,7 +277,7 @@ def main():
             logger.info(f"loading {name}_noise_model (resident)...")
         m = WanModel.from_pretrained(MODEL_PATH, subfolder=sub)
         m.eval().requires_grad_(False)
-        shard_model_tp(m, tp_rank, world_size)
+        shard_model_tp(m, tp_rank, tp)
         m = m.to(torch.bfloat16).to(NEURON_DEVICE)
         experts[name] = FastWanDiT(m, grid=grid, guide_scale=g, device=NEURON_DEVICE)
     dist.barrier()

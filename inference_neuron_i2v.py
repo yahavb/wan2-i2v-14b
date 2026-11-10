@@ -326,8 +326,11 @@ def main():
     # torch.compile(fullgraph=True), TP all-reduces in-graph, batched CFG. Needs SP=1.
     FAST_DIT = os.environ.get("FAST_DIT", "0") == "1"
     if FAST_DIT:
-        assert SP_DEGREE == 1 and TP_DEGREE == world_size, "FAST_DIT needs SP_DEGREE=1, TP_DEGREE=world size"
-        from models.fast_dit import FAST_EMBED_HOST, FastWanDiT, prepare_kernel_weights
+        from models.fast_dit import FAST_CFGP, FAST_EMBED_HOST, FastWanDiT, init_cfg_parallel, prepare_kernel_weights
+        assert SP_DEGREE == 1 and TP_DEGREE * (2 if FAST_CFGP else 1) == world_size, \
+            "FAST_DIT needs SP_DEGREE=1 and TP_DEGREE = world size (FAST_CFGP: world size / 2)"
+        if FAST_CFGP:
+            init_cfg_parallel(TP_DEGREE)
         grid = (T_latent, lat_h // 2, lat_w // 2)
         fast = {}
         for name, sub, g in (("high", config.high_noise_checkpoint, config.sample_guide_scale[1]),
