@@ -33,7 +33,7 @@ EXAMPLES = [
     ("cat_surfboard.jpg", DEFAULT_PROMPT),
     ("blue_bird.jpg",
      "A fluffy cartoon blue bird with big brown eyes stands on a dirt path. It ruffles its feathers, "
-     "tilts its head curiously, blinks, and hops forward toward the camera. Soft blurred garden "
+     "tilts its head curiously, blinks, and flaps its small wings, staying in the center of the frame. Soft blurred garden "
      "background with green grass, warm afternoon light, 3D animation style."),
     ("girl_red_dress.jpg",
      "A cheerful cartoon girl in a red embroidered Chinese New Year outfit laughs and dances, "
