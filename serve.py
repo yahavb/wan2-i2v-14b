@@ -31,6 +31,7 @@ A dead chip shows up as a collective that never returns, so the timestamp goes s
 """
 import base64
 import gc
+import hashlib
 import io
 import logging
 import os
@@ -68,6 +69,7 @@ FPS = int(os.environ.get("FPS", "16"))
 # VAE_STREAM=1: encode the mp4 while the device decodes (see inference_neuron_i2v.py). ffmpeg is
 # spawned without imageio's preexec_fn, so Python uses posix_spawn instead of forking this process.
 VAE_STREAM = os.environ.get("VAE_STREAM", "0") == "1"
+Y_CACHE = os.environ.get("Y_CACHE", "1") == "1"
 if VAE_STREAM:
     os.environ.setdefault("IMAGEIO_FFMPEG_NO_PREVENT_SIGINT", "1")
 VAE_TILE_GRID = tuple(int(v) for v in os.environ.get("VAE_TILE_GRID", "2x4").split("x"))
@@ -306,6 +308,8 @@ def main():
         dist.all_reduce(x)
         return round(x.item()) == world_size
 
+    y_cache = {}
+
     def generate(prompt, negative_prompt, seed, steps, img):
         """One video on every rank; rank 0 returns (mp4 bytes, timings)."""
         maybe_hang()
@@ -317,13 +321,21 @@ def main():
         t_text = time.time() - t0
 
         t1 = time.time()
-        img_tensor = TF.to_tensor(fit(img, OUT_H, OUT_W)).sub_(0.5).div_(0.5)
-        img_for_vae = torch.nn.functional.interpolate(
-            img_tensor[None], size=(OUT_H, OUT_W), mode='bicubic').transpose(0, 1)
-        img_seq = torch.cat([img_for_vae, torch.zeros(3, F - 1, OUT_H, OUT_W)], dim=1)
-        z = vae.encode([img_seq.to(device=NEURON_DEVICE, dtype=torch.bfloat16)])
-        y = torch.cat([msk, z[0].to(torch.bfloat16)], dim=0)
-        y[0, 0, 0, 0].item()
+        # Y_CACHE (default 1): the conditioning y depends only on the image, so a repeated image
+        # (same pixels) reuses the last encode. Exact; saves the VAE encode (0.38 s at 4 devices).
+        key = hashlib.sha1(img.tobytes() + repr((img.size, img.mode)).encode()).hexdigest()
+        if Y_CACHE and y_cache.get("key") == key:
+            y = y_cache["y"]
+        else:
+            img_tensor = TF.to_tensor(fit(img, OUT_H, OUT_W)).sub_(0.5).div_(0.5)
+            img_for_vae = torch.nn.functional.interpolate(
+                img_tensor[None], size=(OUT_H, OUT_W), mode='bicubic').transpose(0, 1)
+            img_seq = torch.cat([img_for_vae, torch.zeros(3, F - 1, OUT_H, OUT_W)], dim=1)
+            z = vae.encode([img_seq.to(device=NEURON_DEVICE, dtype=torch.bfloat16)])
+            y = torch.cat([msk, z[0].to(torch.bfloat16)], dim=0)
+            y[0, 0, 0, 0].item()
+            if Y_CACHE:
+                y_cache.update(key=key, y=y)
         t_encode = time.time() - t1
 
         t2 = time.time()
