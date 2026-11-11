@@ -35,11 +35,11 @@ EXAMPLES = [
      "A fluffy cartoon blue bird with big brown eyes stands on a dirt path. It ruffles its feathers, "
      "tilts its head curiously, blinks, and flaps its small wings, staying in the center of the frame. Soft blurred garden "
      "background with green grass, warm afternoon light, 3D animation style."),
-    ("girl_red_dress.jpg",
-     "A cheerful cartoon girl in a red embroidered Chinese New Year outfit laughs and dances, "
-     "swinging her wide sleeves while her black pigtails bounce. Bright plain background, festive "
-     "and joyful mood, smooth 3D animation style."),
-]
+    ("green_snake.jpg",
+     "A friendly cartoon green snake with big golden eyes raises its head, sways gently from side to "
+     "side, blinks and flicks its tongue, then curls its tail. Bright plain white background, "
+     "playful mood, smooth 3D animation style."),
+]]
 # The server's fallback start image (MODEL_PATH/examples/i2v_input.JPG), shown so it is visible.
 DEFAULT_IMAGE_URL = "https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B/resolve/main/examples/i2v_input.JPG"
 
