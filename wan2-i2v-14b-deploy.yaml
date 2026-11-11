@@ -169,6 +169,20 @@ spec:
           env:
             - name: FAST_CFGP
               value: "1"
+            - name: FAST_QKV_NKI
+              value: "1"
+            - name: FAST_CROSSQ_NKI
+              value: "1"
+            - name: FAST_QKV_SPLIT
+              value: "1"
+            - name: FAST_FFNUP_NKI
+              value: "0"
+            - name: VAE_STREAM
+              value: "1"
+            - name: WARMUP_RUNS
+              value: "3"
+            - name: Y_CACHE
+              value: "1"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: NEURON_RT_LOG_LEVEL
