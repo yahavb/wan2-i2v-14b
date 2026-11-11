@@ -39,7 +39,7 @@ EXAMPLES = [
      "A friendly cartoon green snake with big golden eyes raises its head, sways gently from side to "
      "side, blinks and flicks its tongue, then curls its tail. Bright plain white background, "
      "playful mood, smooth 3D animation style."),
-]]
+]
 # The server's fallback start image (MODEL_PATH/examples/i2v_input.JPG), shown so it is visible.
 DEFAULT_IMAGE_URL = "https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B/resolve/main/examples/i2v_input.JPG"
 
